@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+
+# Local tooling / workspace (not project source)
+.claude/
+.claude.json
+.claude.json.backup
+CLAUDE.local.md
+.axt*
+
+# ast/cst local data homes (default to ~/.ast, ~/.cst; only appear here if
+# AST_HOME/CST_HOME is pointed at the repo during local dev/testing)
+.ast/
+.cst/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Linter / type-checker caches
+.mypy_cache/
+.ruff_cache/
+
+# Skill work products generated under this dir (not part of cst)
+linkedin-post/
+
+# `cst export` default output: <sid[:8]>-<YYYY-MM-DD>.{md,txt} written to
+# the cwd. Anchored to repo root so docs/*-<date>-*.md stays tracked.
+/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-20[0-9][0-9]-[0-9][0-9]-[0-9][0-9].md
+/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-20[0-9][0-9]-[0-9][0-9]-[0-9][0-9].txt
+
+# superpowers (auto-installed; do not track)
+.superpowers/
+docs/superpowers/
+
+# >>> skill-artifacts (auto; do not commit skill-generated output)
+.DS_Store
+/runs/
+/output/
+/outputs/
+/out/
+/generated/
+/.tmp/
+/tmp/
+__pycache__/
+.pytest_cache/
+*-run/
+*-runs/
+*-output/
+# <<< skill-artifacts
+
+# env files
+.env*
+!.env*.example
+!.env*.template
+
+# Coverage (dev-only; the tool itself stays stdlib-only)
+.coverage
+coverage.json
+htmlcov/
+
+# Added by github-init
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+build/
+dist/
+*.egg-info/
+*.egg
+.tox/
+.ipynb_checkpoints/
+Thumbs.db

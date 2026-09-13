@@ -1,0 +1,7862 @@
+#!/usr/bin/env python3
+"""Browse, search, and track local coding-agent sessions.
+
+agent-session-tracker — fork of claude-session-tracker that tracks Claude Code
+and OpenAI Codex sessions side by side, with live status detection
+(세션사용중 / 세션종료) and a user-driven 작업종료 flag.
+
+Data sources:
+  ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl  — claude transcripts
+  ~/.claude/sessions/<pid>.json                        — live process registry
+  ~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl        — codex transcripts
+  ~/.codex/thread-writer-locks/<uuid>.lock             — codex liveness (flock)
+  ~/.ast/state.json                                    — done-state overlay
+  ~/.ast/index.json                                    — indexing cache
+"""
+from __future__ import annotations
+
+__version__ = "1.0.0"
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import tarfile
+import unicodedata
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Callable, Iterator
+
+try:
+    import fcntl  # POSIX advisory file locking (macOS/Linux); absent on Windows
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore
+
+def _claude_config_dir() -> Path:
+    """Claude Code의 설정/데이터 루트. 환경변수 CLAUDE_CONFIG_DIR가 설정돼 있으면
+    그 경로를, 없으면 기존 기본값 ~/.claude를 쓴다(Claude Code 자체 규약과 동일).
+    projects/sessions/jobs/daemon/settings.json/backups가 모두 이 루트 밑에 있다."""
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(env).expanduser() if env else Path.home() / ".claude"
+
+
+CONFIG_DIR = _claude_config_dir()
+PROJECTS_DIR = CONFIG_DIR / "projects"
+SESSIONS_REGISTRY_DIR = CONFIG_DIR / "sessions"
+# Agent-view background sessions: <config-dir>/jobs/<short>/state.json.
+# Hosted by the supervisor, not the pid registry above, so once an idle bg
+# process is stopped they leave no registry entry — the jobs scanner reads
+# their persisted agent-view `state` instead (see scan_jobs / classify_status).
+JOBS_DIR = CONFIG_DIR / "jobs"
+# Supervisor (daemon) state: roster.json lists the running background workers.
+DAEMON_DIR = CONFIG_DIR / "daemon"
+HOME = str(Path.home())
+
+
+def _ast_home() -> Path:
+    """ast의 영속 데이터 루트(상태+prefs+백업). 환경변수 AST_HOME이 설정돼
+    있으면 그 경로를, 없으면 ~/.ast를 쓴다. state.json은 done 플래그·테마·정렬
+    같은 영속 데이터라 언제든 비워질 수 있는 ~/.cache에 두지 않는다."""
+    env = os.environ.get("AST_HOME")
+    return Path(env).expanduser() if env else Path.home() / ".ast"
+
+
+def _ast_index_home() -> Path:
+    """index.json(재생성 가능한 인덱스 캐시)을 둘 디렉터리.
+
+    환경변수 AST_INDEX_DIR이 설정돼 있으면 그 경로, 없으면 ast 홈 그대로다.
+    기본값이 홈과 같으므로 아무것도 지정하지 않은 설치는 동작이 달라지지
+    않는다 — 기존 캐시를 버리고 전량 재인덱싱하게 만들지 않기 위한 선택이다.
+
+    **홈을 동기화 폴더(Synology Drive, Dropbox 등)에 둔 경우에만** 이 변수를
+    지정한다. index.json은 rescan마다 다시 쓰이는 수~수십 MB 파일이라 동기화
+    데몬이 끊임없이 업로드하고, 두 기기가 동시에 쓰면 `index_<host>_…
+    _Conflict.json` 류의 충돌본이 쌓인다. 게다가 이 캐시의 키는 transcript
+    절대 경로이고 값은 mtime이라, 동기화가 mtime을 보존하지 못하면 다른
+    기기에서는 전부 캐시 미스가 된다. 공유해서 얻는 것이 없는 파일이다.
+    state.json(done 플래그·prefs)은 정반대로 공유할 값어치가 있으므로 홈에
+    남는다."""
+    env = os.environ.get("AST_INDEX_DIR")
+    return Path(env).expanduser() if env else _ast_home()
+
+
+CACHE_DIR = _ast_home()
+# The index cache can live apart from the home (see _ast_index_home); the two
+# are the same directory unless AST_INDEX_DIR says otherwise.
+INDEX_DIR = _ast_index_home()
+CACHE_PATH = INDEX_DIR / "index.json"
+# Bumped whenever the cached SessionMeta shape or extraction logic changes,
+# so stale entries are re-indexed instead of serving wrong snippets.
+_CACHE_SCHEMA = 6
+STATE_PATH = CACHE_DIR / "state.json"
+
+# claude-session-tracker's home. ast forked from it, so a first run seeds its
+# own state from there — see seed_from_cst_home().
+_CST_HOME_DIR = Path.home() / ".cst"
+
+
+def seed_from_cst_home() -> bool:
+    """cst 홈(~/.cst)의 state.json을 ast 홈으로 1회 복사한다.
+
+    ast와 cst는 나란히 설치돼 각자의 홈을 쓰므로, cst에서 이미 쌓아 둔 done
+    플래그와 표시 설정을 그대로 이어받도록 첫 실행 때만 복사한다. 이동이
+    아니라 복사인 이유는 cst가 계속 자기 홈을 읽고 쓰기 때문이다. 대상이
+    이미 있으면 아무 것도 하지 않으므로 멱등이고, 재생성 가능한 index.json은
+    가져오지 않는다. CACHE_DIR가 _ast_home()과 다르면(테스트 스텁, AST_HOME
+    지정) 건너뛴다."""
+    if CACHE_DIR != _ast_home():
+        return False
+    src, dst = _CST_HOME_DIR / "state.json", CACHE_DIR / "state.json"
+    if dst.exists() or not src.is_file():
+        return False
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(dst))
+    except OSError:
+        return False
+    return True
+
+# Compact glyphs shown in tables (display width 1 each).
+STATUS_WORKING = "●"   # actively producing (hook working / registry busy)
+STATUS_WAITING = "!"   # waiting for input/permission — the time-leak state
+STATUS_IDLE    = "◦"   # turn finished, process alive, not waiting
+STATUS_ENDED   = "○"   # process gone or never registered
+STATUS_DONE    = "✓"   # user marked finished via D / ast done
+STATUS_ACTIVE  = STATUS_WORKING  # back-compat alias (legacy references)
+STATUS_WIDTH = 2       # glyph padded to "ST" header width (2 display cols)
+
+# Full-text labels used in help / stats / CLI headers.
+LABEL_WORKING = "working"
+LABEL_WAITING = "waiting"
+LABEL_IDLE    = "idle"
+LABEL_ENDED   = "ended"
+LABEL_DONE    = "done"
+LABEL_ACTIVE  = LABEL_WORKING  # back-compat alias
+
+STATUS_LABELS: dict[str, str] = {
+    STATUS_WORKING: LABEL_WORKING,
+    STATUS_WAITING: LABEL_WAITING,
+    STATUS_IDLE:    LABEL_IDLE,
+    STATUS_ENDED:   LABEL_ENDED,
+    STATUS_DONE:    LABEL_DONE,
+}
+
+# Ordered list of all status glyphs (for counts / filters / stats).
+STATUS_ALL = (STATUS_WORKING, STATUS_WAITING, STATUS_IDLE,
+              STATUS_ENDED, STATUS_DONE)
+
+# CLI --status argument name -> glyph (ast list / ast done --filter).
+_STATUS_ARG = {
+    "active":  STATUS_WORKING, "working": STATUS_WORKING,
+    "waiting": STATUS_WAITING,
+    "idle":    STATUS_IDLE,
+    "ended":   STATUS_ENDED,
+    "done":    STATUS_DONE,
+}
+
+# state.json overlay state-name -> glyph
+_STATE_GLYPH = {
+    "working": STATUS_WORKING,
+    "waiting": STATUS_WAITING,
+    "idle":    STATUS_IDLE,
+}
+
+# jobs/<id>/state.json agent-view `state` -> glyph. The union is
+# working | blocked | idle | done | failed | stopped | queued (captured from
+# Claude Code 2.1.x). "blocked" is agent-view's waiting-for-input state.
+# Finished/unknown states fall through to ○ ended (default), since a stopped
+# bg process is no longer running — only the live-ish states override "ended".
+_JOB_STATE_GLYPH = {
+    "working": STATUS_WORKING,
+    "blocked": STATUS_WAITING,
+    "waiting": STATUS_WAITING,
+    "idle":    STATUS_IDLE,
+    "queued":  STATUS_IDLE,
+    "done":    STATUS_ENDED,
+    "failed":  STATUS_ENDED,
+    "stopped": STATUS_ENDED,
+}
+
+
+def status_label(st: str) -> str:
+    return f"{st} {STATUS_LABELS.get(st, '')}".rstrip()
+
+
+# JSON output: glyph -> stable status name (cst.app / machine consumers).
+_JSON_STATUS_NAME = {
+    STATUS_WORKING: "working",
+    STATUS_WAITING: "waiting",
+    STATUS_IDLE:    "idle",
+    STATUS_ENDED:   "ended",
+    STATUS_DONE:    "done",
+}
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ AGENT LAYER — one AgentSpec per CLI (claude, codex, …). Everything    ║
+# ║ agent-specific (data root, transcript format, resume command, live    ║
+# ║ probe) lives behind this table; CORE / CLI / TUI stay agent-agnostic.  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+@dataclass
+class Turn:
+    """One user/assistant message as every agent adapter reports it.
+
+    `text` is the raw extracted text (unstripped — consumers strip/filter as
+    they always did); `cwd` / `git_branch` / `entrypoint` are the per-event
+    metadata the loader keeps the first non-empty value of."""
+    etype: str                     # "user" | "assistant"
+    ts: "datetime | None"
+    text: str
+    cwd: str = ""
+    git_branch: str = ""
+    entrypoint: str = ""
+
+
+@dataclass(frozen=True)
+class AgentSpec:
+    """Everything ast needs to know about one agent CLI's local sessions."""
+    name: str            # registry key + display label ("claude", "codex")
+    bin: str             # CLI executable name
+    resume_label: str    # e.g. "claude --resume" — for spawn-failure messages
+    owns: "Callable[[Path], bool]"                  # is this transcript ours?
+    session_files: "Callable[[bool], list[Path]]"   # (include_subagents)
+    session_id_of: "Callable[[Path], str]"
+    # (path, line_sink=None) -> Turns. `line_sink`, when given, is handed
+    # every raw transcript line as the stream is read, so a consumer that also
+    # needs the text — load_session_meta's PR scan — gets it from the same
+    # single pass instead of re-reading the file. An adapter that cannot
+    # supply raw lines may ignore the argument, but must still accept it.
+    iter_turns: "Callable[..., Iterator[Turn]]"
+    resume_argv: "Callable[[str, str, bool], list[str]]"  # (bin, sid, skip_perm)
+    caps: frozenset = frozenset()
+    skip_perm_flag: str = "--dangerously-skip-permissions"  # shown in the TUI prompt
+    # Agents without a pid registry supply their own liveness: live_probe()
+    # → {sid: {"busy": bool, "updatedAt": ms}} for every live session, merged
+    # into StatusContext; live_info(sid) → {"pid": int|None, "cwd": str} or
+    # None for one session (window focus + the TUI footer). None = claude's
+    # registry path handles it.
+    live_probe: "Callable[[], dict] | None" = None
+    live_info: "Callable[[str], dict | None] | None" = None
+    # ---- data layout (backup / restore / relocate / subagents) ----
+    # Transcript root for this agent: the base every archived path is stored
+    # relative to, and the directory a restore writes back into. Read at call
+    # time (a callable, not a Path) because the tests re-point the module
+    # globals at temp dirs after import.
+    data_root: "Callable[[], Path] | None" = None
+    # Top-level directory this agent's transcripts occupy inside a backup
+    # tarball. "projects" for claude, so archives written before the
+    # multi-agent split still restore unchanged.
+    archive_prefix: str = ""
+    # Rewrite one transcript event's recorded cwd from `old_cwd` to `new_cwd`,
+    # in place; returns True when the event actually changed. Each agent keeps
+    # its cwd somewhere else, so relocate delegates the edit here.
+    rewrite_event_cwd: "Callable[[dict, str, str], bool] | None" = None
+    # Where a relocated transcript belongs once its cwd is `new_cwd`. None
+    # means the file stays put (codex: the dated rollout path carries no cwd).
+    relocated_path: "Callable[[Path, str], Path | None] | None" = None
+    # Sub-sessions spawned by a parent transcript, as [(path, meta dict)].
+    subagents_of: "Callable[[Path], list] | None" = None
+    # Basenames of the files a session touched, used to score candidate
+    # folders when relocating an orphaned session. Each agent records tool
+    # calls differently, so the extraction lives with the agent.
+    file_fingerprint: "Callable[..., set] | None" = None
+
+
+def _path_under(path: Path, root: Path) -> bool:
+    """True when `path` sits below `root` (lexically, else via realpath)."""
+    try:
+        if path.is_relative_to(root):
+            return True
+        return path.resolve().is_relative_to(root.resolve())
+    except (ValueError, OSError):
+        return False
+
+
+def _claude_resume_argv(bin_: str, session_id: str, skip_perm: bool) -> list[str]:
+    argv = [bin_, "--resume", session_id]
+    if skip_perm:
+        argv.append("--dangerously-skip-permissions")
+    return argv
+
+
+def _claude_rewrite_event_cwd(evt: dict, new_cwd: str, old_cwd: str = "") -> bool:
+    """Claude records the cwd once per event, at the top level."""
+    if "cwd" not in evt:
+        return False
+    evt["cwd"] = new_cwd
+    return True
+
+
+# Late-bound wrappers: the CORE functions they call are defined further down,
+# and the tests re-point PROJECTS_DIR & co. at temp dirs after import — so the
+# spec reads the module globals at call time and never captures them.
+CLAUDE_AGENT = AgentSpec(
+    name="claude", bin="claude", resume_label="claude --resume",
+    owns=lambda p: _path_under(p, PROJECTS_DIR),
+    session_files=lambda inc: _claude_session_files(inc),
+    session_id_of=lambda p: p.stem,
+    iter_turns=lambda p, line_sink=None: _claude_iter_turns(p, line_sink),
+    resume_argv=_claude_resume_argv,
+    caps=frozenset({"resume", "attach", "jobs", "hooks", "subagents",
+                    "relocate", "backup"}),
+    data_root=lambda: PROJECTS_DIR,
+    archive_prefix="projects",
+    rewrite_event_cwd=_claude_rewrite_event_cwd,
+    relocated_path=lambda p, new_cwd: PROJECTS_DIR / encode_cwd(new_cwd) / p.name,
+    subagents_of=lambda p: _claude_list_subagents(p),
+    file_fingerprint=lambda p, **kw: _claude_file_fingerprint(p, **kw),
+)
+
+# ---- codex (OpenAI Codex CLI) ----------------------------------------------
+# Data root: $CODEX_HOME (Codex's own convention), default ~/.codex. One
+# transcript per thread at sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl; the
+# first line is `session_meta` (id, cwd, source, git), messages are
+# `response_item` records of payload type "message" with role user /
+# assistant / developer. Liveness: codex flock()s
+# thread-writer-locks/<uuid>.lock for as long as a thread has an active
+# writer (verified against thread-store/src/local/writer_lock.rs), so a
+# non-blocking flock attempt from here tells live from stale without a pid
+# registry. The app-server keeps idle threads loaded for up to 30 min, so a
+# held lock is "alive", and the rollout's mtime decides busy (●) vs idle (◦).
+
+def _codex_home() -> Path:
+    env = os.environ.get("CODEX_HOME")
+    return Path(env).expanduser() if env else Path.home() / ".codex"
+
+
+CODEX_HOME = _codex_home()
+CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
+CODEX_LOCKS_DIR = CODEX_HOME / "thread-writer-locks"
+_CODEX_BUSY_WINDOW_S = 90   # rollout written within this → ● working, else ◦ idle
+_UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+_CODEX_ROLLOUT_RE = re.compile(r"^rollout-.*-(" + _UUID_RE + r")\.jsonl$")
+_CODEX_LOCK_RE = re.compile(r"^(" + _UUID_RE + r")\.lock$")
+# Codex injects these as `user` messages; none of them is the user's prompt.
+_CODEX_WRAPPER_PREFIXES = (
+    "# AGENTS.md instructions", "# Files mentioned by", "The following is the",
+)
+_CODEX_WRAPPER_TAG_RE = re.compile(r"^<[a-z][a-z0-9_\-]*[\s>]")  # <environment_context>…
+
+
+def _codex_session_id_of(path: Path) -> str:
+    m = _CODEX_ROLLOUT_RE.match(path.name)
+    return m.group(1) if m else path.stem
+
+
+def _codex_read_session_meta(path: Path) -> dict:
+    """The `session_meta` payload (first rollout line); {} if unreadable."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            line = f.readline()
+        evt = json.loads(line) if line.strip() else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(evt, dict) or evt.get("type") != "session_meta":
+        return {}
+    payload = evt.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _codex_is_subagent_meta(meta: dict) -> bool:
+    """Spawned threads (source {"subagent": …}, a parent_thread_id, or a
+    subagent/guardian thread_source) are codex's subagents — hidden from the
+    main listing like Claude's `subagents/` dirs."""
+    if isinstance(meta.get("source"), dict):
+        return True
+    if meta.get("parent_thread_id"):
+        return True
+    return meta.get("thread_source") in ("subagent", "guardian_review")
+
+
+def _codex_entrypoint(meta: dict) -> str:
+    """Flatten SessionSource → "cli" | "vscode" | "exec" | "mcp" | "subagent"…"""
+    src = meta.get("source")
+    if isinstance(src, dict):
+        return "subagent"
+    return str(src) if src else ""
+
+
+def _codex_session_files(include_subagents: bool = False) -> list[Path]:
+    if not CODEX_SESSIONS_DIR.exists():
+        return []
+    out: list[Path] = []
+    for p in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
+        if not _CODEX_ROLLOUT_RE.match(p.name):
+            continue
+        if not include_subagents and _codex_is_subagent_meta(_codex_read_session_meta(p)):
+            continue
+        out.append(p)
+    out.sort()
+    return out
+
+
+def _codex_text(content) -> str:
+    """Join the text parts of a codex message content list."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for c in content:
+        if isinstance(c, dict) and isinstance(c.get("text"), str):
+            parts.append(c["text"])
+    return "\n".join(parts)
+
+
+def _codex_is_wrapper(text: str) -> bool:
+    t = text.lstrip()
+    return (not t or t.startswith(_CODEX_WRAPPER_PREFIXES)
+            or bool(_CODEX_WRAPPER_TAG_RE.match(t)))
+
+
+def _codex_iter_turns(path: Path,
+                      line_sink: "Callable[[str], None] | None" = None
+                      ) -> Iterator[Turn]:
+    """Codex rollout → Turns. cwd/branch/entrypoint come from session_meta;
+    developer messages and codex's own user-role wrappers are dropped."""
+    cwd = branch = entry = ""
+    for evt in iter_jsonl(path, line_sink=line_sink):
+        etype = evt.get("type")
+        payload = evt.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if etype == "session_meta":
+            cwd = payload.get("cwd") or cwd
+            git = payload.get("git")
+            if isinstance(git, dict) and git.get("branch"):
+                branch = str(git["branch"])
+            entry = _codex_entrypoint(payload)
+            continue
+        if etype != "response_item" or payload.get("type") != "message":
+            continue
+        role = payload.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = _codex_text(payload.get("content"))
+        if role == "user" and _codex_is_wrapper(text):
+            continue
+        yield Turn(etype=role, ts=parse_ts(evt.get("timestamp")), text=text,
+                   cwd=cwd, git_branch=branch, entrypoint=entry)
+
+
+def _codex_resume_argv(bin_: str, session_id: str, skip_perm: bool) -> list[str]:
+    argv = [bin_, "resume", session_id]
+    if skip_perm:
+        argv.append("--dangerously-bypass-approvals-and-sandbox")
+    return argv
+
+
+def _flock_held(path: Path) -> bool:
+    """True when another process holds an flock on `path` (EWOULDBLOCK on a
+    non-blocking exclusive attempt). False when free, missing, or on
+    platforms without fcntl."""
+    if fcntl is None:
+        return False
+    try:
+        f = path.open("r+")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        import errno
+        return e.errno in (errno.EWOULDBLOCK, errno.EAGAIN)
+    else:
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        f.close()
+
+
+def _codex_rollout_for(session_id: str) -> Path | None:
+    if not CODEX_SESSIONS_DIR.exists():
+        return None
+    for p in CODEX_SESSIONS_DIR.rglob(f"rollout-*-{session_id}.jsonl"):
+        return p
+    return None
+
+
+def _codex_live_ids() -> set[str]:
+    """Thread ids whose writer lock is currently held."""
+    out: set[str] = set()
+    if not CODEX_LOCKS_DIR.is_dir():
+        return out
+    for lock in CODEX_LOCKS_DIR.iterdir():
+        m = _CODEX_LOCK_RE.match(lock.name)
+        if m and _flock_held(lock):
+            out.add(m.group(1))
+    return out
+
+
+def codex_live_probe() -> dict:
+    """{sid: {"busy": bool, "updatedAt": ms}} for every live codex thread."""
+    import time as _time
+    now = _time.time()
+    out: dict = {}
+    for sid in _codex_live_ids():
+        rollout = _codex_rollout_for(sid)
+        mtime = None
+        if rollout is not None:
+            try:
+                mtime = rollout.stat().st_mtime
+            except OSError:
+                mtime = None
+        busy = mtime is not None and (now - mtime) <= _CODEX_BUSY_WINDOW_S
+        out[sid] = {"busy": busy,
+                    "updatedAt": int(mtime * 1000) if mtime else None}
+    return out
+
+
+def _lock_holder_pid(path: Path) -> int | None:
+    """pid of the process holding `path` open (lsof), or None."""
+    import subprocess
+    lsof = shutil.which("lsof")
+    if not lsof:
+        return None
+    try:
+        r = subprocess.run([lsof, "-t", str(path)], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for tok in r.stdout.split():
+        if tok.isdigit():
+            return int(tok)
+    return None
+
+
+def codex_live_info(session_id: str) -> dict | None:
+    lock = CODEX_LOCKS_DIR / f"{session_id}.lock"
+    if not _flock_held(lock):
+        return None
+    meta = {}
+    rollout = _codex_rollout_for(session_id)
+    if rollout is not None:
+        meta = _codex_read_session_meta(rollout)
+    return {"sessionId": session_id, "pid": _lock_holder_pid(lock),
+            "cwd": meta.get("cwd") or "", "agent": "codex"}
+
+
+# Codex stores the session cwd in several nested places: `session_meta.cwd`,
+# the `cwd` of every `turn_context`, the workspace_roots list beside it, and
+# the world_state environment snapshot. Rewriting only keys literally named
+# "cwd" (plus workspace roots that match the old path exactly) retargets all
+# of them while leaving message text untouched.
+_CODEX_CWD_MAX_DEPTH = 12
+
+
+def _codex_rewrite_cwd_value(node, new_cwd: str, old_cwd: str,
+                             depth: int = 0) -> bool:
+    """Retarget every cwd/workspace root inside `node`, in place."""
+    if depth > _CODEX_CWD_MAX_DEPTH:
+        return False
+    changed = False
+    if isinstance(node, dict):
+        for key, val in node.items():
+            if key == "cwd" and isinstance(val, str):
+                if val != new_cwd:
+                    node[key] = new_cwd
+                    changed = True
+            elif key == "workspace_roots" and isinstance(val, list):
+                for i, root in enumerate(val):
+                    if old_cwd and root == old_cwd:
+                        val[i] = new_cwd
+                        changed = True
+            elif isinstance(val, (dict, list)):
+                changed |= _codex_rewrite_cwd_value(val, new_cwd, old_cwd,
+                                                    depth + 1)
+    elif isinstance(node, list):
+        for item in node:
+            if isinstance(item, (dict, list)):
+                changed |= _codex_rewrite_cwd_value(item, new_cwd, old_cwd,
+                                                    depth + 1)
+    return changed
+
+
+def _codex_rewrite_event_cwd(evt: dict, new_cwd: str, old_cwd: str = "") -> bool:
+    return _codex_rewrite_cwd_value(evt.get("payload"), new_cwd, old_cwd)
+
+
+def _codex_subagent_type(meta: dict) -> str:
+    """Label for a spawned thread: "guardian" out of
+    source {"subagent": {"other": "guardian"}}, else the thread_source."""
+    src = meta.get("source")
+    if isinstance(src, dict):
+        inner = src.get("subagent")
+        if isinstance(inner, dict):
+            for val in inner.values():
+                if isinstance(val, str) and val:
+                    return val
+        elif isinstance(inner, str) and inner:
+            return inner
+    return str(meta.get("thread_source") or "subagent")
+
+
+def _codex_subagents_of(parent_path: Path) -> list[tuple[Path, dict]]:
+    """Rollouts whose session_meta names this thread as their parent, oldest
+    first. Codex has no per-subagent meta file, so the label is derived from
+    the spawned thread's own session_meta."""
+    parent_sid = _codex_session_id_of(parent_path)
+    if not parent_sid:
+        return []
+    out: list[tuple[Path, dict]] = []
+    for p in _codex_session_files(include_subagents=True):
+        meta = _codex_read_session_meta(p)
+        if meta.get("parent_thread_id") != parent_sid:
+            continue
+        out.append((p, {"agentType": _codex_subagent_type(meta),
+                        "description": str(meta.get("thread_source") or "")}))
+    out.sort(key=lambda t: t[0].name)
+    return out
+
+
+CODEX_AGENT = AgentSpec(
+    name="codex", bin="codex", resume_label="codex resume",
+    owns=lambda p: _path_under(p, CODEX_SESSIONS_DIR),
+    session_files=_codex_session_files,
+    session_id_of=_codex_session_id_of,
+    iter_turns=_codex_iter_turns,
+    resume_argv=_codex_resume_argv,
+    caps=frozenset({"resume", "relocate", "backup", "subagents"}),
+    skip_perm_flag="--dangerously-bypass-approvals-and-sandbox",
+    live_probe=codex_live_probe,
+    live_info=codex_live_info,
+    data_root=lambda: CODEX_SESSIONS_DIR,
+    archive_prefix="codex",
+    rewrite_event_cwd=_codex_rewrite_event_cwd,
+    # A rollout's path encodes only its start date, so a relocated codex
+    # session keeps its file — only the recorded cwd moves.
+    relocated_path=lambda p, new_cwd: None,
+    subagents_of=_codex_subagents_of,
+    file_fingerprint=lambda p, **kw: _codex_file_fingerprint(p, **kw),
+)
+
+AGENTS: dict[str, AgentSpec] = {"claude": CLAUDE_AGENT, "codex": CODEX_AGENT}
+DEFAULT_AGENT = "claude"
+
+
+def require_cap(meta, cap: str, verb: str) -> bool:
+    """False (after printing why) when `meta`'s agent lacks capability `cap`.
+    Gates a command on agents that have no counterpart for it — attach, jobs
+    and hooks are Claude Code features no other agent provides."""
+    spec = agent_of(meta)
+    if cap in spec.caps:
+        return True
+    print(f"✗ {verb} is not supported for {spec.name} sessions", file=sys.stderr)
+    return False
+
+
+def agent_for_path(path: Path) -> AgentSpec:
+    """The AgentSpec owning a transcript path; claude for anything unowned, so
+    stray/test paths outside every data root keep their legacy behaviour."""
+    for spec in AGENTS.values():
+        if spec.owns(path):
+            return spec
+    return AGENTS[DEFAULT_AGENT]
+
+
+def agent_of(meta) -> AgentSpec:
+    """The AgentSpec for a SessionMeta: its `agent` field when set, else the
+    owner of its path, else claude (bare stubs in tests carry neither)."""
+    spec = AGENTS.get(getattr(meta, "agent", "") or "")
+    if spec is not None:
+        return spec
+    path = getattr(meta, "path", None)
+    return agent_for_path(path) if path else AGENTS[DEFAULT_AGENT]
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ ADAPTER LAYER — OS/terminal integration. Domain-aware (knows resume    ║
+# ║ commands & session alarms) but isolated from data model / rendering.   ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# ---------- terminal-window spawning ----------
+
+def _applescript_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+# NOTE: a macOS desktop notification was deliberately removed here. Plain
+# `osascript -e 'display notification …'` is owned by Script Editor (osascript
+# has no notification-bearing bundle id), so clicking the banner launched
+# Script Editor. There is no stdlib way to change the click owner, and
+# terminal-notifier/PyObjC violate the zero-dependency constraint. The
+# waiting-edge signal is instead carried by curses.beep() + a sticky toast
+# in the TUI loop (see the `if _new:` block).
+
+
+def session_open_invocation(claude_bin: str, session_id: str,
+                            short: str | None, skip_perm: bool,
+                            agent: str = DEFAULT_AGENT) -> str:
+    """The core CLI invocation to open a session in a terminal.
+
+    A background (agent-view) session has a job short id — open it with
+    `claude attach <short>` so the terminal takes over the *live*
+    supervisor-hosted session (catch-up summary + live stream). Everything else
+    is the agent's plain transcript resume (`claude --resume <sid>`,
+    `codex resume <sid>`, …), a fresh local fork, built from the AgentSpec's
+    `resume_argv`. attach connects to an existing session, so the resume-only
+    skip-permissions flag does not apply there.
+    """
+    import shlex
+    q = shlex.quote
+    if short:
+        return f"{q(claude_bin)} attach {q(short)}"
+    spec = AGENTS.get(agent, CLAUDE_AGENT)
+    return " ".join(q(a) for a in spec.resume_argv(claude_bin, session_id, skip_perm))
+
+
+# macOS terminal apps ship their CLI inside the .app bundle and never touch
+# PATH (WezTerm, Ghostty, kitty, Alacritty alike), so a bare shutil.which()
+# misses them — spawn would silently fall back to Terminal.app and focus would
+# skip the backend entirely. Probe the well-known bundle paths after PATH.
+_MACOS_TERM_APP_CLIS: dict[str, tuple[str, ...]] = {
+    "wezterm": (
+        "/Applications/WezTerm.app/Contents/MacOS/wezterm",
+        "~/Applications/WezTerm.app/Contents/MacOS/wezterm",
+    ),
+    "ghostty": (
+        "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+        "~/Applications/Ghostty.app/Contents/MacOS/ghostty",
+    ),
+    "kitty": (
+        "/Applications/kitty.app/Contents/MacOS/kitty",
+        "~/Applications/kitty.app/Contents/MacOS/kitty",
+    ),
+    "alacritty": (
+        "/Applications/Alacritty.app/Contents/MacOS/alacritty",
+        "~/Applications/Alacritty.app/Contents/MacOS/alacritty",
+    ),
+}
+
+
+def _find_terminal_cli(name: str) -> str | None:
+    """Locate a terminal emulator's CLI: PATH first, then app-bundle paths."""
+    import shutil
+    p = shutil.which(name)
+    if p:
+        return p
+    for cand in _MACOS_TERM_APP_CLIS.get(name, ()):
+        cand = os.path.expanduser(cand)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def open_in_new_terminal(cwd: str, session_id: str,
+                         skip_perm: bool = False,
+                         cmux_mode: str | None = None,
+                         attach_short: str | None = None,
+                         terminal: str | None = None,
+                         agent: str = DEFAULT_AGENT) -> tuple[bool, str]:
+    """Spawn `cd <cwd> && claude --resume <session_id>` in a new terminal window.
+
+    Returns (ok, info). On success, `info` names the terminal used; on failure,
+    it carries the error message to surface in the TUI toast.
+
+    When `cmux_mode` is "workspace" or "window", use cmux to open in the
+    respective mode instead of spawning a native terminal window.
+
+    `terminal` overrides the $TERM_PROGRAM-based terminal pick (same names the
+    _open_macos dispatch matches: wezterm/iterm/ghostty/kitty/alacritty/
+    terminal). GUI callers (cst.app) have no $TERM_PROGRAM, so without this
+    they always land on the Terminal.app fallback.
+    """
+    import shlex
+    import shutil
+
+    spec = AGENTS.get(agent, CLAUDE_AGENT)
+    claude_bin = shutil.which(spec.bin) or spec.bin
+
+    # `claude --resume <id>` is project-scoped: it only finds the session whose
+    # cwd-string mangles to the project dir holding the transcript. If the
+    # recorded cwd was since deleted/moved, `cd <cwd>` fails, the `&&`
+    # short-circuits and resume never runs. Recreate an empty placeholder so
+    # the cwd string still maps to the right project (claude reads the
+    # transcript from ~/.claude/projects/<mangled>/, not from the dir itself).
+    # Done parent-side too so terminals that take `--cwd <cwd>` (wezterm,
+    # ghostty, kitty, alacritty, cmux) don't choke on a missing directory.
+    # The cwd-placeholder dance is resume-specific (project-scoped `--resume`
+    # maps the cwd string to the transcript dir). attach addresses the live
+    # session by short id and needs none of it.
+    recreated_cwd = False
+    if not attach_short:
+        try:
+            if cwd and not os.path.isdir(cwd):
+                os.makedirs(cwd, exist_ok=True)
+                recreated_cwd = True
+        except OSError:
+            # Best-effort; the shell `mkdir -p` below retries, and if that also
+            # fails the existing cd-failure handler surfaces the error.
+            recreated_cwd = False
+
+    safe_cwd = shlex.quote(cwd)
+    safe_sid = shlex.quote(session_id)
+    safe_claude = shlex.quote(claude_bin)
+    skip_flag = " --dangerously-skip-permissions" if skip_perm else ""
+    # attach to the live bg session by short id, else resume the transcript.
+    core_cmd = session_open_invocation(claude_bin, session_id,
+                                       attach_short, skip_perm, agent=spec.name)
+    fail_label = "claude attach" if attach_short else spec.resume_label
+    # When the recorded cwd was gone we recreated an empty placeholder so
+    # project-scoped `claude --resume` can still find the transcript. If the
+    # folder was *moved* (not deleted) the real files live elsewhere — point
+    # the user at `ast relocate` instead of silently leaving them in an empty
+    # dir. We deliberately do NOT auto-detect the new location (a same-named
+    # sibling could be the wrong project).
+    recreated_notice = (
+        (
+            'printf "[ast] note: recorded cwd was missing — '
+            'recreated an EMPTY placeholder:\\n  %s\\n" {cwd}; '
+            'printf "[ast] history is intact and resuming, but project files '
+            'are NOT here.\\n"; '
+            'printf "[ast] if this folder was MOVED, remap it properly with:'
+            '\\n  ast relocate %s <new-path>\\n\\n" {sid}; '
+        ).format(cwd=safe_cwd, sid=safe_sid)
+        if recreated_cwd else ""
+    )
+
+    # Keep the terminal window open on failure so the user can read the error.
+    # `read -r` without a prompt waits for Enter; on clean exit (rc=0), we
+    # fall through and the shell closes normally.
+    shell_cmd = (
+        f"mkdir -p {safe_cwd} && "
+        f"cd {safe_cwd} && "
+        f"{recreated_notice}"
+        f"{core_cmd}; "
+        f'rc=$?; if [ "$rc" -ne 0 ]; then '
+        f'printf "\\n[ast] \'{fail_label}\' failed (exit %s)\\n"'
+        f' "$rc"; '
+        f"printf \"[ast] {spec.bin} binary: {claude_bin}\\n\"; "
+        f'printf "[ast] press Enter to close this window..."; '
+        f"read -r; fi"
+    )
+
+    term_program = terminal or os.environ.get("TERM_PROGRAM", "")
+
+    if cmux_mode:
+        return _open_in_cmux(cmux_mode, cwd, safe_cwd, core_cmd, session_id)
+
+    if sys.platform == "darwin":
+        return _open_macos(term_program, shell_cmd, cwd)
+
+    if sys.platform.startswith("linux"):
+        return _open_linux(cwd, shell_cmd)
+
+    return False, f"unsupported platform: {sys.platform}"
+
+
+def _open_in_cmux(cmux_mode, cwd, safe_cwd, core_cmd, session_id,
+                  ws_name: str | None = None):
+    """cmux open-mode branch of open_in_new_terminal (workspace tab / new window)."""
+    import shutil
+    import subprocess
+
+    cmux_bin = shutil.which("cmux")
+    if not cmux_bin:
+        return False, "cmux binary not found"
+    resume_cmd = (
+        f"mkdir -p {safe_cwd} && cd {safe_cwd} && "
+        f"{core_cmd}"
+    )
+    ws_name = ws_name or f"claude:{session_id[:8]}"
+    try:
+        if cmux_mode == "window":
+            result = subprocess.run(
+                [cmux_bin, "new-window"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                return False, f"cmux new-window failed: {result.stderr.strip()}"
+            parts = result.stdout.strip().split()
+            win_id = parts[1] if len(parts) >= 2 else None
+            if not win_id:
+                return False, "cmux new-window returned no window id"
+            ws_result = subprocess.run(
+                [cmux_bin, "list-workspaces", "--window", win_id],
+                capture_output=True, text=True, timeout=5,
+            )
+            ws_ref = None
+            for line in ws_result.stdout.strip().splitlines():
+                tok = line.split()
+                for t in tok:
+                    if t.startswith("workspace:"):
+                        ws_ref = t
+                        break
+                if ws_ref:
+                    break
+            if ws_ref:
+                subprocess.run(
+                    [cmux_bin, "send", "--workspace", ws_ref,
+                     resume_cmd + "\\n"],
+                    capture_output=True, timeout=5,
+                )
+                subprocess.run(
+                    [cmux_bin, "workspace-action", "--action", "rename",
+                     "--workspace", ws_ref, "--title", ws_name],
+                    capture_output=True, timeout=5,
+                )
+            return True, "opened in cmux window"
+        else:
+            subprocess.Popen(
+                [cmux_bin, "new-workspace", "--name", ws_name,
+                 "--cwd", cwd, "--command", resume_cmd],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            return True, "opened in cmux workspace"
+    except OSError as e:
+        return False, f"cmux spawn failed: {e}"
+    except subprocess.TimeoutExpired:
+        return False, "cmux command timed out"
+
+
+def _open_macos(term_program, shell_cmd, cwd):
+    """macOS branch of open_in_new_terminal: AppleScript / per-terminal CLI."""
+    import shutil
+    import subprocess
+
+    tp = term_program
+    tp_l = tp.lower()
+    escaped = _applescript_escape(shell_cmd)
+    bash_args = ["bash", "-lc", shell_cmd]
+
+    def _run_osascript(script: str, label: str) -> tuple[bool, str]:
+        try:
+            subprocess.Popen(
+                ["osascript", "-e", script],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            return True, f"opened in {label}"
+        except OSError as e:
+            return False, f"osascript failed: {e}"
+
+    def _run_cli(argv: list[str], label: str,
+                 activate_name: str | None = None) -> tuple[bool, str]:
+        try:
+            subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            if activate_name:
+                _activate_macos_app(activate_name)
+            return True, f"opened in {label}"
+        except OSError as e:
+            return False, f"{label} spawn failed: {e}"
+
+    terminal_app_script = (
+        'tell application "Terminal"\n'
+        '  activate\n'
+        f'  do script "{escaped}"\n'
+        "end tell"
+    )
+    iterm_script = (
+        'tell application "iTerm"\n'
+        '  activate\n'
+        '  set newWindow to (create window with default profile)\n'
+        f'  tell current session of newWindow to write text "{escaped}"\n'
+        "end tell"
+    )
+
+    # Match the user's current terminal first.
+    if "iterm" in tp_l:
+        return _run_osascript(iterm_script, "iTerm")
+    if "ghostty" in tp_l:
+        p = _find_terminal_cli("ghostty")
+        if p:
+            return _run_cli(
+                [p, "--working-directory", cwd, "-e", *bash_args],
+                "Ghostty", activate_name="Ghostty",
+            )
+    if "wezterm" in tp_l:
+        p = _find_terminal_cli("wezterm")
+        if p:
+            return _run_cli(
+                [p, "start", "--cwd", cwd, "--", *bash_args],
+                "WezTerm", activate_name="WezTerm",
+            )
+    if "kitty" in tp_l:
+        p = _find_terminal_cli("kitty")
+        if p:
+            return _run_cli(
+                [p, "--detach", "--directory", cwd, *bash_args],
+                "kitty", activate_name="kitty",
+            )
+    if "alacritty" in tp_l:
+        p = _find_terminal_cli("alacritty")
+        if p:
+            return _run_cli(
+                [p, "--working-directory", cwd, "-e", *bash_args],
+                "Alacritty", activate_name="Alacritty",
+            )
+    if tp == "Apple_Terminal" or tp_l == "terminal":
+        return _run_osascript(terminal_app_script, "Terminal")
+    if "warp" in tp_l:
+        # Warp has no public scripting API for running commands; user
+        # must run the one-liner manually. Fall back to Terminal.app.
+        ok, info = _run_osascript(terminal_app_script, "Terminal.app")
+        return ok, f"{info}  (Warp is not scriptable)"
+    if tp_l in ("vscode", "cursor"):
+        ok, info = _run_osascript(terminal_app_script, "Terminal.app")
+        return ok, f"{info}  (from {tp} integrated terminal)"
+
+    # Unknown / unset TERM_PROGRAM → default to Terminal.app.
+    ok, info = _run_osascript(terminal_app_script, "Terminal.app")
+    suffix = f"  (unknown TERM_PROGRAM={tp!r})" if tp else ""
+    return ok, info + suffix
+
+
+def _open_linux(cwd, shell_cmd):
+    """Linux branch of open_in_new_terminal: first working terminal emulator."""
+    import os
+    import shutil
+    import subprocess
+
+    candidates: list[str] = []
+    env_term = os.environ.get("TERMINAL")
+    if env_term:
+        candidates.append(env_term)
+    candidates.extend([
+        "x-terminal-emulator", "gnome-terminal", "konsole",
+        "alacritty", "kitty", "wezterm", "xterm",
+    ])
+    # On Linux we hand `shell_cmd` to `bash -lc`; the cwd is already
+    # embedded in shell_cmd, but some terminals honor --working-directory
+    # too — harmless to pass both.
+    for term in candidates:
+        path = shutil.which(term)
+        if not path:
+            continue
+        try:
+            if term == "gnome-terminal":
+                subprocess.Popen(
+                    [path, "--working-directory", cwd,
+                     "--", "bash", "-lc", shell_cmd],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            elif term == "konsole":
+                subprocess.Popen(
+                    [path, "--workdir", cwd,
+                     "-e", "bash", "-lc", shell_cmd],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            else:
+                # alacritty, kitty, wezterm, xterm, x-terminal-emulator, …
+                subprocess.Popen(
+                    [path, "-e", "bash", "-lc", shell_cmd],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            return True, f"opened in {term}"
+        except OSError:
+            continue
+    return False, "no supported terminal emulator found"
+
+
+def open_folder_in_new_terminal(cwd: str,
+                                cmux_mode: str | None = None,
+                                terminal: str | None = None) -> tuple[bool, str]:
+    """Spawn a plain interactive shell (no claude command) in a new terminal
+    window at the session's `cwd` — the TUI `o` action.
+
+    Reuses the same per-terminal spawners as open_in_new_terminal(). Unlike
+    the resume path, a missing cwd is an error instead of a recreate: an empty
+    placeholder would *look* like the project folder, so point the user at
+    `ast relocate` instead.
+    """
+    import shlex
+
+    if not cwd:
+        return False, "session has no recorded cwd"
+    if not os.path.isdir(cwd):
+        return False, f"cwd missing (moved? try `ast relocate`): {cwd}"
+
+    safe_cwd = shlex.quote(cwd)
+    # The spawners run their command via `bash -lc` (or AppleScript `do
+    # script`), whose shell exits — and closes the window — when the command
+    # ends. `exec` swaps that wrapper for the user's own interactive shell so
+    # the window stays open at the target folder.
+    shell_core = 'exec "${SHELL:-bash}" -l'
+    shell_cmd = f"cd {safe_cwd} && {shell_core}"
+
+    if cmux_mode:
+        base = os.path.basename(cwd.rstrip("/")) or "/"
+        return _open_in_cmux(cmux_mode, cwd, safe_cwd, shell_core, "",
+                             ws_name=f"dir:{base}")
+
+    if sys.platform == "darwin":
+        return _open_macos(terminal or os.environ.get("TERM_PROGRAM", ""),
+                           shell_cmd, cwd)
+
+    if sys.platform.startswith("linux"):
+        return _open_linux(cwd, shell_cmd)
+
+    return False, f"unsupported platform: {sys.platform}"
+
+
+# ── terminal-focus layer: raise an existing live session's window ──────────
+
+def _normalize_tty(raw: str) -> str | None:
+    """Normalize `ps -o tty=` output to a `/dev/ttysNNN` path, or None if the
+    process has no controlling tty (`?`/`??`/empty)."""
+    t = (raw or "").strip()
+    if not t or t in ("?", "??"):
+        return None
+    return t if t.startswith("/dev/") else "/dev/" + t
+
+
+def _wezterm_find_pane(list_json: str, tty: str) -> dict | None:
+    """Parse `wezterm cli list --format json` output, return the pane record
+    whose tty_name matches `tty`, or None."""
+    try:
+        panes = json.loads(list_json)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(panes, list):
+        return None
+    for p in panes:
+        if isinstance(p, dict) and p.get("tty_name") == tty:
+            return p
+    return None
+
+
+def _strip_status_glyph(title: str) -> str:
+    """Strip a leading status/spinner glyph (e.g. ✳ or braille spinner frames
+    like ⠂⠐) and surrounding whitespace from a WezTerm window title, leaving the
+    stable task text used for matching. Falls back to the trimmed original if
+    stripping would empty it."""
+    i = 0
+    while i < len(title) and (unicodedata.category(title[i]).startswith("S")
+                              or title[i].isspace()):
+        i += 1
+    stripped = title[i:].strip()
+    return stripped or title.strip()
+
+
+def _build_terminal_app_focus_script(tty: str) -> str:
+    """AppleScript: select the Terminal.app tab whose tty matches and raise it.
+    The script prints FOCUSED on a hit, NOMATCH otherwise."""
+    esc = _applescript_escape(tty)
+    return (
+        'tell application "Terminal"\n'
+        f'  set theTTY to "{esc}"\n'
+        '  repeat with w in windows\n'
+        '    repeat with t in tabs of w\n'
+        '      if (tty of t) is theTTY then\n'
+        '        set selected tab of w to t\n'
+        '        set index of w to 1\n'
+        '        activate\n'
+        '        return "FOCUSED"\n'
+        '      end if\n'
+        '    end repeat\n'
+        '  end repeat\n'
+        'end tell\n'
+        'return "NOMATCH"'
+    )
+
+
+def _build_iterm2_focus_script(tty: str) -> str:
+    """AppleScript: select the iTerm2 session whose tty matches and raise it.
+    The script prints FOCUSED on a hit, NOMATCH otherwise."""
+    esc = _applescript_escape(tty)
+    return (
+        'tell application "iTerm"\n'
+        f'  set theTTY to "{esc}"\n'
+        '  repeat with w in windows\n'
+        '    repeat with t in tabs of w\n'
+        '      repeat with s in sessions of t\n'
+        '        if (tty of s) is theTTY then\n'
+        '          select w\n'
+        '          select t\n'
+        '          select s\n'
+        '          activate\n'
+        '          return "FOCUSED"\n'
+        '        end if\n'
+        '      end repeat\n'
+        '    end repeat\n'
+        '  end repeat\n'
+        'end tell\n'
+        'return "NOMATCH"'
+    )
+
+
+def _build_wezterm_axraise_script(needle: str) -> str:
+    """AppleScript: raise the wezterm-gui window whose AX title contains `needle`,
+    via the macOS Accessibility API (WezTerm has no native CLI window-raise).
+    The script prints FOCUSED on a hit, NOMATCH otherwise."""
+    esc = _applescript_escape(needle)
+    return (
+        'tell application "System Events"\n'
+        f'  set theNeedle to "{esc}"\n'
+        '  repeat with p in (every process whose name is "wezterm-gui")\n'
+        '    repeat with w in windows of p\n'
+        '      if name of w contains theNeedle then\n'
+        '        perform action "AXRaise" of w\n'
+        '        set frontmost of p to true\n'
+        '        return "FOCUSED"\n'
+        '      end if\n'
+        '    end repeat\n'
+        '  end repeat\n'
+        'end tell\n'
+        'return "NOMATCH"'
+    )
+
+
+def _controlling_tty(pid: int) -> str | None:
+    """Return the normalized `/dev/ttysNNN` controlling tty for `pid`, or None."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "tty=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _normalize_tty(out.stdout)
+
+
+def _macos_proc_running(proc_name: str) -> bool:
+    """True if a process with this exact name is running (no GUI launch)."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["pgrep", "-x", proc_name],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def _wezterm_gui_sockets() -> list[str]:
+    """Paths of live WezTerm gui-sock-<pid> sockets, one per GUI instance.
+
+    The user may run several independent WezTerm GUI instances, each with its
+    own mux socket; `wezterm cli list` only sees the socket it connects to. The
+    socket filename encodes the gui pid, so we skip dead instances (whose
+    sockets would otherwise hang the cli)."""
+    import glob
+    base = os.path.expanduser("~/.local/share/wezterm")
+    socks = []
+    for s in sorted(glob.glob(os.path.join(base, "gui-sock-*"))):
+        pid_str = s.rsplit("-", 1)[-1]
+        if pid_str.isdigit() and _pid_alive(int(pid_str)):
+            socks.append(s)
+    return socks
+
+
+def _wezterm_cli_list(wez: str, socket: str | None) -> str | None:
+    """`wezterm cli list --format json` against one mux socket (None = the
+    inherited/default socket). Returns stdout, or None on failure."""
+    import subprocess
+    env = None
+    if socket:
+        env = dict(os.environ)
+        env["WEZTERM_UNIX_SOCKET"] = socket
+    try:
+        r = subprocess.run(
+            [wez, "cli", "list", "--format", "json"],
+            capture_output=True, text=True, timeout=5, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _focus_wezterm(tty: str) -> tuple[bool, str]:
+    """Find the WezTerm pane whose tty matches and raise its GUI window.
+
+    WezTerm has no CLI to raise a GUI window on macOS, so we map
+    tty -> pane -> window_title via `wezterm cli list`, then raise the matching
+    window via the macOS Accessibility API (System Events AXRaise), matching on
+    the title minus its animated leading status glyph. The session may live in
+    any of several WezTerm GUI instances, so we search the inherited mux socket
+    first, then every live gui-sock-<pid>. activate-pane first selects the right
+    pane (helps multi-pane windows); it is best-effort since the window raise is
+    what matters (and AXRaise already scans all wezterm-gui processes).
+    """
+    import subprocess
+    wez = _find_terminal_cli("wezterm")
+    if not wez:
+        return False, "wezterm not found"
+    sockets: list[str | None] = [None]
+    for s in _wezterm_gui_sockets():
+        if s not in sockets:
+            sockets.append(s)
+    pane = None
+    pane_socket: str | None = None
+    for sock in sockets:
+        stdout = _wezterm_cli_list(wez, sock)
+        if stdout is None:
+            continue
+        found = _wezterm_find_pane(stdout, tty)
+        if found is not None:
+            pane, pane_socket = found, sock
+            break
+    if pane is None:
+        return False, "no wezterm pane for tty"
+    pane_id = pane.get("pane_id")
+    if isinstance(pane_id, int):
+        env = None
+        if pane_socket:
+            env = dict(os.environ)
+            env["WEZTERM_UNIX_SOCKET"] = pane_socket
+        try:
+            subprocess.run(
+                [wez, "cli", "activate-pane", "--pane-id", str(pane_id)],
+                capture_output=True, text=True, timeout=5, env=env,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass  # best-effort pane select; window raise is what matters
+    title = pane.get("window_title")
+    if not isinstance(title, str) or not title.strip():
+        return False, "no wezterm window title"
+    needle = _strip_status_glyph(title)
+    if not needle:
+        return False, "empty wezterm title"
+    ok, _info = _run_applescript_focus(
+        _build_wezterm_axraise_script(needle), "WezTerm")
+    if ok:
+        return True, f"WezTerm window «{needle[:40]}»"
+    return False, "no wezterm window raised"
+
+
+def _run_applescript_focus(script: str, label: str) -> tuple[bool, str]:
+    """Run a focus AppleScript; success only if it printed FOCUSED."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False, f"{label} osascript failed"
+    if r.returncode == 0 and "FOCUSED" in r.stdout:
+        return True, f"{label} tab"
+    return False, f"no {label} tab for tty"
+
+
+def _focus_terminal_app(tty: str) -> tuple[bool, str]:
+    return _run_applescript_focus(
+        _build_terminal_app_focus_script(tty), "Terminal.app")
+
+
+def _focus_iterm2(tty: str) -> tuple[bool, str]:
+    return _run_applescript_focus(
+        _build_iterm2_focus_script(tty), "iTerm2")
+
+
+def _cmux_locate_surface(debug_out: str, tty_base: str) -> dict | None:
+    """Parse `cmux --id-format both debug-terminals`; return the window/
+    workspace/pane UUIDs of the surface whose `tty=<tty_base>` line matches,
+    or None. Each surface is a multi-line block: the header line carries
+    `window=window:N (UUID) workspace=... pane=...`, and the controlling pty
+    appears on a later `tty=ttysNNN` line of the same block."""
+    uuid = r"\(([0-9A-Fa-f-]{36})\)"
+    pending: dict | None = None
+    for line in debug_out.splitlines():
+        s = line.strip()
+        if re.match(r"\[\d+\]\s+surface:", s):
+            win = re.search(rf"window=window:\d+ {uuid}", s)
+            ws = re.search(rf"workspace=workspace:\d+ {uuid}", s)
+            pane = re.search(rf"pane=pane:\d+ {uuid}", s)
+            pending = {
+                "window": win.group(1) if win else None,
+                "workspace": ws.group(1) if ws else None,
+                "pane": pane.group(1) if pane else None,
+            }
+            continue
+        m = re.search(r"\btty=(ttys[0-9]+)\b", s)
+        if m and pending is not None and m.group(1) == tty_base:
+            if pending["window"] and pending["workspace"]:
+                return pending
+            return None
+    return None
+
+
+def _activate_macos_app(app_name: str) -> None:
+    """Bring a macOS app to the foreground at the OS (NSApp) level. Best-effort,
+    no-op off macOS or when osascript is missing.
+
+    cmux's own focus-window / set-app-focus / simulate-app-active only move its
+    INTERNAL current-window — none of them activate the app process, so when
+    cmux isn't already frontmost (user in another app, or target in a different
+    OS window) the window never visibly rises. Only an AppleScript `activate`
+    (NSApplication activate) brings the current window forward."""
+    if sys.platform != "darwin":
+        return
+    import shutil
+    import subprocess
+    osa = shutil.which("osascript")
+    if not osa:
+        return
+    try:
+        subprocess.run(
+            [osa, "-e", f'tell application "{app_name}" to activate'],
+            capture_output=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _cmux_available() -> bool:
+    """True when the cmux GUI is reachable, used to gate the cmux focus backend.
+
+    `pgrep -x cmux` (the old check) is unreliable: the GUI's process name is its
+    full bundle path (/Applications/cmux.app/Contents/MacOS/cmux), so an exact
+    match never catches it — pgrep only ever sees transient `cmux` CLI
+    invocations, making the gate flaky (it passes only while a CLI call happens
+    to be mid-run). Inside a cmux workspace the env var is definitive and free;
+    otherwise fall back to `cmux ping` (a socket round-trip to the live GUI)."""
+    import shutil
+    cmux = shutil.which("cmux")
+    if cmux is None:
+        return False
+    if os.environ.get("CMUX_WORKSPACE_ID"):
+        return True
+    import subprocess
+    try:
+        r = subprocess.run([cmux, "ping"], capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def _focus_cmux(tty: str) -> tuple[bool, str]:
+    """Raise the cmux workspace/window hosting the surface whose pty matches
+    `tty` (e.g. /dev/ttys005). cmux is a Ghostty-based GUI multiplexer with no
+    per-tty raise command, so we map tty -> surface -> (workspace, window) via
+    `debug-terminals`, then select-workspace + focus-pane + focus-window, and
+    finally activate the cmux app so the now-current window actually rises to
+    the macOS foreground (focus-window alone only moves cmux's internal
+    current-window — see `_activate_macos_app`). Refs like `window:1` are
+    rejected by focus-window, so we drive everything by the UUIDs that
+    `--id-format both` prints."""
+    import shutil
+    import subprocess
+    cmux = shutil.which("cmux")
+    if not cmux:
+        return False, "cmux not found"
+    tty_base = tty.rsplit("/", 1)[-1]  # /dev/ttys005 -> ttys005
+    try:
+        r = subprocess.run(
+            [cmux, "--id-format", "both", "debug-terminals"],
+            capture_output=True, text=True, timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False, "cmux debug-terminals failed"
+    if r.returncode != 0:
+        return False, "cmux debug-terminals error"
+    loc = _cmux_locate_surface(r.stdout, tty_base)
+    if not loc:
+        return False, f"no cmux surface for {tty_base}"
+    ws, win, pane = loc["workspace"], loc["window"], loc["pane"]
+    try:
+        subprocess.run(
+            [cmux, "select-workspace", "--workspace", ws, "--window", win],
+            capture_output=True, timeout=5,
+        )
+        if pane:
+            subprocess.run(
+                [cmux, "focus-pane", "--pane", pane,
+                 "--workspace", ws, "--window", win],
+                capture_output=True, timeout=5,
+            )
+        fr = subprocess.run(
+            [cmux, "focus-window", "--window", win],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False, "cmux focus failed"
+    if fr.returncode != 0:
+        return False, "cmux focus-window failed"
+    _activate_macos_app("cmux")  # OS-level raise; focus-window only sets internal current-window
+    return True, "cmux workspace"
+
+
+def focus_existing_window(session_id: str, live_info: dict) -> tuple[bool, str]:
+    """Raise the existing terminal window/tab/pane hosting a live session.
+
+    Derives the claude PID's controlling tty, then probes terminal backends in
+    a smart order (current $TERM_PROGRAM first), short-circuiting on the first
+    match. Returns (False, reason) when no backend can find/raise the window, so
+    the caller falls back to opening a new window.
+    """
+    pid = live_info.get("pid")
+    if not isinstance(pid, int):
+        return False, "no pid"
+    tty = _controlling_tty(pid)
+    if not tty:
+        return False, "no controlling tty"
+
+    tp = os.environ.get("TERM_PROGRAM", "").lower()
+    wez = ("WezTerm", lambda: _find_terminal_cli("wezterm") is not None,
+           _focus_wezterm)
+    term = ("Terminal.app", lambda: _macos_proc_running("Terminal"), _focus_terminal_app)
+    iterm = ("iTerm2", lambda: _macos_proc_running("iTerm2"), _focus_iterm2)
+    cmux = ("cmux", _cmux_available, _focus_cmux)
+
+    # In cmux TERM_PROGRAM is "ghostty" (its embedded terminal), so cmux can't
+    # be detected from $TERM_PROGRAM alone — probe it first when we're inside a
+    # cmux workspace, and keep it as a fallback everywhere else.
+    if os.environ.get("CMUX_WORKSPACE_ID"):
+        order = [cmux, wez, term, iterm]
+    elif "wezterm" in tp:
+        order = [wez, term, iterm, cmux]
+    elif "iterm" in tp:
+        order = [iterm, term, wez, cmux]
+    elif tp == "apple_terminal":
+        order = [term, iterm, wez, cmux]
+    else:
+        order = [cmux, wez, term, iterm]
+
+    for _name, available, focus in order:
+        try:
+            if not available():
+                continue
+            ok, info = focus(tty)
+            if ok:
+                return True, info
+        except Exception:
+            continue
+    return False, f"no window found for {tty}"
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ UTIL LAYER — domain-agnostic, reusable helpers (string/width/time/IO). ║
+# ║ Contract: nothing here may reference SessionMeta, status glyphs,       ║
+# ║ caches, or argparse. Safe to lift into a module verbatim.              ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# ---------- display width helpers (Korean/East-Asian-aware) ----------
+
+def display_width(s: str) -> int:
+    s = unicodedata.normalize("NFC", s)
+    w = 0
+    for ch in s:
+        ea = unicodedata.east_asian_width(ch)
+        w += 2 if ea in ("W", "F") else 1
+    return w
+
+
+def pad_display(s: str, width: int, align: str = "left") -> str:
+    pad = width - display_width(s)
+    if pad <= 0:
+        return s
+    return s + " " * pad if align == "left" else " " * pad + s
+
+
+def truncate_display(s: str, width: int) -> str:
+    """Truncate a string so its display width is <= width. Appends … when cut."""
+    s = unicodedata.normalize("NFC", s)
+    if display_width(s) <= width:
+        return s
+    out = ""
+    used = 0
+    for ch in s:
+        ea = unicodedata.east_asian_width(ch)
+        cw = 2 if ea in ("W", "F") else 1
+        if used + cw > width - 1:  # reserve 1 for ellipsis
+            break
+        out += ch
+        used += cw
+    return out + "…"
+
+
+def truncate_display_tail(s: str, width: int) -> str:
+    """Truncate from the left so the tail of the string is preserved.
+
+    Used for paths where the final segment (project name) is the meaningful
+    part to keep visible; prepends … when cut.
+    """
+    s = unicodedata.normalize("NFC", s)
+    if display_width(s) <= width:
+        return s
+    out_chars: list[str] = []
+    used = 0
+    for ch in reversed(s):
+        ea = unicodedata.east_asian_width(ch)
+        cw = 2 if ea in ("W", "F") else 1
+        if used + cw > width - 1:  # reserve 1 for ellipsis
+            break
+        out_chars.append(ch)
+        used += cw
+    return "…" + "".join(reversed(out_chars))
+
+
+# ---------- common helpers ----------
+
+def shorten_path(p: str) -> str:
+    if p and p.startswith(HOME):
+        return "~" + p[len(HOME):]
+    return p or "?"
+
+
+def parse_ts(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def fmt_ts(dt: datetime | None) -> str:
+    if not dt:
+        return "?"
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def extract_text(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                parts.append(block.get("text", ""))
+            elif btype == "tool_use":
+                name = block.get("name", "")
+                parts.append(f"[tool_use:{name}]")
+            elif btype == "tool_result":
+                tr = block.get("content")
+                if isinstance(tr, str):
+                    parts.append(tr)
+                elif isinstance(tr, list):
+                    for sub in tr:
+                        if isinstance(sub, dict) and sub.get("type") == "text":
+                            parts.append(sub.get("text", ""))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def truncate(s: str, n: int) -> str:
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ CORE LAYER — domain model & state: live/registry/overlay/done, status  ║
+# ║ resolution, SessionMeta, loading/cache. No printing, no argparse.      ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# ---------- live process registry ----------
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _iter_registry_records(sort: bool = False):
+    """Yield each parsed ~/.claude/sessions/*.json record (a dict), skipping
+    unreadable / malformed files. Yields nothing when the registry dir is
+    absent. sort=True iterates files in sorted order (stable CLI output)."""
+    if not SESSIONS_REGISTRY_DIR.is_dir():
+        return
+    files = SESSIONS_REGISTRY_DIR.glob("*.json")
+    if sort:
+        files = sorted(files)
+    for f in files:
+        try:
+            with f.open("r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except (OSError, json.JSONDecodeError):
+            continue
+        yield data
+
+
+def scan_live_sessions() -> tuple[set[str], set[str]]:
+    """Return (live_session_ids, all_registered_session_ids).
+
+    live = process with PID still running.
+    all_registered = every session id present in the registry (stale entries
+    included). A session is 세션종료 if it's registered but not live.
+    Anything not registered also counts as 세션종료 (no proof it's alive).
+    """
+    live: set[str] = set()
+    registered: set[str] = set()
+    for data in _iter_registry_records():
+        sid = data.get("sessionId")
+        pid = data.get("pid")
+        if not sid:
+            continue
+        registered.add(sid)
+        if isinstance(pid, int) and _pid_alive(pid):
+            live.add(sid)
+    return live, registered
+
+
+def scan_registry_status() -> dict[str, dict]:
+    """sessionId -> {"status": str|None, "updatedAt": int|None} from the
+    ~/.claude/sessions registry (Claude Code's own busy/idle signal)."""
+    out: dict[str, dict] = {}
+    for data in _iter_registry_records():
+        if not isinstance(data, dict):
+            continue
+        sid = data.get("sessionId")
+        if not sid:
+            continue
+        st = data.get("status")
+        up = data.get("updatedAt")
+        out[sid] = {
+            "status": st if isinstance(st, str) else None,
+            "updatedAt": up if isinstance(up, (int, float)) else None,
+        }
+    return out
+
+
+def scan_jobs() -> dict[str, dict]:
+    """sessionId -> agent-view job record from ~/.claude/jobs/<short>/state.json.
+
+    Background (agent-view) sessions are managed by the supervisor and may not
+    appear in the pid registry once their idle process is stopped. Their
+    persisted state.json still carries the true agent-view `state`, so ast can
+    show ●/!/◦ instead of a misleading ○ ended. Keyed by sessionId (falling
+    back to resumeSessionId) so it joins straight onto the transcript-derived
+    SessionMeta. Robust to the sibling pins.json/.order files and partial dirs.
+    """
+    out: dict[str, dict] = {}
+    if not JOBS_DIR.is_dir():
+        return out
+    for d in JOBS_DIR.iterdir():
+        if not d.is_dir():
+            continue  # skip pins.json / .order and other stray files
+        try:
+            with (d / "state.json").open("r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        sid = data.get("sessionId") or data.get("resumeSessionId")
+        if not sid:
+            continue
+        st = data.get("state")
+        out[sid] = {
+            "state": st if isinstance(st, str) else None,
+            "tempo": data.get("tempo") if isinstance(data.get("tempo"), str) else None,
+            "detail": data.get("detail") or "",
+            "template": data.get("template") or "",
+            "short": data.get("daemonShort") or d.name,
+            "cwd": data.get("cwd") or "",
+            "worktreeBranch": data.get("worktreeBranch") or "",
+            "worktreePath": data.get("worktreePath") or "",
+            "updatedAt": data.get("updatedAt"),
+        }
+    return out
+
+
+def job_short_for(session_id: str) -> str | None:
+    """The agent-view daemonShort for a session, or None if it is not a
+    background (job-backed) session. Used to attach/stop/logs the live session
+    via the `claude` CLI instead of forking its transcript."""
+    return (scan_jobs().get(session_id) or {}).get("short")
+
+
+def job_badge(job: dict | None) -> str:
+    """Compact tag for a job-backed (background/agent-view) row, e.g.
+    `[exec]`, `[bg]`, `[bg ⎇worktree-fix]`, `[bg ∙]`. Empty for non-bg sessions.
+    Surfaces the agent-view `template`, the git worktree branch the session is
+    editing on, and a ∙ when the process has exited (agent-view's ✻/∙ icon
+    shape: tempo != "active" means recoverable-but-not-running) — context the
+    transcript alone does not carry."""
+    if not job:
+        return ""
+    base = "exec" if (job.get("template") or "") == "exec" else "bg"
+    tempo = job.get("tempo")
+    if tempo and tempo != "active":
+        base += " ∙"               # process exited; still attach/respawn-able
+    if base.startswith("exec"):
+        return f"[{base}]"
+    branch = job.get("worktreeBranch") or ""
+    return f"[{base} ⎇{branch}]" if branch else f"[{base}]"
+
+
+def read_pins() -> set[str]:
+    """agent-view's pinned daemonShorts from ~/.claude/jobs/pins.json (a JSON
+    array of short-id strings, e.g. ["cbe8e3bb","4c51890c"]; stale shorts whose
+    job was removed persist). Read-only — ast never writes this supervisor file.
+    """
+    try:
+        with (JOBS_DIR / "pins.json").open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {x for x in data if isinstance(x, str)} if isinstance(data, list) else set()
+
+
+PIN_GLYPH = "*"   # 1-col ASCII (emoji pin is double-width, breaks alignment)
+
+
+def pin_marker(short: str | None, pins: set[str]) -> str:
+    """`*` when this job short is pinned in agent-view, else empty."""
+    return PIN_GLYPH if short and short in pins else ""
+
+
+def bg_delete_warning(target_sids: list[str], jobs: dict) -> str:
+    """Warning shown before deleting sessions that are job-backed: ast's delete
+    only unlinks the transcript — the live supervisor process keeps running.
+    Empty string when no target is a background session."""
+    n = sum(1 for s in target_sids if s in jobs)
+    if not n:
+        return ""
+    return (f"⚠ {n} background session(s): delete removes the transcript only — "
+            f"the live process keeps running. `claude stop <short>` first.")
+
+
+def read_daemon_roster() -> dict | None:
+    """Parse ~/.claude/daemon/roster.json (the supervisor's worker roster), or
+    None when there is no reachable daemon / unreadable file."""
+    try:
+        with (DAEMON_DIR / "roster.json").open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def daemon_status_line(roster: dict | None) -> str:
+    """One-line supervisor health summary from a roster dict."""
+    if not roster:
+        return "daemon: not running"
+    pid = roster.get("supervisorPid")
+    workers = roster.get("workers")
+    n = len(workers) if isinstance(workers, dict) else 0
+    return f"daemon: pid {pid} · {n} worker(s)"
+
+
+def get_live_session_info(session_id: str) -> dict | None:
+    """Return the registry record (pid, cwd, ideName, …) for a live session.
+    Registry-less agents (codex) answer through their spec's live_info."""
+    for data in _iter_registry_records():
+        if data.get("sessionId") == session_id:
+            pid = data.get("pid")
+            if isinstance(pid, int) and _pid_alive(pid):
+                return data
+            return None
+    for spec in AGENTS.values():
+        if spec.live_info is None:
+            continue
+        try:
+            info = spec.live_info(session_id)
+        except Exception:
+            info = None
+        if info:
+            return info
+    return None
+
+
+# ---------- done-state overlay ----------
+
+def load_state() -> dict:
+    try:
+        with STATE_PATH.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_PATH.with_suffix(f".{os.getpid()}.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        tmp.replace(STATE_PATH)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _state_lock():
+    """Serialize the read-modify-write of state.json across concurrently
+    running hook processes (many sessions can fire status hooks at once).
+    Advisory and best-effort: if fcntl is unavailable or the lock can't be
+    acquired, proceed unlocked rather than block a status update."""
+    f = None
+    if fcntl is not None:
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            f = open(STATE_PATH.with_suffix(".lock"), "w")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            if f is not None:
+                f.close()
+            f = None
+    try:
+        yield
+    finally:
+        if f is not None:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            finally:
+                f.close()
+
+
+def done_ids() -> set[str]:
+    state = load_state()
+    return set((state.get("done") or {}).keys())
+
+
+def mark_done(session_id: str) -> bool:
+    """Toggle done state; return True if now marked done, False if unmarked."""
+    with _state_lock():
+        state = load_state()
+        done = state.setdefault("done", {})
+        if session_id in done:
+            del done[session_id]
+            save_state(state)
+            return False
+        done[session_id] = datetime.now(timezone.utc).isoformat()
+        save_state(state)
+        return True
+
+
+def set_done(session_id: str, value: bool) -> None:
+    with _state_lock():
+        state = load_state()
+        done = state.setdefault("done", {})
+        if value:
+            done[session_id] = datetime.now(timezone.utc).isoformat()
+        else:
+            done.pop(session_id, None)
+        save_state(state)
+
+
+# Refusing done on an actively-working (●) session: the task is still running,
+# and since done > every state, the ✓ would mask a live, quota-burning session.
+# Stop it with `claude stop <short>` → ended, or wait for the turn to finish →
+# idle, then mark done. Other states (waiting/idle/ended) and unmarking are
+# allowed. (ast's own Del removes the transcript but does NOT stop the live
+# supervisor process, so it is not a substitute for `claude stop`.)
+DONE_WORKING_REASON = (
+    "● actively working — refusing to mark done (the ✓ flag would hide a live, "
+    "quota-burning session). Stop it with `claude stop <short>` or wait for the "
+    "turn to finish, then mark done. Pass --force to override.")
+
+
+def done_guard_blocks(status: str, force: bool = False) -> bool:
+    """True when a done=True request must be refused: the session is actively
+    working (●) and not forced. Pure decision so every entry point (cmd_done,
+    the done! prompt-hook, TUI D / Ctrl-D) refuses consistently. Already-done
+    sessions resolve to ✓ (not ●) so unmarking is never blocked here."""
+    return (not force) and status == STATUS_WORKING
+
+
+def rm_guard_blocks(status: str, force: bool = False) -> bool:
+    """True when a delete request must be refused: the session's process is
+    live and still owns the transcript (● working / ! waiting), not forced.
+
+    A live Claude process keeps the `.jsonl` open and appends to it. Unlinking
+    doesn't stop the process — it keeps writing to the now-unlinked inode, so
+    everything said after the delete vanishes silently. ◦ idle is allowed: no
+    turn is in flight, so nothing is lost unless the user resumes that session.
+    Deliberately stricter than `done_guard_blocks` (which only blocks ●).
+    """
+    return (not force) and status in (STATUS_WORKING, STATUS_WAITING)
+
+
+def status_overlay() -> dict:
+    """state.json hook-driven status overlay: sid -> {state,event,ts}."""
+    val = load_state().get("status")
+    return val if isinstance(val, dict) else {}
+
+
+def set_status(session_id: str, state: str | None, event: str) -> None:
+    """Record (or clear, when state is None) a session's hook status."""
+    with _state_lock():
+        st = load_state()
+        bucket = st.get("status")
+        if not isinstance(bucket, dict):
+            bucket = {}
+            st["status"] = bucket
+        if state is None:
+            bucket.pop(session_id, None)
+        else:
+            bucket[session_id] = {
+                "state": state,
+                "event": event,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+        save_state(st)
+
+
+def resolve_status(session_id: str, live: set[str], done: set[str],
+                   registry: dict | None = None,
+                   overlay: dict | None = None,
+                   jobs: dict | None = None) -> str:
+    return classify_status(
+        done=session_id in done,
+        alive=session_id in live,
+        overlay=(overlay or {}).get(session_id),
+        reg=(registry or {}).get(session_id),
+        job=(jobs or {}).get(session_id),
+    )
+
+
+@dataclass
+class StatusContext:
+    """Bundles the four status sources (live / done / registry / overlay) so
+    commands resolve status without re-deriving the quad in every function.
+    Replaces the repeated scan_live_sessions/scan_registry_status/
+    status_overlay/done_ids boilerplate across the CLI and TUI."""
+    live: set[str]
+    done: set[str]
+    registry: dict
+    overlay: dict
+    jobs: dict
+    pins: set = field(default_factory=set)  # agent-view pinned daemonShorts
+
+    @classmethod
+    def capture(cls) -> "StatusContext":
+        live, _ = scan_live_sessions()
+        registry = scan_registry_status()
+        # Agents without a pid registry (codex) report their own live
+        # sessions; fold them in as synthetic registry records so
+        # classify_status needs no agent-specific branch.
+        for spec in AGENTS.values():
+            if spec.live_probe is None:
+                continue
+            try:
+                probed = spec.live_probe()
+            except Exception:
+                continue
+            for sid, rec in probed.items():
+                live.add(sid)
+                registry[sid] = {"status": "busy" if rec.get("busy") else "idle",
+                                 "updatedAt": rec.get("updatedAt")}
+        return cls(live=live, done=done_ids(),
+                   registry=registry, overlay=status_overlay(),
+                   jobs=scan_jobs(), pins=read_pins())
+
+    def resolve(self, session_id: str) -> str:
+        return resolve_status(session_id, self.live, self.done,
+                              self.registry, self.overlay, self.jobs)
+
+    def counts(self, sessions) -> dict:
+        c = {g: 0 for g in STATUS_ALL}
+        for s in sessions:
+            c[self.resolve(s.session_id)] += 1
+        return c
+
+    def waiting(self, sessions) -> set:
+        return waiting_ids(sessions, self.live, self.done,
+                           self.registry, self.overlay, self.jobs)
+
+
+def _iso_to_ms(iso: str | None) -> int | None:
+    """ISO-8601 string -> epoch milliseconds, or None if unparseable."""
+    dt = parse_ts(iso) if iso else None
+    if dt is None:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+def classify_status(*, done: bool, alive: bool,
+                       overlay: dict | None,
+                       reg: dict | None,
+                       job: dict | None = None) -> str:
+    """Pure status decision. See spec 'Resolution priority'.
+
+    overlay: state.json status entry for this session, e.g.
+             {"state": "waiting", "event": "Notification", "ts": "<iso>"} or None
+    reg:     registry record for this session, e.g.
+             {"status": "idle", "updatedAt": <ms>} or None
+    job:     ~/.claude/jobs record for this session, e.g.
+             {"state": "blocked", ...} or None. Only consulted when the pid
+             registry shows the session as not alive: a background session
+             whose process the supervisor stopped is absent from the registry
+             but still carries its true agent-view state, so we surface that
+             instead of a misleading ○ ended. A live (attached/running) bg
+             session is in the registry, so the fresher signal there wins.
+    """
+    if done:
+        return STATUS_DONE
+    if not alive:
+        if job:
+            return _JOB_STATE_GLYPH.get(job.get("state"), STATUS_ENDED)
+        return STATUS_ENDED
+    reg_status = (reg or {}).get("status")
+    reg_ms = (reg or {}).get("updatedAt")
+    if overlay:
+        state = overlay.get("state")
+        if state in ("working", "waiting") and reg_status == "idle":
+            ov_ms = _iso_to_ms(overlay.get("ts"))
+            if (reg_ms is not None and ov_ms is not None
+                    and reg_ms > ov_ms):
+                return STATUS_IDLE
+        return _STATE_GLYPH.get(state, STATUS_WORKING)
+    if reg_status == "busy":
+        return STATUS_WORKING
+    if reg_status == "waiting":
+        # Claude Code 2.x registry natively flags blocked-on-user state
+        # (waitingFor="permission prompt"/"selection"/...). Surface it even
+        # with no hook overlay installed.
+        return STATUS_WAITING
+    if reg_status == "idle":
+        return STATUS_IDLE
+    return STATUS_WORKING  # legacy: alive but no signal
+
+
+# ---- auto-rescan (TUI) config + transition helpers ----
+AUTO_RESCAN_PRESETS = (5, 10, 30, 60, 120)        # selectable seconds
+AUTO_RESCAN_DEFAULT_INTERVAL = 10
+AUTO_RESCAN_TICK_MS = 1000                         # getch idle heartbeat (ms)
+
+
+def load_auto_rescan() -> tuple[bool, int]:
+    """(enabled, interval_seconds) from state.json. Safe defaults
+    (True, 10) on missing / corrupt / out-of-range."""
+    cfg = load_state().get("auto_rescan")
+    if not isinstance(cfg, dict):
+        return True, AUTO_RESCAN_DEFAULT_INTERVAL
+    enabled = cfg.get("enabled")
+    interval = cfg.get("interval")
+    if not isinstance(enabled, bool):
+        enabled = True
+    if not isinstance(interval, int) or interval not in AUTO_RESCAN_PRESETS:
+        interval = AUTO_RESCAN_DEFAULT_INTERVAL
+    return enabled, interval
+
+
+def save_auto_rescan(enabled: bool, interval: int) -> None:
+    if interval not in AUTO_RESCAN_PRESETS:
+        interval = AUTO_RESCAN_DEFAULT_INTERVAL
+    st = load_state()
+    st["auto_rescan"] = {"enabled": bool(enabled), "interval": int(interval)}
+    save_state(st)
+
+
+# ── TUI color theme persistence + resolution ────────────────────────────────
+#
+# Mirrors how auto-rescan stores its preference in state.json — the theme is a
+# user preference of the same nature, so it lives in the same overlay (no extra
+# config file). The stored value is one of "auto"/"dark"/"light"; "auto" defers
+# the dark↔light decision to resolve_theme() (COLORFGBG sniff). The live `t`
+# toggle persists the *concrete* theme it switched to, so the choice sticks.
+
+THEME_CHOICES = ("auto", "dark", "light")
+
+
+def load_theme() -> str:
+    """Stored TUI theme preference from state.json ("auto"|"dark"|"light").
+    Defaults to "auto" on missing / unknown values."""
+    val = load_state().get("theme")
+    return val if val in THEME_CHOICES else "auto"
+
+
+def save_theme(theme: str) -> None:
+    if theme not in THEME_CHOICES:
+        theme = "auto"
+    st = load_state()
+    st["theme"] = theme
+    save_state(st)
+
+
+# ---- column sort preference (CLI `--sort` / TUI `s`,`S`) -------------------
+# Sortable columns shared by `ast list` and the TUI picker. Each maps to a
+# SessionMeta attribute (or the live-resolved status). Stored in state.json the
+# same way the theme is, so the TUI choice sticks across runs and `ast list`
+# (without an explicit --sort) mirrors it.
+
+# Ordered to match the on-screen column layout (ST → LAST ACTIVITY → MSGS →
+# MESSAGE → PROJECT), so the `s` key cycles left-to-right across the visible
+# columns.
+SORT_KEYS = ("status", "time", "msgs", "message", "project")
+SORT_LABELS = {  # compact tag rendered in the TUI header / toasts
+    "status": "status", "time": "time", "msgs": "msgs", "message": "message",
+    "project": "project",
+}
+# Natural direction per column (True = descending). Time/msgs read best
+# newest-/most-first; status/message/project read best ascending (rank / A→Z).
+_SORT_DEFAULT_DESC = {
+    "time": True, "status": False, "msgs": True, "message": False,
+    "project": False,
+}
+
+
+def _status_sort_rank(st: str) -> int:
+    """Rank a status glyph for sorting: working→waiting→idle→ended→done."""
+    try:
+        return STATUS_ALL.index(st)
+    except ValueError:
+        return len(STATUS_ALL)
+
+
+def sort_sessions(sessions: list["SessionMeta"], ctx, sort_key: str = "time",
+                  reverse: "bool | None" = None) -> list["SessionMeta"]:
+    """Return a NEW list of ``sessions`` ordered by ``sort_key``.
+
+    ``ctx`` is a StatusContext — needed to resolve live status for status-sort.
+    ``reverse=None`` uses the column's natural direction (``_SORT_DEFAULT_DESC``).
+    Equal primary keys break by ``last_ts`` descending: Python's sort is stable,
+    so pre-sorting by recency keeps newest-first within ties.
+    """
+    if sort_key not in SORT_KEYS:
+        sort_key = "time"
+    if reverse is None:
+        reverse = _SORT_DEFAULT_DESC[sort_key]
+    _MIN = datetime.min.replace(tzinfo=timezone.utc)
+    base = sorted(sessions, key=lambda m: m.last_ts or _MIN, reverse=True)
+    if sort_key == "time":
+        return base if reverse else base[::-1]
+    if sort_key == "msgs":
+        keyfn = lambda m: m.msg_count
+    elif sort_key == "status":
+        keyfn = lambda m: _status_sort_rank(ctx.resolve(m.session_id))
+    elif sort_key == "message":
+        keyfn = lambda m: (m.first_user_msg or "").lower()
+    else:  # project
+        keyfn = lambda m: (shorten_path(m.cwd) or "").lower()
+    return sorted(base, key=keyfn, reverse=reverse)
+
+
+def load_sort() -> "tuple[str, bool]":
+    """Stored (sort_key, reverse) from state.json; ("time", desc) by default."""
+    cfg = load_state().get("sort")
+    if isinstance(cfg, dict) and cfg.get("key") in SORT_KEYS:
+        key = cfg["key"]
+        rev = cfg.get("reverse")
+        return key, rev if isinstance(rev, bool) else _SORT_DEFAULT_DESC[key]
+    return "time", _SORT_DEFAULT_DESC["time"]
+
+
+def save_sort(sort_key: str, reverse: bool) -> None:
+    if sort_key not in SORT_KEYS:
+        sort_key = "time"
+    st = load_state()
+    st["sort"] = {"key": sort_key, "reverse": bool(reverse)}
+    save_state(st)
+
+
+# ---- origin filter (CLI `--origin` / TUI `f`,`F`) --------------------------
+# Who started the session. Claude Code stamps every user/assistant event with
+# an `entrypoint`: "cli" for a session a human typed into a terminal (agent-view
+# `--bg` jobs included — the user dispatched them), and "sdk-py"/"sdk-cli"/
+# "sdk-ts" for one an SDK/agent spawned programmatically (security-review hooks,
+# `claude -p` scripts, cst.app-style tooling). Those SDK sessions can flood the
+# list, hence a filter for either direction.
+#
+# Unknown / absent entrypoints read as "user": some transcript-less or
+# message-poor bg jobs carry none, and the user-only view must not silently
+# swallow a session whose origin ast cannot prove.
+
+ORIGIN_CHOICES = ("all", "user", "agent")
+ORIGIN_LABELS = {"all": "all", "user": "user", "agent": "agent"}
+_AGENT_ENTRYPOINT_PREFIX = "sdk"
+# Codex SessionSource values that mean "not a human at a terminal": `codex
+# exec` (the `claude -p` analogue), MCP-hosted threads, spawned subagents.
+_AGENT_ENTRYPOINTS = frozenset({"exec", "mcp", "subagent"})
+
+
+def session_origin(meta) -> str:
+    """"user" or "agent" for a SessionMeta (or a bare entrypoint string)."""
+    ep = meta if isinstance(meta, str) else getattr(meta, "entrypoint", "")
+    ep = ep or ""
+    if ep.startswith(_AGENT_ENTRYPOINT_PREFIX) or ep in _AGENT_ENTRYPOINTS:
+        return "agent"
+    return "user"
+
+
+def filter_origin(sessions, origin: str) -> list:
+    """Return a NEW list keeping only sessions of `origin`; "all"/unknown keeps
+    everything (an unrecognised value must never silently empty the view)."""
+    if origin not in ("user", "agent"):
+        return list(sessions)
+    return [s for s in sessions if session_origin(s) == origin]
+
+
+def cycle_origin(origin: str, step: int = 1) -> str:
+    """Next origin in the all→user→agent cycle (`step=-1` walks backwards)."""
+    try:
+        i = ORIGIN_CHOICES.index(origin)
+    except ValueError:
+        i = 0
+    return ORIGIN_CHOICES[(i + step) % len(ORIGIN_CHOICES)]
+
+
+def origin_note(origin: str) -> str:
+    """Trailing `  [origin:user]` tag for CLI summaries; empty when unfiltered.
+    A saved preference must never silently shrink a listing without saying so."""
+    if origin not in ("user", "agent"):
+        return ""
+    return f"  [origin:{ORIGIN_LABELS[origin]}]"
+
+
+def load_origin() -> str:
+    """Stored origin filter from state.json; "all" by default."""
+    val = load_state().get("origin")
+    return val if val in ORIGIN_CHOICES else "all"
+
+
+def save_origin(origin: str) -> None:
+    if origin not in ORIGIN_CHOICES:
+        origin = "all"
+    st = load_state()
+    st["origin"] = origin
+    save_state(st)
+
+
+# ---- agent view (CLI `--agent` / TUI `a`,`A`) ------------------------------
+# Which agent CLI's sessions are shown: "all" or one AGENTS key. The TUI `a`
+# key cycles all→claude→codex→…, `A` walks backwards; the last view is saved in
+# state.json (`{"agent": "..."}`) so the picker reopens where it was left, and
+# `ast list`/`ast search` fall back to that same pref unless `--agent` is given.
+
+AGENT_VIEW_ALL = "all"
+AGENT_VIEW_WIDTH = 6   # AGENT column width: fits "claude" / "codex" / "gemini"
+
+
+def agent_choices() -> tuple:
+    """("all", <every registered agent>) — the `--agent` choices + `a` cycle."""
+    return (AGENT_VIEW_ALL,) + tuple(AGENTS)
+
+
+def filter_agent(sessions, view: str) -> list:
+    """Return a NEW list keeping only `view`'s sessions; "all"/unknown keeps
+    everything (an unrecognised value must never silently empty the view)."""
+    if view not in AGENTS:
+        return list(sessions)
+    return [s for s in sessions if getattr(s, "agent", DEFAULT_AGENT) == view]
+
+
+def cycle_agent(view: str, step: int = 1) -> str:
+    """Next view in the all→claude→codex→… cycle (`step=-1` walks backwards)."""
+    choices = agent_choices()
+    try:
+        i = choices.index(view)
+    except ValueError:
+        i = 0
+    return choices[(i + step) % len(choices)]
+
+
+def agent_note(view: str) -> str:
+    """Trailing `  [agent:codex]` tag for CLI summaries; empty when unfiltered."""
+    if view not in AGENTS:
+        return ""
+    return f"  [agent:{view}]"
+
+
+def load_agent_view() -> str:
+    """Stored agent view from state.json; "all" by default."""
+    val = load_state().get("agent")
+    return val if val in agent_choices() else AGENT_VIEW_ALL
+
+
+def save_agent_view(view: str) -> None:
+    if view not in agent_choices():
+        view = AGENT_VIEW_ALL
+    st = load_state()
+    st["agent"] = view
+    save_state(st)
+
+
+def _detect_terminal_is_light(env: dict | None = None) -> bool | None:
+    """Best-effort terminal-background detection via ``COLORFGBG``.
+
+    Returns ``True`` (light bg), ``False`` (dark bg), or ``None`` (unknown).
+    ``COLORFGBG`` is ``"fg;bg"`` or ``"fg;default;bg"`` — the last field is the
+    background color index; index 7 (white) / 15 (bright white) reads as light.
+    macOS Terminal.app / default iTerm2 do NOT set it, so auto falls back to
+    dark and the user toggles to light with `t` / --theme.
+    """
+    src = os.environ if env is None else env
+    raw = (src.get("COLORFGBG") or "").strip()
+    if not raw:
+        return None
+    parts = raw.split(";")
+    if len(parts) < 2:
+        return None
+    bg = parts[-1].strip()
+    if not bg.isdigit():
+        return None
+    return int(bg) in (7, 15)
+
+
+def resolve_theme(config_theme: str, cli_override: str | None = None,
+                  env: dict | None = None) -> str:
+    """Resolve the effective TUI theme to ``"dark"`` or ``"light"``.
+
+    Priority: ``cli_override`` → saved ``config_theme`` (when explicit) →
+    ``COLORFGBG`` auto-detect → ``"dark"`` fallback. ``"auto"`` from either
+    source triggers detection rather than acting as an explicit theme.
+    """
+    candidate = (cli_override or config_theme or "auto").lower()
+    if candidate in ("dark", "light"):
+        return candidate
+    return "light" if _detect_terminal_is_light(env) else "dark"
+
+
+def newly_waiting(prev: set[str], cur: set[str]) -> set[str]:
+    """Session ids that transitioned INTO waiting since the last snapshot."""
+    return cur - prev
+
+
+def waiting_ids(sessions: list, live: set[str], done: set[str],
+                registry: dict, overlay: dict,
+                jobs: dict | None = None) -> set[str]:
+    """Session ids currently resolving to STATUS_WAITING."""
+    return {s.session_id for s in sessions
+            if resolve_status(s.session_id, live, done, registry, overlay, jobs)
+            == STATUS_WAITING}
+
+
+# ---------- session data model ----------
+
+@dataclass
+class SessionMeta:
+    session_id: str
+    path: Path
+    cwd: str = ""
+    first_ts: datetime | None = None
+    last_ts: datetime | None = None
+    msg_count: int = 0
+    first_user_msg: str = ""
+    git_branch: str = ""
+    prs: list = field(default_factory=list)  # [{host,repo,number,url}] from transcript
+    entrypoint: str = ""  # transcript `entrypoint`: cli | sdk-py | sdk-cli | sdk-ts
+    agent: str = DEFAULT_AGENT  # AGENTS key of the CLI that wrote the transcript
+
+
+@dataclass
+class Candidate:
+    path: str
+    score: int
+    signals: list[str]
+
+
+@dataclass
+class RelocateResult:
+    ok: bool
+    message: str
+    new_path: Path | None = None
+    new_cwd: str = ""
+    old_cwd: str = ""
+    old_subdir: Path | None = None
+    new_subdir: Path | None = None
+    rewritten: int = 0
+    sub_moved: bool = False
+    reason: str = ""  # ok | nodir | samecwd | collision | writefail | nosession
+
+    def _with_warnings(self, *warns: str) -> "RelocateResult":
+        extra = [w for w in warns if w]
+        if extra:
+            self.message = self.message + "\n" + "\n".join(extra)
+        return self
+
+
+# Confidence gate for auto-relocate. A candidate is only "confirm" when its
+# fingerprint score >= HIGH_CONFIDENCE_SCORE; a single low-score candidate
+# still routes to "pick" (shown, never auto-confirmed). Conservative on
+# purpose — bias toward "pick" over a weak "confirm".
+HIGH_CONFIDENCE_SCORE = 3
+CONFIDENCE_MARGIN = 2
+
+
+# Claude Code prepends these XML-ish wrappers to user events when the user
+# runs slash commands, `!bash`, `#memory`, etc. They carry no real prompt,
+# only system metadata, so we skip them when picking a session's first
+# "real" user message.
+_SYSTEM_WRAPPER_PREFIXES = (
+    "<local-command-caveat>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<command-stdout>",
+    "<command-stderr>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+)
+
+
+def _is_system_wrapper_msg(text: str) -> bool:
+    if not text:
+        return True
+    return text.lstrip().startswith(_SYSTEM_WRAPPER_PREFIXES)
+
+
+def iter_jsonl(path: Path, line_sink: "Callable[[str], None] | None" = None
+               ) -> Iterator[dict]:
+    """Decoded records from a .jsonl transcript, skipping unparseable lines.
+
+    `line_sink` receives every non-empty line *before* it is decoded, so a
+    caller that needs the raw text as well — the PR URL scan — can piggyback
+    on this single read instead of opening the file a second time. Lines that
+    fail to decode still reach the sink, which keeps a text scan's coverage
+    identical to reading the whole file independently."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line_sink is not None:
+                    line_sink(line)
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return
+
+
+# agent-view detects a session's PRs by link-scanning its transcript for PR
+# URLs (jobs/state.json carries linkScanPath/linkScanOffset, NOT the PR itself —
+# verified on a real session that opened a PR). ast does the same over the
+# transcript it already reads. Matches GitHub pulls + GitLab/Bitbucket MRs.
+_PR_URL_RE = re.compile(
+    r"https?://(?:www\.)?(github\.com|gitlab\.com|bitbucket\.org)/"
+    r"([^/\s\"']+/[^/\s\"']+?)/(?:pull|-/merge_requests|pull-requests)/(\d+)")
+
+
+def find_pr_refs(text: str) -> list[dict]:
+    """Extract deduped PR/MR refs ({host,repo,number,url}) from a text blob."""
+    seen: dict = {}
+    for m in _PR_URL_RE.finditer(text or ""):
+        repo, num = m.group(2), int(m.group(3))
+        seen.setdefault((repo, num), {"host": m.group(1), "repo": repo,
+                                      "number": num, "url": m.group(0)})
+    return list(seen.values())
+
+
+def _pr_collector() -> "tuple[dict, Callable[[str], None]]":
+    """A `(refs, sink)` pair for scanning PR/MR URLs line by line.
+
+    Feed `sink` every raw transcript line; read the deduped refs off
+    `refs.values()` when the scan ends. Both the single-pass scan inside
+    `load_session_meta` and the standalone `scan_pr_refs` below use this, so
+    the first-occurrence-wins dedupe rule is written once.
+
+    The `in` test short-circuits the regex, which never matches the
+    overwhelming majority of transcript lines — it keeps this sink cheap
+    enough to run on every line of a multi-gigabyte index."""
+    refs: dict = {}
+
+    def sink(line: str) -> None:
+        if "/pull" not in line and "merge_requests" not in line:
+            return
+        for r in find_pr_refs(line):
+            refs.setdefault((r["repo"], r["number"]), r)
+
+    return refs, sink
+
+
+def scan_pr_refs(path: Path) -> list[dict]:
+    """Scan a transcript .jsonl for PR/MR URLs, deduped across the whole file."""
+    refs, sink = _pr_collector()
+    for _ in iter_jsonl(path, line_sink=sink):
+        pass
+    return list(refs.values())
+
+
+def pr_badge(prs: list) -> str:
+    """`[PR #1]` / `[PR #1,3]` for a session's PR refs; empty when none."""
+    if not prs:
+        return ""
+    nums = sorted({p["number"] for p in prs})
+    return "[PR #" + ",".join(str(n) for n in nums) + "]"
+
+
+def _claude_iter_turns(path: Path,
+                       line_sink: "Callable[[str], None] | None" = None
+                       ) -> Iterator[Turn]:
+    """Claude Code transcript → Turns: one per user/assistant event, carrying
+    the event's cwd / gitBranch / entrypoint stamps."""
+    for evt in iter_jsonl(path, line_sink=line_sink):
+        etype = evt.get("type")
+        if etype not in ("user", "assistant"):
+            continue
+        yield Turn(
+            etype=etype,
+            ts=parse_ts(evt.get("timestamp")),
+            text=extract_text((evt.get("message") or {}).get("content")),
+            cwd=evt.get("cwd") or "",
+            git_branch=evt.get("gitBranch") or "",
+            entrypoint=evt.get("entrypoint") or "",
+        )
+
+
+def load_session_meta(path: Path, fast: bool = False) -> SessionMeta | None:
+    """Parse one transcript into a SessionMeta, whatever agent wrote it: the
+    owning AgentSpec supplies the id and the Turn stream, the folding below
+    is shared (first/last ts, counts, first real user message, PR refs).
+
+    The PR scan rides along on the Turn stream's own read via `line_sink`
+    rather than calling `scan_pr_refs()` afterwards: these transcripts run to
+    tens of megabytes, and reading each one twice doubled the cost of a cold
+    index for no extra information."""
+    spec = agent_for_path(path)
+    meta = SessionMeta(session_id=spec.session_id_of(path), path=path,
+                       agent=spec.name)
+    if fast:
+        try:
+            meta.last_ts = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            pass
+    refs, pr_sink = _pr_collector()
+    for turn in spec.iter_turns(path, line_sink=pr_sink):
+        meta.msg_count += 1
+        ts = turn.ts
+        if ts and not fast:
+            if not meta.first_ts or ts < meta.first_ts:
+                meta.first_ts = ts
+            if not meta.last_ts or ts > meta.last_ts:
+                meta.last_ts = ts
+        elif ts and fast and not meta.first_ts:
+            meta.first_ts = ts
+        if not meta.cwd and turn.cwd:
+            meta.cwd = turn.cwd
+        if not meta.git_branch and turn.git_branch:
+            meta.git_branch = turn.git_branch
+        if not meta.entrypoint and turn.entrypoint:
+            meta.entrypoint = turn.entrypoint
+        if turn.etype == "user" and not meta.first_user_msg:
+            text = turn.text.strip()
+            if (text
+                    and not text.startswith("[tool_use:")
+                    and not _is_system_wrapper_msg(text)):
+                meta.first_user_msg = text
+    if meta.msg_count == 0:
+        return None
+    meta.prs = list(refs.values())
+    return meta
+
+
+def last_message_ts(path: Path) -> "datetime | None":
+    """Timestamp of the last user/assistant message, read from the file *tail*
+    so it stays O(tail) on a huge transcript (the fast index cache stores an
+    mtime-based `last_ts`, which is wrong for restored/relocated sessions; this
+    recovers the precise value for `ast show` without a full-file parse).
+
+    Scans growing tail windows (64KB → 1MB → whole file) from the end until a
+    parseable user/assistant event with a timestamp is found. Returns None when
+    there is none (empty/message-less file)."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    if size == 0:
+        return None
+    for window in (65536, 1 << 20, size):
+        chunk = min(window, size)
+        try:
+            with path.open("rb") as f:
+                f.seek(size - chunk)
+                data = f.read(chunk)
+        except OSError:
+            return None
+        lines = data.decode("utf-8", errors="replace").split("\n")
+        if chunk < size:
+            lines = lines[1:]           # drop the partial leading line
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if evt.get("type") not in ("user", "assistant"):
+                continue
+            ts = parse_ts(evt.get("timestamp"))
+            if ts:
+                return ts
+        if chunk >= size:
+            break
+    return None
+
+
+def _claude_session_files(include_subagents: bool = False) -> list[Path]:
+    if not PROJECTS_DIR.exists():
+        return []
+    out: list[Path] = []
+    for p in PROJECTS_DIR.rglob("*.jsonl"):
+        if not include_subagents and "subagents" in p.parts:
+            continue
+        out.append(p)
+    out.sort()
+    return out
+
+
+def all_session_files(include_subagents: bool = False) -> list[Path]:
+    """Every agent's transcript files, agent by agent in registry order and
+    path-sorted within each (dedupe_sessions relies on that determinism)."""
+    out: list[Path] = []
+    for spec in AGENTS.values():
+        out.extend(spec.session_files(include_subagents))
+    return out
+
+
+def all_subagent_files() -> list[Path]:
+    if not PROJECTS_DIR.exists():
+        return []
+    return sorted(PROJECTS_DIR.rglob("subagents/*.jsonl"))
+
+
+def _load_cache() -> dict:
+    try:
+        with CACHE_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"schema": _CACHE_SCHEMA, "entries": {}}
+    if data.get("schema") != _CACHE_SCHEMA:
+        # Extraction rules changed — drop stale entries so they're re-indexed.
+        return {"schema": _CACHE_SCHEMA, "entries": {}}
+    return data
+
+
+def _save_cache(cache: dict) -> None:
+    try:
+        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        cache["schema"] = _CACHE_SCHEMA
+        tmp = CACHE_PATH.with_suffix(f".{os.getpid()}.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        tmp.replace(CACHE_PATH)
+    except OSError:
+        pass
+
+
+def invalidate_cache_entries(paths) -> int:
+    """Drop just `paths` from the index cache, keeping every other entry.
+
+    Returns how many entries were actually removed. Callers that move or
+    overwrite transcripts (relocate, restore) use this instead of deleting
+    `index.json` outright: discarding the whole index to account for one
+    changed file forces the *next* run to re-read every transcript, which on a
+    few thousand sessions is a multi-second stall — and relocate is reachable
+    straight from the TUI, so that stall landed on the next rescan. Entries
+    whose file genuinely vanished are pruned by `load_all_sessions` anyway, so
+    nothing here needs to guess about paths it was not given."""
+    cache = _load_cache()
+    entries = cache.get("entries")
+    if not isinstance(entries, dict):
+        return 0
+    removed = 0
+    for p in paths:
+        if entries.pop(str(p), None) is not None:
+            removed += 1
+    if removed:
+        _save_cache(cache)
+    return removed
+
+
+def _meta_to_cache(m: SessionMeta) -> dict:
+    return {
+        "session_id": m.session_id,
+        "cwd": m.cwd,
+        "first_ts": m.first_ts.isoformat() if m.first_ts else None,
+        "last_ts": m.last_ts.isoformat() if m.last_ts else None,
+        "msg_count": m.msg_count,
+        "first_user_msg": m.first_user_msg,
+        "git_branch": m.git_branch,
+        "prs": m.prs,
+        "entrypoint": m.entrypoint,
+        "agent": m.agent,
+    }
+
+
+def _meta_from_cache(d: dict, path: Path) -> SessionMeta:
+    return SessionMeta(
+        session_id=d["session_id"],
+        path=path,
+        cwd=d.get("cwd", ""),
+        first_ts=parse_ts(d.get("first_ts")),
+        last_ts=parse_ts(d.get("last_ts")),
+        msg_count=d.get("msg_count", 0),
+        first_user_msg=d.get("first_user_msg", ""),
+        git_branch=d.get("git_branch", ""),
+        prs=d.get("prs") or [],
+        entrypoint=d.get("entrypoint", ""),
+        agent=d.get("agent") or DEFAULT_AGENT,
+    )
+
+
+def _meta_for_path(
+    path: Path, entries: dict, fast: bool = True
+) -> "tuple[SessionMeta | None, bool]":
+    """Resolve a SessionMeta for `path` via the mtime/size index cache.
+
+    Returns `(meta, parsed_fresh)`. A fresh index entry (matching mtime+size)
+    is served from `entries` without re-reading the file; otherwise the file is
+    parsed and `entries` is updated in place (caller persists the cache). This
+    is the shared cache gate for both `load_all_sessions` (bulk) and
+    `find_session` (single lookup), so a warm cache — e.g. cst.app polling
+    `ast list --json` every few seconds — makes a subsequent `ast show` skip
+    the full transcript parse."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None, False
+    key = str(path)
+    cached = entries.get(key)
+    if cached and cached.get("mtime") == st.st_mtime and cached.get("size") == st.st_size:
+        return _meta_from_cache(cached, path), False
+    meta = load_session_meta(path, fast=fast)
+    if meta:
+        entries[key] = {
+            **_meta_to_cache(meta),
+            "mtime": st.st_mtime,
+            "size": st.st_size,
+        }
+    return meta, True
+
+
+# ---- parallel transcript indexing ----------------------------------------
+#
+# A cold index re-reads every transcript, which on a large collection means
+# gigabytes of JSON through `json.loads` — CPU-bound work behind the GIL, so
+# threads buy nothing (measured: no change) while separate processes scale
+# almost linearly with cores.
+#
+# Only cache MISSES are farmed out. A warm rescan misses a handful of files
+# and finishes in milliseconds; forking a pool for that costs more than it
+# saves, so the sequential path stays the default until the miss count clears
+# `_PARALLEL_MIN_MISSES`.
+_PARALLEL_MIN_MISSES = 200
+# Pool size cap. Indexing is a mix of disk reads and JSON decoding, so there
+# is nothing to gain past the core count, and an unbounded pool on a big
+# machine would just multiply the per-worker memory.
+_PARALLEL_MAX_WORKERS = 12
+
+
+def _index_workers(miss_count: int) -> int:
+    """How many worker processes to index `miss_count` transcripts with.
+
+    0 means "stay sequential" — too few misses to pay for a pool, the
+    platform cannot fork, or the user pinned it off with `AST_JOBS=1`.
+    `AST_JOBS=N` forces N workers (and lowers the miss threshold to 2, so the
+    setting is testable without thousands of files)."""
+    env = (os.environ.get("AST_JOBS") or "").strip()
+    forced = None
+    if env:
+        try:
+            forced = max(1, int(env))
+        except ValueError:
+            forced = None
+    if forced == 1:
+        return 0
+    if forced is None and miss_count < _PARALLEL_MIN_MISSES:
+        return 0
+    if forced is not None and miss_count < 2:
+        return 0
+    try:
+        import multiprocessing
+        if "fork" not in multiprocessing.get_all_start_methods():
+            # spawn/forkserver would re-import this 7k-line script per worker,
+            # which costs more than it saves. Only fork is worth it.
+            return 0
+    except Exception:
+        return 0
+    if forced is not None:
+        return min(forced, miss_count)
+    return max(1, min(_PARALLEL_MAX_WORKERS, os.cpu_count() or 1, miss_count))
+
+
+def _index_one(args: "tuple[str, bool]") -> "tuple[str, dict | None]":
+    """Worker body: parse one transcript into its cache-entry dict.
+
+    Returns `(path_str, entry_or_None)` — a plain dict rather than a
+    SessionMeta because that is what crosses the process boundary cheaply and
+    is exactly what the index stores. Every failure is swallowed into `None`:
+    a worker must never write to stderr, which in the TUI is the curses
+    screen."""
+    path_str, fast = args
+    try:
+        p = Path(path_str)
+        st = p.stat()
+        meta = load_session_meta(p, fast=fast)
+        if not meta:
+            return path_str, None
+        return path_str, {**_meta_to_cache(meta),
+                          "mtime": st.st_mtime, "size": st.st_size}
+    except Exception:
+        return path_str, None
+
+
+def _index_parallel(
+    paths: "list[Path]", fast: bool, workers: int,
+    on_done: "Callable[[str, dict | None], None]",
+) -> bool:
+    """Index `paths` across `workers` forked processes, reporting each result
+    to `on_done(path_str, entry_or_None)` as it lands.
+
+    Returns False if the pool could not be used at all, so the caller can fall
+    back to indexing sequentially. Results arrive out of order — callers must
+    key them by path, not by position."""
+    try:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        ctx = multiprocessing.get_context("fork")
+        chunk = max(1, min(64, len(paths) // (workers * 4) or 1))
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+            for path_str, entry in ex.map(
+                    _index_one, [(str(p), fast) for p in paths],
+                    chunksize=chunk):
+                on_done(path_str, entry)
+        return True
+    except Exception:
+        return False
+
+
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _dup_rank(m: SessionMeta) -> tuple:
+    """Ranking for two files that claim the same sessionId — bigger wins.
+
+    The canonical copy is the one sitting in the project dir that encodes its
+    own transcript `cwd`; a leftover copy in a renamed project's old dir loses
+    even if it looks fatter. Then richer transcript, then fresher activity."""
+    # The encoded-cwd project dir is a Claude Code convention; other agents
+    # (codex: one dated rollout per session) have no such duplicate layout.
+    canonical = (m.agent == "claude" and bool(m.cwd)
+                 and m.path.parent.name == encode_cwd(m.cwd))
+    return (canonical, m.msg_count, m.last_ts or _EPOCH)
+
+
+def dedupe_sessions(metas: list[SessionMeta]) -> list[SessionMeta]:
+    """One row per sessionId, preserving input order.
+
+    Renaming or copying a project leaves Claude Code's old
+    `~/.claude/projects/<encoded-cwd>/<sid>.jsonl` behind, so the same session
+    exists as two (usually byte-identical) files. One SessionMeta per *file*
+    would render the session twice in `ast list`, `--json` and the TUI. Ties
+    keep the first copy — callers feed the path-sorted `all_session_files()`,
+    so the pick is deterministic."""
+    best: dict[str, SessionMeta] = {}
+    for m in metas:
+        cur = best.get(m.session_id)
+        if cur is None or _dup_rank(m) > _dup_rank(cur):
+            best[m.session_id] = m
+    return [m for m in metas if best[m.session_id] is m]
+
+
+def progress_pct(done: int, total: int) -> int:
+    """Completion of `done` out of `total` as an integer 0–100 percentage.
+
+    Clamped at both ends, and an empty set counts as finished (100), so a
+    caller can format the number without guarding against a division by zero
+    or an off-by-one overshoot."""
+    if total <= 0:
+        return 100
+    return max(0, min(100, int(done * 100 / total)))
+
+
+def load_all_sessions(
+    cwd_filter: str | None = None,
+    days: int | None = None,
+    fast: bool = True,
+    progress: bool = False,
+    on_progress: "Callable[[int, int], None] | None" = None,
+) -> list[SessionMeta]:
+    """Load every agent's sessions, honouring the mtime index cache.
+
+    `progress` prints a percentage line on stderr (CLI); `on_progress` is
+    called as `(done, total)` after each transcript file so a non-stderr
+    front end — the TUI rescan — can render its own percentage. The callback
+    fires once with `(0, total)` before the scan starts, so a caller knows the
+    denominator even when there is nothing to index.
+
+    The scan runs in two passes. The first only `stat()`s each file to sort it
+    into a cache hit or a miss; the second parses the misses, handing them to
+    a process pool once there are enough of them to be worth one (see
+    `_index_workers`). Splitting it that way is what makes the parallel path
+    possible — and it costs nothing when the cache is warm, since `stat()` on
+    every file is a few milliseconds."""
+    cutoff = None
+    if days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    files = all_session_files()
+    cache = _load_cache()
+    entries = cache.setdefault("entries", {})
+    dirty = False
+    total = len(files)
+    show = progress and sys.stderr.isatty()
+    if on_progress:
+        on_progress(0, total)
+
+    # Pass 1 — classify by mtime+size without reading any transcript.
+    metas: "dict[str, SessionMeta | None]" = {}
+    misses: "list[Path]" = []
+    done = 0
+    for p in files:
+        key = str(p)
+        try:
+            st = p.stat()
+        except OSError:
+            metas[key] = None
+            done += 1
+            if on_progress:
+                on_progress(done, total)
+            continue
+        cached = entries.get(key)
+        if (cached and cached.get("mtime") == st.st_mtime
+                and cached.get("size") == st.st_size):
+            metas[key] = _meta_from_cache(cached, p)
+            done += 1
+            if on_progress:
+                on_progress(done, total)
+        else:
+            misses.append(p)
+
+    # Pass 2 — parse what the cache could not answer.
+    if misses:
+        dirty = True
+        by_path = {str(p): p for p in misses}
+        # Only repaint the stderr counter when the percentage actually moves.
+        # Writing it once per file costs ~0.9s of a ~2.7s parallel cold index
+        # on a real tty — a third of the scan spent drawing the same number.
+        # (The TUI's own painter throttles for the same reason.)
+        shown_pct = -1
+
+        def _absorb(path_str: str, entry: "dict | None") -> None:
+            nonlocal done, shown_pct
+            if entry is None:
+                metas[path_str] = None
+            else:
+                entries[path_str] = entry
+                metas[path_str] = _meta_from_cache(entry, by_path[path_str])
+            done += 1
+            if show:
+                pct = progress_pct(done, total)
+                if pct != shown_pct:
+                    shown_pct = pct
+                    sys.stderr.write(
+                        f"\rIndexing sessions… {pct:3d}% ({done}/{total})")
+                    sys.stderr.flush()
+            if on_progress:
+                on_progress(done, total)
+
+        workers = _index_workers(len(misses))
+        if not (workers and _index_parallel(misses, fast, workers, _absorb)):
+            for p in misses:
+                _absorb(*_index_one((str(p), fast)))
+
+    # Assemble in `files` order — dedupe_sessions relies on that determinism,
+    # and the parallel pass returns results out of order.
+    out: list[SessionMeta] = []
+    for p in files:
+        meta = metas.get(str(p))
+        if not meta:
+            continue
+        if cwd_filter and not meta.cwd.startswith(cwd_filter):
+            continue
+        if cutoff and (not meta.last_ts or meta.last_ts < cutoff):
+            continue
+        out.append(meta)
+
+    existing_keys = {str(p) for p in files}
+    stale = [k for k in entries if k not in existing_keys]
+    for k in stale:
+        del entries[k]
+        dirty = True
+    if dirty:
+        _save_cache(cache)
+    if show:
+        sys.stderr.write("\r" + " " * 60 + "\r")
+        sys.stderr.flush()
+    out = dedupe_sessions(out)
+    out.sort(key=lambda m: m.last_ts or _EPOCH, reverse=True)
+    return out
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ CLI LAYER — thin orchestration: parse args → call CORE → render/print. ║
+# ║ Commands should not re-derive status context or re-scan transcripts;   ║
+# ║ use the shared CORE helpers (StatusContext, require_session, …).       ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# ---------- CLI: list ----------
+
+def _job_json(job: "dict | None") -> "dict | None":
+    if not job:
+        return None
+    return {
+        "short": job.get("short"),
+        "template": job.get("template") or "",
+        "branch": job.get("worktreeBranch") or "",
+        "worktreePath": job.get("worktreePath") or "",
+        "state": job.get("state"),
+        "tempo": job.get("tempo"),
+        "alive": job.get("tempo") == "active",
+    }
+
+
+def session_to_dict(s: "SessionMeta", ctx: "StatusContext") -> dict:
+    """One SessionMeta -> the cst.app JSON contract (schema 1)."""
+    glyph = ctx.resolve(s.session_id)
+    job = ctx.jobs.get(s.session_id)
+    short = (job or {}).get("short")
+    last = s.last_ts
+    return {
+        "sessionId": s.session_id,
+        "shortId": short,
+        "cwd": s.cwd,
+        "project": os.path.basename(s.cwd.rstrip("/")) if s.cwd else "",
+        "status": _JSON_STATUS_NAME.get(glyph, "ended"),
+        "glyph": glyph,
+        "isLive": s.session_id in ctx.live,
+        "isDone": s.session_id in ctx.done,
+        "messages": s.msg_count,
+        "summary": s.first_user_msg or "",
+        "lastActivity": last.astimezone().isoformat() if last else None,
+        "lastTs": int(last.timestamp()) if last else 0,
+        "gitBranch": s.git_branch or "",
+        "entrypoint": s.entrypoint or "",
+        "origin": session_origin(s),
+        "agent": s.agent or DEFAULT_AGENT,
+        "job": _job_json(job),
+        "prs": list(s.prs or []),
+        "pinned": bool(short and short in ctx.pins),
+    }
+
+
+def sessions_json_payload(sessions, ctx: "StatusContext") -> dict:
+    counts = ctx.counts(sessions)
+    return {
+        "schema": 1,
+        "version": __version__,
+        "sessions": [session_to_dict(s, ctx) for s in sessions],
+        "counts": {_JSON_STATUS_NAME[g]: counts[g] for g in STATUS_ALL},
+    }
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    as_json = getattr(args, "json", False)
+    sessions = load_all_sessions(cwd_filter=args.cwd, days=args.days,
+                                 progress=not as_json)
+    ctx = StatusContext.capture()
+    if args.status:
+        wanted = _STATUS_ARG.get(args.status.lower())
+        if wanted:
+            sessions = [s for s in sessions
+                        if ctx.resolve(s.session_id) == wanted]
+    # Origin filter: an explicit --origin is a one-off override; no flag uses
+    # the saved TUI preference (same contract as --sort below).
+    origin = getattr(args, "origin", None) or load_origin()
+    sessions = filter_origin(sessions, origin)
+    # Agent view: same contract — explicit --agent is a one-off, else the view
+    # the TUI `a` key last saved.
+    agent_view = getattr(args, "agent", None) or load_agent_view()
+    sessions = filter_agent(sessions, agent_view)
+    # Column sort: an explicit --sort is a one-off override (natural direction,
+    # flipped by --reverse); no flag uses the saved TUI preference. Sort runs
+    # BEFORE --limit so the slice keeps the top-N of the chosen order. getattr
+    # keeps callers that build a bare Namespace (tests) working.
+    sort_arg = getattr(args, "sort", None)
+    reverse_arg = getattr(args, "reverse", False)
+    if sort_arg:
+        rev = (not _SORT_DEFAULT_DESC[sort_arg]) if reverse_arg else None
+        sessions = sort_sessions(sessions, ctx, sort_arg, reverse=rev)
+    else:
+        skey, srev = load_sort()
+        if reverse_arg:
+            srev = not srev
+        sessions = sort_sessions(sessions, ctx, skey, srev)
+    if args.limit:
+        sessions = sessions[: args.limit]
+    if as_json:
+        print(json.dumps(sessions_json_payload(sessions, ctx),
+                         ensure_ascii=False, indent=2))
+        return 0
+    if not sessions:
+        print("(no sessions found)")
+        return 0
+    print(f"agent-session-tracker v{__version__}")
+    # Width of the `#` column — fits up to 4 digits (10000+ sessions fall back
+    # to longer numbers, but the layout still works).
+    num_w = max(3, len(str(len(sessions))))
+    header = (
+        f"{'#':>{num_w}} "
+        f"{pad_display('ST', STATUS_WIDTH)} "
+        f"{'AGENT':<{AGENT_VIEW_WIDTH}}  "
+        f"{'LAST ACTIVITY':<16}  "
+        f"{'SESSION':<10} "
+        f"{'MSGS':>4}  "
+        f"{'MESSAGE':<60}  "
+        f"PROJECT"
+    )
+    print(header)
+    print("-" * max(110, min(200, len(header) + 20)))
+    for idx, s in enumerate(sessions, 1):
+        st = ctx.resolve(s.session_id)
+        sid = s.session_id[:8]
+        ts = fmt_ts(s.last_ts)
+        first = truncate(s.first_user_msg, 60) or "(no user message)"
+        job = ctx.jobs.get(s.session_id)
+        tags = " ".join(t for t in (
+            pin_marker((job or {}).get("short"), ctx.pins),
+            job_badge(job), pr_badge(s.prs)) if t)
+        proj = shorten_path(s.cwd) + (f"  {tags}" if tags else "")
+        print(
+            f"{idx:>{num_w}} "
+            f"{pad_display(st, STATUS_WIDTH)} "
+            f"{s.agent:<{AGENT_VIEW_WIDTH}}  "
+            f"{ts:<16}  "
+            f"{sid:<10} "
+            f"{s.msg_count:>4}  "
+            f"{pad_display(truncate_display(first, 60), 60)}  "
+            f"{proj}"
+        )
+    counts = ctx.counts(sessions)
+    summary = "  ".join(f"{status_label(g)}:{counts[g]}"
+                        for g in STATUS_ALL if counts[g])
+    print(f"\n{len(sessions)} session(s)  [{summary}]"
+          f"{origin_note(origin)}{agent_note(agent_view)}")
+    return 0
+
+
+# ---------- CLI: search ----------
+
+def compile_query(q: str, case_insensitive: bool) -> re.Pattern:
+    parts = [re.escape(p) for p in q.split("|")]
+    pattern = "|".join(parts)
+    flags = re.IGNORECASE if case_insensitive else 0
+    return re.compile(pattern, flags)
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    regex = compile_query(args.query, args.ignore_case)
+    hits: list[tuple[SessionMeta, list[tuple[datetime | None, str, str]]]] = []
+    for p in all_session_files():
+        spec = agent_for_path(p)
+        meta = SessionMeta(session_id=spec.session_id_of(p), path=p,
+                           agent=spec.name)
+        matches: list[tuple[datetime | None, str, str]] = []
+        for turn in spec.iter_turns(p):
+            meta.msg_count += 1
+            ts = turn.ts
+            if ts and (not meta.last_ts or ts > meta.last_ts):
+                meta.last_ts = ts
+            if not meta.cwd and turn.cwd:
+                meta.cwd = turn.cwd
+            if not meta.entrypoint and turn.entrypoint:
+                meta.entrypoint = turn.entrypoint
+            text = turn.text
+            if not text:
+                continue
+            m = regex.search(text)
+            if m:
+                start = max(0, m.start() - 40)
+                end = min(len(text), m.end() + 80)
+                snippet = text[start:end].replace("\n", " ")
+                matches.append((ts, turn.etype, snippet))
+        if matches and (not args.cwd or meta.cwd.startswith(args.cwd)):
+            hits.append((meta, matches))
+    # A session copied into two project dirs would otherwise report its hits
+    # twice; dedupe_sessions hands back the very objects it kept.
+    kept = {id(m) for m in dedupe_sessions([h[0] for h in hits])}
+    hits = [h for h in hits if id(h[0]) in kept]
+    origin = getattr(args, "origin", None) or load_origin()
+    if origin in ("user", "agent"):
+        hits = [h for h in hits if session_origin(h[0]) == origin]
+    agent_view = getattr(args, "agent", None) or load_agent_view()
+    if agent_view in AGENTS:
+        hits = [h for h in hits if h[0].agent == agent_view]
+    hits.sort(key=lambda h: h[0].last_ts or _EPOCH, reverse=True)
+    if args.limit:
+        hits = hits[: args.limit]
+    notes = f"{origin_note(origin)}{agent_note(agent_view)}"
+    if not hits:
+        print(f"(no matches for {args.query!r}{notes})")
+        return 0
+    ctx = StatusContext.capture()
+    for meta, matches in hits:
+        st = ctx.resolve(meta.session_id)
+        print(f"\n{status_label(st)}  {meta.agent:<{AGENT_VIEW_WIDTH}}  "
+              f"{meta.session_id[:8]}  {fmt_ts(meta.last_ts)}  "
+              f"{shorten_path(meta.cwd)}  ({len(matches)} hit(s))")
+        for ts, role, snippet in matches[:3]:
+            print(f"    [{role}] {truncate(snippet, 140)}")
+        if len(matches) > 3:
+            print(f"    … +{len(matches) - 3} more")
+    print(f"\n{len(hits)} session(s) matched.{notes}")
+    return 0
+
+
+# ---------- CLI: subagents / show ----------
+
+def subagents_dir(parent_path: Path) -> Path:
+    return parent_path.parent / parent_path.stem / "subagents"
+
+
+def list_subagents(parent_path: Path) -> list[tuple[Path, dict]]:
+    """Sub-sessions of a parent transcript as [(path, meta)], dispatched to
+    the owning agent. Agents that spawn none report an empty list."""
+    fn = agent_for_path(parent_path).subagents_of
+    return fn(parent_path) if fn else []
+
+
+def _claude_list_subagents(parent_path: Path) -> list[tuple[Path, dict]]:
+    d = subagents_dir(parent_path)
+    if not d.is_dir():
+        return []
+    out: list[tuple[Path, dict]] = []
+    for jp in sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime):
+        meta_path = jp.with_suffix(".meta.json")
+        meta: dict = {}
+        if meta_path.exists():
+            try:
+                with meta_path.open("r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                pass
+        out.append((jp, meta))
+    return out
+
+
+def iter_messages(path: Path) -> "Iterator[tuple[str, str, str]]":
+    """Shared transcript-iteration contract: yield (etype, ts_str, text) for
+    each user/assistant message with non-empty text. Every renderer (tty /
+    txt / md) consumes this so the filter/extract logic lives in one place;
+    only the per-format header & message styling differ downstream. The owning
+    AgentSpec supplies the Turn stream, so every agent renders alike."""
+    for turn in agent_for_path(path).iter_turns(path):
+        text = turn.text.strip()
+        if not text:
+            continue
+        yield turn.etype, fmt_ts(turn.ts), text
+
+
+def _print_transcript(path: Path, max_chars: int, indent: str = "",
+                      head_chars: int = 0) -> int:
+    """Render user/assistant messages. `max_chars` truncates each message;
+    `head_chars` (0 = unlimited) caps the *total* message text emitted and
+    stops iterating — so a huge transcript is never fully read when only a
+    head preview is wanted (the cst.app fast-preview path)."""
+    count = 0
+    emitted = 0
+    for etype, ts, text in iter_messages(path):
+        if head_chars and emitted >= head_chars:
+            print(f"\n{indent}… (미리보기 상한 {head_chars}자 도달; 이후 메시지 생략)")
+            break
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"… (+{len(text) - max_chars} chars)"
+        if head_chars:
+            remaining = head_chars - emitted
+            if len(text) > remaining:
+                text = text[:remaining] + "…"
+        prefix = "🧑" if etype == "user" else "🤖"
+        print(f"\n{indent}{prefix} [{ts}]")
+        for line in text.splitlines() or [""]:
+            print(f"{indent}{line}")
+        emitted += len(text)
+        count += 1
+    return count
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    target = require_session(args.session_id)
+    if target is None:
+        return 1
+    ctx = StatusContext.capture()
+    st = ctx.resolve(target.session_id)
+    print(f"Session:  {target.session_id}")
+    print(f"Agent:    {target.agent}")
+    print(f"Status:   {status_label(st)}")
+    print(f"Cwd:      {target.cwd}")
+    if target.git_branch:
+        print(f"Branch:   {target.git_branch}")
+    # The cache-first lookup yields an mtime-based last_ts (fast); recover the
+    # precise last-message timestamp from the file tail so `show` stays accurate
+    # for restored/relocated sessions without giving up the fast preview.
+    precise_last = last_message_ts(target.path)
+    print(f"Started:  {fmt_ts(target.first_ts)}")
+    print(f"Last:     {fmt_ts(precise_last or target.last_ts)}")
+    print(f"Messages: {target.msg_count}")
+    subs = list_subagents(target.path)
+    if subs:
+        print(f"Subagents: {len(subs)}"
+              + ("  (use --with-subagents to expand)" if not args.with_subagents else ""))
+    print("-" * 80)
+    head_chars = getattr(args, "head_chars", 0) or 0
+    _print_transcript(target.path, args.max_chars, head_chars=head_chars)
+    if args.with_subagents and subs:
+        print("\n" + "=" * 80)
+        print(f"  SUBAGENTS ({len(subs)})")
+        print("=" * 80)
+        for i, (sub_path, meta) in enumerate(subs, 1):
+            agent_type = meta.get("agentType", "?")
+            desc = meta.get("description", "(no description)")
+            print(f"\n┌─ [{i}/{len(subs)}] {sub_path.stem}")
+            print(f"│  type: {agent_type}")
+            print(f"│  desc: {desc}")
+            print("└" + "─" * 79)
+            _print_transcript(sub_path, args.max_chars, indent="  ",
+                              head_chars=head_chars)
+    return 0
+
+
+def _build_export_text(target: "SessionMeta", st: str) -> str:
+    lines: list[str] = []
+    lines.append(f"Session:  {target.session_id}")
+    lines.append(f"Agent:    {target.agent}")
+    lines.append(f"Status:   {status_label(st)}")
+    lines.append(f"Cwd:      {target.cwd}")
+    if target.git_branch:
+        lines.append(f"Branch:   {target.git_branch}")
+    lines.append(f"Started:  {fmt_ts(target.first_ts)}")
+    lines.append(f"Last:     {fmt_ts(target.last_ts)}")
+    lines.append(f"Messages: {target.msg_count}")
+    lines.append("-" * 80)
+    for etype, ts, text in iter_messages(target.path):
+        prefix = "🧑" if etype == "user" else "🤖"
+        lines.append(f"\n{prefix} [{ts}]")
+        lines.extend(text.splitlines() or [""])
+    return "\n".join(lines) + "\n"
+
+
+def _build_export_md(target: "SessionMeta", st: str) -> str:
+    lines: list[str] = []
+    lines.append(f"# Session: {target.session_id}")
+    lines.append(f"")
+    lines.append(f"**Agent:** {target.agent}  ")
+    lines.append(f"**Status:** {status_label(st)}  ")
+    lines.append(f"**Started:** {fmt_ts(target.first_ts)}  ")
+    lines.append(f"**Last:** {fmt_ts(target.last_ts)}  ")
+    lines.append(f"**Cwd:** {shorten_path(target.cwd)}  ")
+    if target.git_branch:
+        lines.append(f"**Branch:** {target.git_branch}  ")
+    lines.append(f"**Messages:** {target.msg_count}  ")
+    lines.append("")
+    lines.append("---")
+    for etype, ts, text in iter_messages(target.path):
+        prefix = "🧑 User" if etype == "user" else "🤖 Assistant"
+        lines.append(f"\n## {prefix} [{ts}]")
+        lines.append("")
+        lines.extend(text.splitlines() or [""])
+    return "\n".join(lines) + "\n"
+
+
+def export_session(target: "SessionMeta", fmt: str, out: str | None) -> Path:
+    st = StatusContext.capture().resolve(target.session_id)
+
+    if fmt == "txt":
+        content = _build_export_text(target, st)
+        ext = "txt"
+    else:
+        content = _build_export_md(target, st)
+        ext = "md"
+
+    if out:
+        dest = Path(out)
+        if dest.is_dir():
+            date_str = (target.last_ts or target.first_ts or datetime.now()).strftime("%Y-%m-%d")
+            dest = dest / f"{target.session_id[:8]}-{date_str}.{ext}"
+    else:
+        date_str = (target.last_ts or target.first_ts or datetime.now()).strftime("%Y-%m-%d")
+        dest = Path(f"{target.session_id[:8]}-{date_str}.{ext}")
+
+    dest.write_text(content, encoding="utf-8")
+    return dest
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    target = require_session(args.session_id)
+    if target is None:
+        return 1
+    dest = export_session(target, args.format, args.out)
+    print(f"Exported: {dest}")
+    return 0
+
+
+def cmd_subagents(args: argparse.Namespace) -> int:
+    target = require_session(args.session_id)
+    if target is None:
+        return 1
+    if not require_cap(target, "subagents", "subagents"):
+        return 1
+    subs = list_subagents(target.path)
+    if not subs:
+        print(f"(session {target.session_id[:8]} has no subagents)")
+        return 0
+    print(f"Parent:    {target.session_id}")
+    print(f"Cwd:       {shorten_path(target.cwd)}")
+    print(f"Subagents: {len(subs)}")
+    print("-" * 80)
+    for i, (sub_path, meta) in enumerate(subs, 1):
+        agent_type = meta.get("agentType", "?")
+        desc = meta.get("description", "")
+        try:
+            ts = datetime.fromtimestamp(sub_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        except OSError:
+            ts = "?"
+        # Counted through the sub-session's own AgentSpec so a codex guardian
+        # thread reports the same way a claude subagent transcript does.
+        msg_count = 0
+        first_user = ""
+        for turn in agent_for_path(sub_path).iter_turns(sub_path):
+            msg_count += 1
+            if first_user or turn.etype != "user":
+                continue
+            txt = turn.text.strip()
+            if txt and not txt.startswith("[tool_use:"):
+                first_user = txt
+        print(f"\n[{i}] {sub_path.stem}")
+        print(f"    type: {agent_type}   msgs: {msg_count}   last: {ts}")
+        if desc:
+            print(f"    desc: {desc}")
+        if first_user:
+            print(f"    → {truncate(first_user, 90)}")
+    print()
+    print("Use: ast show <subagent-id> [--max-chars N]")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    target = require_session(args.session_id)
+    if target is None:
+        return 1
+    cwd = target.cwd or "."
+    short = job_short_for(target.session_id)
+    if getattr(args, "spawn", False):
+        # GUI/cst.app path: actually open (or focus) the session in a terminal,
+        # reusing the same logic as the TUI Enter handler. One-line result.
+        live = get_live_session_info(target.session_id)
+        if live:
+            ok, info = focus_existing_window(target.session_id, live)
+            if ok:
+                print(f"→ focused {target.session_id[:8]}  {info}")
+                return 0
+        ok, info = open_in_new_terminal(
+            target.cwd, target.session_id,
+            skip_perm=getattr(args, "skip_perm", False),
+            attach_short=short,
+            terminal=getattr(args, "terminal", None),
+            agent=agent_of(target).name,
+        )
+        if ok:
+            print(f"→ {'attach' if short else 'resume'} {target.session_id[:8]}  {info}")
+            return 0
+        print(f"open failed: {info}", file=sys.stderr)
+        return 1
+    if short:
+        # background session — attach to the live process, not a transcript fork
+        cmd = f"claude attach {short}"
+    else:
+        import shlex
+        spec = agent_of(target)
+        core = " ".join(shlex.quote(a) for a in spec.resume_argv(
+            spec.bin, target.session_id, bool(getattr(args, "skip_perm", False))))
+        cmd = f'cd {shlex.quote(cwd)} && {core}'
+    if args.print_only:
+        print(cmd)
+        return 0
+    print(f"Session:  {target.session_id}")
+    print(f"Cwd:      {cwd}")
+    print(f"Last:     {fmt_ts(target.last_ts)}")
+    print()
+    print("Run this command to jump back into the session:")
+    print()
+    print(f"    {cmd}")
+    print()
+    print("(In Claude Code, prefix with `!` to execute it in the current session.)")
+    return 0
+
+
+def cmd_open(args: argparse.Namespace) -> int:
+    """`ast open <id>` — open the session's folder in a new terminal window:
+    the TUI `o` key as a subcommand (plain interactive shell at the recorded
+    cwd, no claude command). Used by cst.app's folder-open action. A missing
+    cwd fails with the relocate hint from open_folder_in_new_terminal()."""
+    target = require_session(args.session_id)
+    if target is None:
+        return 1
+    ok, info = open_folder_in_new_terminal(
+        target.cwd, terminal=getattr(args, "terminal", None))
+    if ok:
+        print(f"→ folder {shorten_path(target.cwd)}  {info}")
+        return 0
+    print(f"open folder failed: {info}", file=sys.stderr)
+    return 1
+
+
+# ---------- CLI: done / undone / live ----------
+
+def _bulk_done(args: argparse.Namespace, needle: str) -> int:
+    """`ast done --filter TEXT` — the TUI "`/` filter → Ctrl-A → d" flow as
+    one CLI call. Matches exactly like the TUI pool filter: case-insensitive
+    substring over "sessionId cwd first_user_msg". Already-done sessions are
+    excluded; ● working ones are skipped unless --force (done_guard_blocks);
+    the candidate list is printed and confirmed before marking — non-tty
+    callers must pass -y/--yes (mirrors cmd_rm)."""
+    sessions = load_all_sessions(cwd_filter=getattr(args, "cwd", None),
+                                 days=getattr(args, "days", None),
+                                 progress=True)
+    ctx = StatusContext.capture()
+    q = needle.lower()
+    pool = [s for s in sessions
+            if s.session_id not in ctx.done
+            and q in f"{s.session_id} {s.cwd} {s.first_user_msg}".lower()]
+    status_arg = getattr(args, "status", None)
+    if status_arg:
+        wanted = _STATUS_ARG.get(status_arg.lower())
+        if wanted:
+            pool = [s for s in pool if ctx.resolve(s.session_id) == wanted]
+    if not pool:
+        print(f"(no sessions matching {needle!r})")
+        return 1
+    force = getattr(args, "force", False)
+    markable = [s for s in pool
+                if not done_guard_blocks(ctx.resolve(s.session_id), force)]
+    skipped = [s for s in pool if done_guard_blocks(ctx.resolve(s.session_id), force)]
+    for s in markable:
+        print(f"  {ctx.resolve(s.session_id)} {s.session_id[:8]}  "
+              f"{shorten_path(s.cwd)}  "
+              f"{truncate_display(s.first_user_msg or '', 40)}")
+    if skipped:
+        ids8 = ", ".join(s.session_id[:8] for s in skipped)
+        print(f"({len(skipped)} skipped — ● actively working: {ids8}; "
+              f"pass --force to include)", file=sys.stderr)
+    if not markable:
+        print("Nothing to mark — every match is actively working.",
+              file=sys.stderr)
+        return 1
+    if not getattr(args, "yes", False):
+        if not sys.stdin.isatty():
+            print(f"Refusing to mark {len(markable)} session(s) done without "
+                  f"confirmation — pass -y/--yes (non-interactive).",
+                  file=sys.stderr)
+            return 1
+        try:
+            reply = input(f"Mark {len(markable)} session(s) done? [y/N] ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+    for s in markable:
+        set_done(s.session_id, True)
+    print(f"✓ Marked done: {len(markable)} session(s)")
+    return 0
+
+
+def cmd_done(args: argparse.Namespace) -> int:
+    ids = args.session_id
+    if isinstance(ids, str):  # pre-1.12 callers pass a plain string
+        ids = [ids]
+    needle = getattr(args, "filter", None)
+    if needle and ids:
+        print("Pass session id(s) OR --filter, not both.", file=sys.stderr)
+        return 1
+    narrow = [n for n in ("cwd", "days", "status") if getattr(args, n, None)]
+    if narrow and not needle:
+        print(f"--{narrow[0]} only narrows a bulk --filter match; "
+              f"add --filter TEXT.", file=sys.stderr)
+        return 1
+    if needle:
+        return _bulk_done(args, needle)
+    if not ids:
+        print("session_id (or --filter TEXT) required.", file=sys.stderr)
+        return 1
+    ctx = StatusContext.capture()
+    rc = 0
+    for prefix in ids:
+        target = require_session(prefix)
+        if target is None:
+            rc = 1
+            continue
+        if done_guard_blocks(ctx.resolve(target.session_id),
+                             getattr(args, "force", False)):
+            print(f"{target.session_id[:8]}  {DONE_WORKING_REASON}",
+                  file=sys.stderr)
+            rc = 1
+            continue
+        set_done(target.session_id, True)
+        print(f"✓ Marked done: {target.session_id[:8]}  {shorten_path(target.cwd)}")
+    return rc
+
+
+def cmd_undone(args: argparse.Namespace) -> int:
+    target = require_session(args.session_id)
+    if target is None:
+        return 1
+    set_done(target.session_id, False)
+    print(f"✓ Cleared done: {target.session_id[:8]}  {shorten_path(target.cwd)}")
+    return 0
+
+
+# ---------- CLI: bulk rm ----------
+
+_RM_LIST_CAP = 20   # candidate rows printed before "… +N more" (mirrors backup)
+_RM_SELECTORS = ("filter", "cwd", "status", "days", "older_than", "before")
+_RM_INT_SELECTORS = ("days", "older_than")  # 0 is a valid value -> `is not None`
+
+
+def _rm_cutoff(args: argparse.Namespace) -> datetime | None:
+    """`--older-than N` / `--before YYYY-MM-DD` → the timestamp a session's
+    last activity must precede, or None when neither flag is given. Raises
+    ValueError carrying the user-facing message when --before isn't a date
+    (same format and wording as `cmd_backup`)."""
+    before = getattr(args, "before", None)
+    if before:
+        try:
+            return datetime.strptime(before, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise ValueError(f"--before must be YYYY-MM-DD (got {before!r})")
+    older = getattr(args, "older_than", None)
+    if older is not None:
+        return datetime.now(timezone.utc) - timedelta(days=older)
+    return None
+
+
+def _rm_candidates(sessions: list, ctx, needle: str | None,
+                   status_arg: str | None,
+                   cutoff: "datetime | None") -> list:
+    """Bulk-rm selection pool, before the live guard is applied.
+
+    `needle` matches like the TUI `/` filter and `_bulk_done`: case-insensitive
+    substring over "sessionId cwd first_user_msg". `cutoff` keeps sessions whose
+    last activity precedes it. `status_arg` is a --status name resolved through
+    `_STATUS_ARG`. Unlike `_bulk_done`, ✓ done sessions are NOT excluded —
+    they're the prime delete candidates.
+    """
+    pool = list(sessions)
+    if needle:
+        q = needle.lower()
+        pool = [s for s in pool
+                if q in f"{s.session_id} {s.cwd} {s.first_user_msg}".lower()]
+    if cutoff is not None:
+        pool = [s for s in pool if s.last_ts and s.last_ts < cutoff]
+    if status_arg:
+        wanted = _STATUS_ARG.get(status_arg.lower())
+        if wanted:
+            pool = [s for s in pool if ctx.resolve(s.session_id) == wanted]
+    return pool
+
+
+def _rm_guard_status(session_id: str, ctx) -> str:
+    """The status the delete guard must judge — NOT necessarily the glyph the
+    row displays. `resolve_status`/`classify_status` let ✓ done short-circuit
+    before liveness is even considered, so a session that's ✓ done AND still
+    alive-and-working would resolve to ✓, and `rm_guard_blocks("✓")` is always
+    False — the live guard silently doesn't apply. Re-classify past the done
+    flag when the process is actually in the live registry; callers should
+    still use `ctx.resolve()` for what gets *printed* (stays ✓).
+
+    The `session_id in ctx.live` guard is load-bearing: without it, a DEAD
+    background job whose last persisted job-state happens to be "working"
+    would re-classify to ● via `_JOB_STATE_GLYPH` and wrongly become
+    unskippable (a false positive block, not a false negative).
+    """
+    st = ctx.resolve(session_id)
+    if st == STATUS_DONE and session_id in ctx.live:
+        st = classify_status(done=False, alive=True,
+                             overlay=ctx.overlay.get(session_id),
+                             reg=ctx.registry.get(session_id),
+                             job=ctx.jobs.get(session_id))
+    return st
+
+
+def _bulk_rm(args: argparse.Namespace) -> int:
+    """`ast rm --filter/--status/--older-than/…` — the TUI "`/` filter →
+    Ctrl-A → Del" flow as one CLI call.
+
+    Live (● working / ! waiting) sessions are skipped unless --force
+    (`rm_guard_blocks`, judged via `_rm_guard_status` so a ✓ done session
+    whose process is still alive and working/waiting is skipped too — the
+    row still displays ✓), the candidate list is printed and confirmed before
+    unlinking, and non-tty callers must pass -y/--yes (mirrors single-id rm).
+    --force only widens the target set to include live sessions — unlike the
+    single-id path, it does NOT skip the confirmation prompt (mirrors
+    `_bulk_done`); pass -y/--yes for that.
+    Deletion goes through `_delete_sessions`, the same path as the TUI Del key,
+    so cache entries and done flags are purged too. Only unlinks transcripts —
+    a live background process keeps running (see `bg_delete_warning`).
+    """
+    try:
+        cutoff = _rm_cutoff(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    sessions = load_all_sessions(cwd_filter=getattr(args, "cwd", None),
+                                 days=getattr(args, "days", None),
+                                 progress=True)
+    ctx = StatusContext.capture()
+    pool = _rm_candidates(sessions, ctx, getattr(args, "filter", None),
+                          getattr(args, "status", None), cutoff)
+    if not pool:
+        print("(no sessions matching the given filters)")
+        return 1
+
+    force = getattr(args, "force", False)
+    targets, skipped = [], []
+    for s in pool:
+        (skipped if rm_guard_blocks(_rm_guard_status(s.session_id, ctx), force)
+         else targets).append(s)
+
+    total_bytes = 0
+    for s in targets:
+        try:
+            total_bytes += s.path.stat().st_size
+        except OSError:
+            pass
+
+    for s in targets[:_RM_LIST_CAP]:
+        print(f"  {ctx.resolve(s.session_id)} {s.session_id[:8]}  "
+              f"{shorten_path(s.cwd)}  "
+              f"{truncate_display(s.first_user_msg or '', 40)}")
+    if len(targets) > _RM_LIST_CAP:
+        print(f"  … +{len(targets) - _RM_LIST_CAP} more")
+
+    if skipped:
+        ids8 = ", ".join(s.session_id[:8] for s in skipped)
+        print(f"({len(skipped)} skipped — live: {ids8}; "
+              f"pass --force to include)", file=sys.stderr)
+    if not targets:
+        print("Nothing to remove — every match is live.", file=sys.stderr)
+        return 1
+
+    warn = bg_delete_warning([s.session_id for s in targets], ctx.jobs)
+    if warn:
+        print(warn, file=sys.stderr)
+
+    if getattr(args, "dry_run", False):
+        print(f"(dry run — {len(targets)} session(s), "
+              f"{_human(total_bytes)}, nothing removed)")
+        return 0
+
+    if not getattr(args, "yes", False):
+        if not sys.stdin.isatty():
+            print(f"Refusing to remove {len(targets)} session(s) without "
+                  f"confirmation — pass -y/--yes (non-interactive).",
+                  file=sys.stderr)
+            return 1
+        try:
+            reply = input(f"Remove {len(targets)} session(s), "
+                          f"{_human(total_bytes)}? [y/N] ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+
+    deleted, errors = _delete_sessions(targets, list(targets), set(), ctx)
+    failed = bool(errors or not deleted)
+    msg = f"{'✗' if failed else '✓'} removed {deleted} session(s)"
+    if errors:
+        msg += f", {errors} failed"
+    print(msg)
+    return 1 if failed else 0
+
+
+def _rm_one(prefix: str, args: argparse.Namespace, ctx) -> int:
+    """Remove one session addressed by id prefix. Extracted from cmd_rm so the
+    id mode and the bulk mode share nothing but `_delete_sessions`."""
+    target = require_session(prefix)
+    if target is None:
+        return 1
+    id8 = target.session_id[:8]
+    label = f"{id8}  {shorten_path(target.cwd)}"
+
+    warn = bg_delete_warning([target.session_id], ctx.jobs)
+    if warn:
+        print(warn, file=sys.stderr)
+
+    if getattr(args, "dry_run", False):
+        print(f"Would remove: {label}  →  {target.path}")
+        return 0
+
+    if not (getattr(args, "yes", False) or getattr(args, "force", False)):
+        if not sys.stdin.isatty():
+            print(f"Refusing to remove {id8} without confirmation — "
+                  f"pass -y/--yes (non-interactive).", file=sys.stderr)
+            return 1
+        try:
+            reply = input(f"Remove {label}? [y/N] ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+
+    deleted, errors = _delete_sessions([target], [target], set(), ctx)
+    if not deleted or errors:
+        print(f"✗ failed to remove {id8}", file=sys.stderr)
+        return 1
+    print(f"✓ removed {id8}  {shorten_path(target.cwd)}")
+    return 0
+
+
+def cmd_rm(args: argparse.Namespace) -> int:
+    """Remove (unlink) session transcripts and purge their cache/state/mark
+    traces, reusing the same `_delete_sessions` path as the TUI `Del` key.
+
+    Two modes, mirroring `ast done`: explicit id prefix(es), or bulk selection
+    via --filter/--cwd/--status/--days/--older-than/--before (`_bulk_rm`).
+    Only unlinks the transcript — a live background process keeps running
+    (see `bg_delete_warning`). The menu-bar app calls this as `ast rm <id> -y`;
+    non-interactive callers MUST pass -y/--yes, otherwise we refuse rather than
+    hang on `input()` waiting for a tty that isn't there.
+    """
+    ids = args.session_id
+    if isinstance(ids, str):  # pre-1.13 callers pass a plain string
+        ids = [ids] if ids else []
+    selectors = [n for n in _RM_SELECTORS if
+                (getattr(args, n, None) is not None if n in _RM_INT_SELECTORS
+                 else getattr(args, n, None))]
+    if ids and selectors:
+        flag = "--" + selectors[0].replace("_", "-")
+        print(f"Pass session id(s) OR a selector ({flag}), not both.",
+              file=sys.stderr)
+        return 1
+    if selectors:
+        return _bulk_rm(args)
+    if not ids:
+        print("session_id (or a selector such as --filter TEXT) required.",
+              file=sys.stderr)
+        return 1
+    ctx = StatusContext.capture()
+    rc = 0
+    for prefix in ids:
+        if _rm_one(prefix, args, ctx):
+            rc = 1
+    return rc
+
+
+def cmd_live(args: argparse.Namespace) -> int:
+    if not SESSIONS_REGISTRY_DIR.is_dir():
+        print("(no ~/.claude/sessions registry directory)")
+        return 0
+    rows: list[tuple[int, str, str, str, bool, str]] = []  # (pid, sid, cwd, started, alive, kind)
+    for data in _iter_registry_records(sort=True):
+        pid = data.get("pid")
+        sid = data.get("sessionId", "")
+        cwd = data.get("cwd", "")
+        started = data.get("startedAt")
+        kind = data.get("kind", "?")
+        started_str = ""
+        if isinstance(started, (int, float)):
+            started_str = datetime.fromtimestamp(started / 1000).strftime("%Y-%m-%d %H:%M")
+        alive = isinstance(pid, int) and _pid_alive(pid)
+        rows.append((pid or 0, sid, cwd, started_str, alive, kind))
+    if not rows:
+        print("(no registered sessions)")
+        return 0
+    if not args.all:
+        rows = [r for r in rows if r[4]]
+    if not rows:
+        print("(no live sessions)")
+        return 0
+    print(f"{'PID':>7}  {'STATUS':<7}  {'KIND':<11}  {'STARTED':<17}  {'SESSION':<10}  PROJECT")
+    print("-" * 100)
+    reg = scan_registry_status()
+    for pid, sid, cwd, started, alive, kind in rows:
+        rs = (reg.get(sid) or {}).get("status") or ("live" if alive else "dead")
+        print(f"{pid:>7}  {rs:<7}  {kind:<11}  "
+              f"{started:<17}  {sid[:8]:<10}  {shorten_path(cwd)}")
+    return 0
+
+
+def _run_claude(argv: list[str]) -> int:
+    """Run the real `claude` CLI with argv, inheriting stdio (passthrough).
+    Returns its exit code, or 1 if the binary can't be launched. Isolated so
+    bg-action commands (stop/logs) are unit-testable by stubbing this."""
+    import shutil
+    import subprocess
+    claude = shutil.which("claude") or "claude"
+    try:
+        return subprocess.run([claude, *argv]).returncode
+    except OSError as e:
+        print(f"[ast] failed to run 'claude {' '.join(argv)}': {e}",
+              file=sys.stderr)
+        return 1
+
+
+def _bg_action(session_prefix: str, verb: str) -> int:
+    """Resolve a session and run `claude <verb> <short>` against its live
+    background process. Refuses non-bg sessions (no ~/.claude/jobs entry)."""
+    target = require_session(session_prefix)
+    if target is None:
+        return 1
+    short = job_short_for(target.session_id)
+    if not short:
+        print(f"[ast {verb}] {target.session_id[:8]} is not a background "
+              f"session (no ~/.claude/jobs entry). Only bg sessions started "
+              f"via `claude --bg` / agent view can be {verb}'d.",
+              file=sys.stderr)
+        return 1
+    return _run_claude([verb, short])
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    return _bg_action(args.session_id, "stop")
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    return _bg_action(args.session_id, "logs")
+
+
+def cmd_bg(args: argparse.Namespace) -> int:
+    """Dispatch a new background session: `claude --bg [--name N] <prompt>`."""
+    prompt = " ".join(args.prompt).strip()
+    if not prompt:
+        print("[ast bg] empty prompt — nothing to dispatch.", file=sys.stderr)
+        return 1
+    argv = ["--bg"]
+    if getattr(args, "name", None):
+        argv += ["--name", args.name]
+    argv.append(prompt)
+    return _run_claude(argv)
+
+
+def cmd_jobs(args: argparse.Namespace) -> int:
+    """List every agent-view background job from ~/.claude/jobs, including
+    exec / transcript-less jobs the session browser (transcript-based) can't
+    show. Read-only; use ast stop/logs/attach to act on a row."""
+    jobs = scan_jobs()
+    pins = read_pins()
+    print(f"agent-session-tracker v{__version__}  ·  "
+          f"{daemon_status_line(read_daemon_roster())}")
+    if not jobs:
+        print("(no background jobs in ~/.claude/jobs)")
+        return 0
+    print(f"{'':<2} {'ST':<2} {'SHORT':<9} {'STATE':<8} {'TAG':<24} "
+          f"{'DETAIL':<40}  CWD")
+    print("-" * 100)
+    # waiting first, then working, then the rest — most-attention-first.
+    order = {STATUS_WAITING: 0, STATUS_WORKING: 1, STATUS_IDLE: 2,
+             STATUS_ENDED: 3, STATUS_DONE: 4}
+    rows = sorted(jobs.items(),
+                  key=lambda kv: order.get(
+                      _JOB_STATE_GLYPH.get(kv[1].get("state"), STATUS_ENDED), 9))
+    for _sid, j in rows:
+        glyph = _JOB_STATE_GLYPH.get(j.get("state"), STATUS_ENDED)
+        state = j.get("state") or "?"
+        tag = job_badge(j)
+        detail = truncate(j.get("detail") or "", 40)
+        pin = pin_marker(j.get("short"), pins)
+        print(f"{pad_display(pin, 2)} {pad_display(glyph, 2)} "
+              f"{j.get('short', ''):<9} {state:<8} "
+              f"{tag:<24} {pad_display(truncate_display(detail, 40), 40)}  "
+              f"{shorten_path(j.get('cwd') or '')}")
+    print(f"\n{len(jobs)} background job(s). "
+          f"Act with: ast attach|stop|logs <short>")
+    return 0
+
+
+# ---------- prompt-hook (UserPromptSubmit: /done & /undone, 0 tokens) ----------
+
+# `ast prompt-hook` is wired into ~/.claude/settings.json by `ast install-hook`.
+# It intercepts the trigger prompts "done!" / "undone!" (optionally with a
+# session id) BEFORE they reach the model and toggles 작업종료 locally, then
+# blocks the prompt — so the model is never invoked (zero tokens). Anything
+# else: exit 0 with no output, and the prompt proceeds normally.
+#
+# The primary triggers are bang-suffixed ("done!" / "undone!") on purpose: a
+# leading "/" collides with Claude Code's slash-command palette, which
+# intercepts the input before it is ever submitted as a prompt (so the hook
+# never fires). The legacy "/done" / "/undone" forms are still accepted for
+# environments where they happen to submit as plain text.
+
+HOOK_EVENT = "UserPromptSubmit"
+HOOK_CMD = "ast prompt-hook"
+SETTINGS_PATH_DEFAULT = CONFIG_DIR / "settings.json"
+PROMPT_HOOK_RE = re.compile(
+    r"^(?:(done|undone)!|/(done|undone))(?:\s+(\S+))?\s*$")
+
+STATUS_HOOK_CMD = "ast status-hook"
+# Events wired by install-hook. PreToolUse/SessionStart intentionally omitted
+# (write amplification / false-working); the mapper still understands them.
+STATUS_HOOK_EVENTS = ("UserPromptSubmit", "Notification",
+                      "PermissionRequest", "Stop", "SessionEnd")
+
+
+def _our_hook_specs() -> dict[str, list[tuple[str, int]]]:
+    """event -> list of (command, timeout) entries ast manages."""
+    specs: dict[str, list[tuple[str, int]]] = {}
+    specs.setdefault(HOOK_EVENT, []).append((HOOK_CMD, 25))  # prompt-hook
+    for ev in STATUS_HOOK_EVENTS:
+        specs.setdefault(ev, []).append((STATUS_HOOK_CMD, 10))
+    return specs
+
+
+def _is_our_hook_cmd(cmd: str) -> bool:
+    """True for our own hook commands, so install-hook / uninstall-hook stay
+    idempotent and leave foreign entries (ast's included) alone."""
+    c = (cmd or "").strip()
+    return (c.endswith("ast prompt-hook")
+            or c.endswith("ast status-hook"))
+
+
+def cmd_prompt_hook(args: argparse.Namespace) -> int:
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        return 0  # unparseable payload — let the prompt go through
+    prompt = (data.get("prompt") or "").strip()
+    session_id = (data.get("session_id") or "").strip()
+
+    m = PROMPT_HOOK_RE.match(prompt)
+    if not m:
+        return 0  # not our command — normal prompt, goes to the model
+
+    action = m.group(1) or m.group(2)         # "done" | "undone"
+    raw_target = m.group(3) or session_id     # explicit arg wins, else self
+
+    def _block(reason: str) -> int:
+        print(json.dumps({"decision": "block", "reason": reason},
+                          ensure_ascii=False))
+        return 0
+
+    note = "Note: this prompt was not sent to the model (0 tokens)."
+    if not raw_target:
+        return _block(
+            f"[ast {action}] no session id — payload had no session_id and "
+            f"none was given. Nothing changed.\n{note}")
+    target = find_session(raw_target)
+    if target is None:
+        return _block(
+            f"[ast {action}] failed — no session matching '{raw_target}' "
+            f"(not found or ambiguous). Nothing changed.\n{note}")
+    # Self-done (no explicit target) is exempt from the working-guard: the
+    # session is *necessarily* ● working while it processes this very prompt,
+    # so guarding it would block self-done 100% of the time. The guard exists
+    # to stop ✓ from masking some *other* live, quota-burning session — only an
+    # explicit target can be that other session.
+    explicit = bool(m.group(3))
+    if action == "done" and explicit:
+        status = StatusContext.capture().resolve(target.session_id)
+        if done_guard_blocks(status):
+            return _block(
+                f"[ast done] refused — {target.session_id[:8]}  "
+                f"{DONE_WORKING_REASON}\n{note}")
+    set_done(target.session_id, action == "done")
+    glyph = "✓ done ON" if action == "done" else "○ done cleared"
+    return _block(
+        f"[ast {action}] success — {glyph}\n"
+        f"target session: {target.session_id[:8]}  {shorten_path(target.cwd)}\n"
+        f"{note}")
+
+
+# ---------- status-hook (lifecycle: working/waiting/idle, 0 tokens) ----------
+#
+# `ast status-hook` is wired into ~/.claude/settings.json by `ast install-hook`
+# under several Claude Code lifecycle events. It reads the hook JSON on stdin,
+# maps hook_event_name -> a status, and records it into state.json["status"].
+# No stdout (non-blocking; 0 tokens). See the waiting-status design spec.
+
+_HOOK_STATE = {
+    "SessionStart": "working",
+    "UserPromptSubmit": "working",
+    "PreToolUse": "working",
+    "Notification": "waiting",
+    "PermissionRequest": "waiting",
+    "Stop": "idle",
+    "SessionEnd": "-",   # sentinel: clear the overlay entry
+}
+
+
+def hook_event_to_state(event: str) -> str:
+    """Claude Code hook event -> state name. '' = ignore, '-' = clear."""
+    return _HOOK_STATE.get((event or "").strip(), "")
+
+
+def cmd_status_hook(args: argparse.Namespace) -> int:
+    try:
+        raw = sys.stdin.read()
+    except OSError:
+        return 0
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    event = (data.get("hook_event_name")
+             or getattr(args, "event", None) or "").strip()
+    sid = (data.get("session_id") or "").strip()
+    if not sid or not event:
+        return 0
+    s = hook_event_to_state(event)
+    if s == "":
+        return 0  # unknown event — ignore
+    set_status(sid, None if s == "-" else s, event)
+    return 0
+
+
+def _load_settings(path: Path) -> tuple[dict | None, str | None]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None, f"(settings file not found: {path})"
+    try:
+        return json.loads(text), None
+    except json.JSONDecodeError as e:
+        return None, f"(settings file is not valid JSON: {e})"
+
+
+def _write_settings(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
+def _strip_our_entries(hook_list: list) -> tuple[list, int]:
+    kept, removed = [], 0
+    for entry in hook_list:
+        cmds = [h.get("command", "") for h in (entry.get("hooks") or [])
+                if isinstance(h, dict)]
+        if any(_is_our_hook_cmd(c) for c in cmds):
+            removed += 1
+            continue
+        kept.append(entry)
+    return kept, removed
+
+
+def cmd_install_hook(args: argparse.Namespace) -> int:
+    path = Path(os.path.expanduser(args.settings))
+    if not path.exists():
+        # No settings file yet — start from an empty structure and create it so
+        # a first-time install doesn't fail on a missing ~/.claude/settings.json.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        before, work = {}, {}
+    else:
+        before, err = _load_settings(path)
+        if before is None:
+            print(err, file=sys.stderr)
+            return 1
+        work, _ = _load_settings(path)            # independent copy to mutate
+    hooks = work.setdefault("hooks", {})
+    specs = _our_hook_specs()
+    other_total = 0
+    for event, cmds in specs.items():
+        lst = hooks.get(event, [])
+        if not isinstance(lst, list):
+            print(f"(hooks.{event} is not a list — aborting)", file=sys.stderr)
+            return 1
+        kept, _removed = _strip_our_entries(lst)
+        other_total += len(kept)
+        for cmd, to in cmds:
+            kept.append({
+                "matcher": "",
+                "hooks": [{"type": "command", "command": cmd, "timeout": to}],
+            })
+        hooks[event] = kept
+    if json.dumps(before, sort_keys=True) == json.dumps(work, sort_keys=True):
+        print("✓ already installed (no change)")
+        return 0
+    _write_settings(path, work)
+    print(f"✓ installed → {path}\n"
+          f"  events: {', '.join(specs)}\n"
+          f"  ({other_total} foreign hook entr"
+          f"{'y' if other_total == 1 else 'ies'} preserved)\n"
+          f"  Open /hooks once (or restart) if it doesn't fire immediately.")
+    return 0
+
+
+def cmd_uninstall_hook(args: argparse.Namespace) -> int:
+    path = Path(os.path.expanduser(args.settings))
+    data, err = _load_settings(path)
+    if data is None:
+        print(err, file=sys.stderr)
+        return 1
+    hooks = data.get("hooks") or {}
+    total_removed = 0
+    for event in _our_hook_specs():
+        lst = hooks.get(event)
+        if not isinstance(lst, list):
+            continue
+        kept, removed = _strip_our_entries(lst)
+        total_removed += removed
+        if removed:
+            hooks[event] = kept
+    if total_removed == 0:
+        print("✓ not installed — nothing to remove")
+        return 0
+    _write_settings(path, data)
+    print(f"✓ uninstalled from {path} (removed {total_removed} ast entr"
+          f"{'y' if total_removed == 1 else 'ies'}; foreign hooks kept)")
+    return 0
+
+
+# ---------- TUI ----------
+
+def _tui_search_prompt(stdscr, initial: str = "") -> str | None:
+    import curses
+    h, w = stdscr.getmaxyx()
+    buf = initial
+    curses.curs_set(1)
+    try:
+        while True:
+            line = f" / {buf}"
+            try:
+                stdscr.addnstr(h - 1, 0, line.ljust(w - 1), w - 1,
+                               curses.color_pair(2) | curses.A_BOLD)
+                cx = min(w - 1, len(line))
+                stdscr.move(h - 1, cx)
+                stdscr.refresh()
+            except curses.error:
+                pass
+            ch = stdscr.getch()
+            if ch == 27:
+                return None
+            if ch in (10, 13):
+                return buf
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                buf = buf[:-1]
+            elif ch == 21:
+                buf = ""
+            elif 32 <= ch < 127:
+                buf += chr(ch)
+    finally:
+        curses.curs_set(0)
+
+
+def _tui_run_search(stdscr, sessions: list[SessionMeta], query: str) -> dict[str, str] | None:
+    import curses
+    regex = compile_query(query, case_insensitive=True)
+    hits: dict[str, str] = {}
+    h, w = stdscr.getmaxyx()
+    total = len(sessions)
+    stdscr.nodelay(True)
+    try:
+        for i, s in enumerate(sessions, 1):
+            try:
+                ch = stdscr.getch()
+                if ch == 27:
+                    return None
+            except curses.error:
+                pass
+            if i == 1 or i == total or i % 5 == 0:
+                msg = f" Searching {i}/{total}…  (Esc to cancel) "
+                try:
+                    stdscr.addnstr(h - 1, 0, msg.ljust(w - 1), w - 1,
+                                   curses.color_pair(2) | curses.A_BOLD)
+                    stdscr.refresh()
+                except curses.error:
+                    pass
+            # Fast path: session ID match needs no file I/O
+            if regex.search(s.session_id):
+                hits[s.session_id] = f"[session ID: {s.session_id}]"
+                continue
+            try:
+                for turn in agent_of(s).iter_turns(s.path):
+                    text = turn.text
+                    if not text:
+                        continue
+                    m = regex.search(text)
+                    if m:
+                        start = max(0, m.start() - 40)
+                        end = min(len(text), m.end() + 80)
+                        hits[s.session_id] = text[start:end].replace("\n", " ")
+                        break
+            except OSError:
+                continue
+        return hits
+    finally:
+        stdscr.nodelay(False)
+
+
+HELP_LINES = [
+    "agent-session-tracker — TUI help",
+    "",
+    "Navigation (normal mode)",
+    "  ↑↓ / Ctrl-P Ctrl-N     move one row",
+    "  PgUp PgDn Home End     page / jump",
+    "  Enter                  live session: raise its existing terminal window;",
+    "                         else (or on focus miss) open in a NEW window",
+    "                         (spawns `cd <cwd> && claude --resume <id>`;",
+    "                          focus: WezTerm/Terminal.app/iTerm2 via tty match;",
+    "                          macOS new window: iTerm/Terminal; Linux: $TERMINAL/xterm)",
+    "                         cmux: choose [t] workspace tab or [w] new window",
+    "                         Without `ast --skip-perm`, a per-resume popup",
+    "                         asks whether to add --dangerously-skip-permissions.",
+    "  Esc                    clear filter/search, or quit if none",
+    "",
+    "Filter / search  (ALL text input is behind `/`)",
+    "  /                      enter filter prompt (cursor shown on prompt line)",
+    "      typing             live metadata filter (session ID · cwd · first msg)",
+    "      ↑↓ / Ctrl-P Ctrl-N move selection while filtering",
+    "      PgUp PgDn Home End page / jump while filtering",
+    "      Backspace / Ctrl-U edit / wipe the query",
+    "      Ctrl-D             toggle done on the current row",
+    "      Ctrl-A             toggle mark on ALL filtered rows (select all)",
+    "      Ctrl-R             rescan sessions + live-process registry",
+    "      Enter              commit filter, exit prompt (filter stays applied)",
+    "                         → then use ↑↓, Enter, D, R, Del normally",
+    "      Tab                escalate to full-text transcript search",
+    "      Esc                clear query and exit prompt",
+    "",
+    "Session actions (normal mode)",
+    "  a / A                  cycle agent view (all→claude→codex; A backwards) — saved",
+    "  i / I                  auto-rescan interval popup (Off/5/10/30/60/120s)",
+    "  v / V                  preview the focused session (scroll/search modal)",
+    "                         ↑↓ scroll · PgUp/PgDn page · g/G top/bottom · q/Esc/v close",
+    "                         ←/→ (or ‹ › / [ ]) prev/next session in list",
+    "                         / full-text search (literal, case-insensitive)",
+    "                         n / N next/prev match · Esc clear search then close",
+    "                         d / Ctrl-D toggle done on the previewed session",
+    "                         Del delete the session being previewed (confirm first)",
+    "  e / E                  export focused session transcript to .md in cwd",
+    "  o / O                  open the session's folder in a new terminal",
+    "                         (plain shell at the recorded cwd — no claude;",
+    "                          cmux: [t] tab / [w] window chooser as on Enter)",
+    "  Space                  toggle mark on the current row",
+    "  Ctrl-A                 toggle mark on ALL filtered rows (select all)",
+    "  Ctrl-X                 clear all marks",
+    "  D / d / Ctrl-D         mark done on marked rows, else toggle on current row",
+    "  H / h                  toggle hide: show/hide done rows",
+    "                         (Ctrl-H is unavailable — it aliases Backspace)",
+    "  C / c                  toggle: only show sessions under the TUI launch cwd",
+    "                         (prefix match on the recorded session cwd)",
+    "  s                      cycle sort column (status→time→msgs→message→project) — saved",
+    "  S                      reverse the sort direction — saved",
+    "  f / F                  cycle origin filter (all→user→agent; F backwards) — saved",
+    "                         user = started from a terminal (bg jobs included);",
+    "                         agent = SDK-spawned (hooks, claude -p, tooling)",
+    "  t / T                  toggle color theme (dark ↔ light) — saved",
+    "  R / r / Ctrl-R         rescan sessions + live-process registry",
+    "  Del / Fn+Delete        delete marked/current session(s)",
+    "  ?                      this help",
+    "",
+    "Status glyphs",
+    "  ● working  actively producing (hook working / registry busy)",
+    "  ! waiting  waiting for input/permission — the time-leak state",
+    "  ◦ idle     turn finished, process alive, not waiting",
+    "  ○ ended    process gone or never registered",
+    "  ✓ done     user-marked finished — persistent (D / ast done)",
+    "  done overrides all; a stopped session is ended regardless of",
+    "  its last signal; a live one is working/waiting/idle by signal.",
+    "",
+    "Note: plain letters do NOT filter in normal mode — press `/` first.",
+    "",
+    "  ↑↓ scroll · PgUp/PgDn page · g/G top/bottom · q/Esc/Enter close",
+]
+
+
+def _sanitize_cells(s: str) -> str:
+    """Make a single line safe for ``addnstr`` width accounting.
+
+    ``display_width`` counts a TAB / control char as 1 column, but curses
+    expands a TAB to the next tab stop and lets ESC & other C0/C1 controls
+    move the cursor unpredictably — so the rendered width exceeds what we
+    measured and the text spills past the box border. Expand tabs to spaces
+    (no tabs left → curses can't re-expand) and replace remaining control
+    chars with a space, so measured width == rendered width.
+    """
+    s = s.expandtabs(8)
+    return "".join(
+        " " if (o := ord(ch)) < 0x20 or 0x7f <= o <= 0x9f else ch
+        for ch in s
+    )
+
+
+def _wrap_display(s: str, width: int) -> list[str]:
+    """Wrap a single logical line into chunks that fit within `width` display columns.
+
+    Embedded newlines are split defensively: callers should pass single
+    logical lines, but a stray ``\\n`` fed straight to ``addnstr()`` makes the
+    curses cursor jump a row and spill past the box border, so we guard here.
+    Tabs and other control chars are neutralized via ``_sanitize_cells`` for
+    the same reason (a TAB makes the cursor jump horizontally to a tab stop).
+    """
+    if width <= 0:
+        return [""]
+    if not s:
+        return [""]
+    if "\n" in s or "\r" in s:
+        out: list[str] = []
+        for part in s.splitlines():
+            out.extend(_wrap_display(part, width))
+        return out or [""]
+    s = _sanitize_cells(s)
+    out: list[str] = []
+    cur = ""
+    used = 0
+    for ch in s:
+        ea = unicodedata.east_asian_width(ch)
+        cw = 2 if ea in ("W", "F") else 1
+        if used + cw > width:
+            out.append(cur)
+            cur = ch
+            used = cw
+        else:
+            cur += ch
+            used += cw
+    if cur:
+        out.append(cur)
+    return out or [""]
+
+
+def _preview_find_matches(lines: list[tuple[str, int]],
+                          query: str) -> list[tuple[int, int, int]]:
+    """All case-insensitive *literal* substring matches across preview display
+    lines. Returns (line_idx, char_start, char_end) tuples in document order.
+    Offsets are CHARACTER indices into each line's text (not display columns).
+    Empty/whitespace query -> []. `re.escape` keeps the query literal (no regex
+    metacharacters, no `|`-OR) while giving correct offsets into the original
+    text regardless of case folding."""
+    if not query.strip():
+        return []
+    rx = re.compile(re.escape(query), re.IGNORECASE)
+    out: list[tuple[int, int, int]] = []
+    for li, (text, _attr) in enumerate(lines):
+        for m in rx.finditer(text):
+            out.append((li, m.start(), m.end()))
+    return out
+
+
+def _match_step(cur: int, total: int, forward: bool) -> int:
+    """Cyclic next/prev match index. total<=0 -> -1; cur<0 -> first (forward)
+    or last (backward) match."""
+    if total <= 0:
+        return -1
+    if cur < 0:
+        return 0 if forward else total - 1
+    return (cur + 1) % total if forward else (cur - 1) % total
+
+
+def _preview_step(sel: int, total: int, forward: bool) -> int:
+    """Cyclic next/prev session index for the preview modal. total<=0 -> 0;
+    wraps at both ends so ‹/› cycle through the whole list."""
+    if total <= 0:
+        return 0
+    return (sel + 1) % total if forward else (sel - 1) % total
+
+
+_PREVIEW_STATUS_ROW = 1      # index of the Status line inside the header block
+_PREVIEW_MIN_BODY_ROWS = 3   # transcript rows the pinned header must leave free
+
+
+def _preview_status_row(status: str, inner_w: int, flash: bool = False):
+    """The preview modal's Status line as one (text, attr) display row.
+
+    The row carries the state's own color (`_status_attr`, the same palette the
+    list's ST column uses), so ● working / ! waiting / ✓ done read at a glance
+    instead of all looking alike in plain text.
+
+    `flash` reverses it for exactly one keypress after `d` changed the flag:
+    that toggle repaints a single pinned row in place, which is easy to miss on
+    a screenful of transcript, so the row briefly inverts to say "this just
+    changed".
+    """
+    import curses
+    attr = _status_attr(status)
+    if flash:
+        attr |= curses.A_REVERSE | curses.A_BOLD
+    return (truncate_display(f"Status   {status_label(status)}", inner_w), attr)
+
+
+def _preview_sticky_head(head_n: int, view_h: int) -> int:
+    """Rows of the preview's metadata header to pin above the scrolling body.
+
+    The Session/Status/Cwd/Branch/Started block should stay readable while the
+    transcript scrolls, so the renderer paints it separately from the scrolled
+    lines. On a short window pinning all of it would leave no room for the
+    transcript, so the pin is capped at ``view_h - _PREVIEW_MIN_BODY_ROWS``
+    (0 when even that does not fit). Rows dropped by the cap are not lost to
+    the reader: the scrolling body starts at the pinned count, so they show up
+    at the top of the scroll area instead.
+    """
+    if head_n <= 0 or view_h <= 0:
+        return 0
+    return max(0, min(head_n, view_h - _PREVIEW_MIN_BODY_ROWS))
+
+
+def _scroll_match_into_view(line_idx: int, top: int, view_h: int,
+                            max_top: int) -> int:
+    """Return a new `top` so `line_idx` is visible within [top, top+view_h-1],
+    clamped to [0, max_top]. Keeps `top` if the line is already visible."""
+    if view_h <= 0:
+        return max(0, min(top, max_top))
+    if line_idx < top:
+        top = line_idx
+    elif line_idx > top + view_h - 1:
+        top = line_idx - view_h + 1
+    return max(0, min(top, max_top))
+
+
+def _read_key(win) -> tuple[int, str | None]:
+    """Read one keypress from a curses window, assembling multi-byte UTF-8 so
+    Korean/CJK input works (mirrors the main TUI loop). Returns
+    (code, char_or_None): `code` is the curses key code (>=0x100 for special
+    keys) or the codepoint for single chars, else -1. `char_or_None` is the
+    decoded printable string when applicable."""
+    b = win.getch()
+    if b < 0:
+        return (-1, None)
+    if b >= 0x100:                       # special key (KEY_UP, KEY_BACKSPACE, ...)
+        return (b, None)
+    if b < 0x80:                         # ASCII / control char
+        return (b, chr(b) if 0x20 <= b < 0x7f else None)
+    # UTF-8 lead byte — read continuation bytes for this character.
+    if b & 0xE0 == 0xC0:
+        n_more = 1
+    elif b & 0xF0 == 0xE0:
+        n_more = 2
+    elif b & 0xF8 == 0xF0:
+        n_more = 3
+    else:
+        return (-1, None)
+    buf = bytearray([b])
+    for _ in range(n_more):
+        nb = win.getch()
+        if nb < 0 or nb >= 0x100:
+            return (-1, None)
+        buf.append(nb)
+    try:
+        s = buf.decode("utf-8")
+    except UnicodeDecodeError:
+        return (-1, None)
+    return (ord(s) if len(s) == 1 else -1, s)
+
+
+def _centered_win(stdscr, box_h, box_w):
+    """Create a `box_h`×`box_w` curses window centered on `stdscr`, keypad on.
+
+    Centralizes the box-placement math every TUI modal repeated. The caller
+    still computes `box_h`/`box_w` (content-dependent); this owns the centering
+    + ``newwin`` + ``keypad``. ``curses.error`` from an oversized ``newwin`` is
+    left to propagate so callers that already guard it keep their behavior.
+    """
+    import curses
+    h, w = stdscr.getmaxyx()
+    y0 = max(0, (h - box_h) // 2)
+    x0 = max(0, (w - box_w) // 2)
+    win = curses.newwin(box_h, box_w, y0, x0)
+    win.keypad(True)
+    return win
+
+
+def _preview_modal(stdscr, items, sel: int, ctx, on_status_change=None):
+    """Scrollable preview of the focused session's transcript.
+
+    The leading metadata block (Session/Status/Cwd/Branch/Started + a rule) is
+    pinned at the top by `_preview_sticky_head`: only the transcript below it
+    scrolls, so the session being read stays identified at every scroll offset.
+
+    `‹`/`›` (or ←/→) switch to the previous/next session in `items` without
+    leaving the modal; the view, scroll and in-modal search reset per session.
+    Closed by q/Q/Esc/v/V. `d`/`Ctrl-D` toggles the viewed session's 작업종료
+    (done) flag in place (refused on a ● working session, mirroring the list's
+    done guard); only the pinned Status row is repainted, so the scroll
+    position and any active search survive the toggle. `on_status_change`, when
+    the caller passes one, is invoked right after that toggle so the list
+    around the modal box can repaint its own ST glyph and ✓/○ counts instead of
+    showing the pre-toggle state until the modal closes; the callback is
+    expected to write to the virtual screen only (`noutrefresh`), and the
+    modal's next `refresh()` flushes both in one update. Read-only otherwise
+    except for `Del`, which shows the delete confirmation in place: cancel
+    returns to the preview, confirm closes the modal and returns the
+    (already-confirmed) `SessionMeta` for the caller to delete. Every other
+    path returns None.
+    """
+    import curses
+    if not items:
+        return None
+    h, w = stdscr.getmaxyx()
+    box_w = min(120, max(60, w - 2))
+    box_h = min(40, max(12, h - 2))
+    win = _centered_win(stdscr, box_h, box_w)
+
+    inner_w = box_w - 4
+    total = len(items)
+    multi = total > 1
+    sel = sel % total
+
+    header_attr = curses.color_pair(2) | curses.A_BOLD
+    cwd_attr = curses.color_pair(4)
+    dim_attr = curses.A_DIM
+    user_attr = curses.color_pair(2) | curses.A_BOLD
+    asst_attr = curses.color_pair(3) | curses.A_BOLD
+    # Distinct colors so the focused match stands out from the rest.
+    # A_REVERSE is kept so matches stay visible even on colorless terminals.
+    hl_attr = curses.color_pair(2) | curses.A_REVERSE              # all matches — yellow block
+    cur_attr = curses.color_pair(9) | curses.A_REVERSE | curses.A_BOLD  # current — cyan block
+
+    def _status_row(status, flash=False):
+        """The Status line, rebuilt in place when `d` toggles the done flag.
+        Its index inside `lines` is `_PREVIEW_STATUS_ROW`."""
+        return _preview_status_row(status, inner_w, flash)
+
+    def _build_lines(target, status):
+        """Display lines for one session, plus the length of the leading
+        metadata block the renderer pins above the scrolling body."""
+        lines: list[tuple[str, int]] = []
+        lines.append((truncate_display(
+            f"Session  {target.session_id}    Agent  {target.agent}", inner_w),
+            header_attr))
+        lines.append(_status_row(status))
+        lines.append((truncate_display(f"Cwd      {shorten_path(target.cwd)}", inner_w), cwd_attr))
+        if target.git_branch:
+            lines.append((truncate_display(f"Branch   {target.git_branch}", inner_w), cwd_attr))
+        lines.append((truncate_display(
+            f"Started  {fmt_ts(target.first_ts)}    Last  {fmt_ts(target.last_ts)}    Msgs  {target.msg_count}",
+            inner_w), dim_attr))
+        lines.append(("─" * inner_w, dim_attr))
+        head_n = len(lines)   # everything above this stays pinned on screen
+        if target.first_user_msg:
+            lines.append(("", 0))
+            lines.append(("First user message:", curses.A_BOLD))
+            for raw_ln in target.first_user_msg.splitlines() or [""]:
+                for ln in _wrap_display(raw_ln, inner_w):
+                    lines.append((ln, 0))
+            lines.append(("", 0))
+            lines.append(("─" * inner_w, dim_attr))
+
+        rendered = 0
+        try:
+            for etype, ts, text in iter_messages(target.path):
+                prefix = "🧑 user" if etype == "user" else "🤖 assistant"
+                attr = user_attr if etype == "user" else asst_attr
+                lines.append((truncate_display(f"{prefix}  [{ts}]", inner_w), attr))
+                for raw_ln in text.splitlines() or [""]:
+                    for ln in _wrap_display(raw_ln, inner_w):
+                        lines.append((ln, 0))
+                lines.append(("", 0))
+                rendered += 1
+        except Exception as e:
+            lines.append((truncate_display(f"(read error: {e})", inner_w), curses.color_pair(5)))
+
+        if rendered == 0:
+            lines.append(("(no user/assistant messages)", dim_attr))
+        return lines, head_n
+
+    delete_target = None  # set when the user presses Del; returned to the caller
+    notice = ""           # transient footer message (done toggle / guard); one keypress
+
+    # --- outer session-switch loop ---
+    while True:
+        target = items[sel]
+        status = ctx.resolve(target.session_id)
+        lines, head_n = _build_lines(target, status)
+
+        # Force a full repaint of the box on every session entry/switch. erase()
+        # keeps the window's logical buffer clean, but terminal multiplexers that
+        # only apply ncurses' cell-diff updates (cmux/Ghostty) can drop part of
+        # the diff on a ‹/› switch, leaving the previous session's text bleeding
+        # through. clearok makes the next refresh resend the whole window;
+        # ncurses auto-clears the flag afterwards, so per-key scrolling still
+        # uses cheap diff updates.
+        win.clearok(True)
+
+        list_h = box_h - 3  # 1 top border + 1 bottom border + 1 footer line
+        view_h = max(1, list_h - 1)  # visible content rows (last inner row = footer)
+        head_h = _preview_sticky_head(head_n, view_h)  # pinned metadata rows
+        body_h = max(1, view_h - head_h)               # scrolling transcript rows
+        # `top` indexes `lines` absolutely. The pinned rows never scroll, so it
+        # stays within [head_h, max_top].
+        max_top = max(head_h, len(lines) - body_h)
+        top = head_h
+
+        # True while the Status row is inverted right after a `d` toggle; the
+        # next keypress clears it, exactly like `notice`.
+        status_flash = False
+
+        # --- in-modal full-text search state (per session) ---
+        query = ""
+        searching = False                          # True while typing in the `/` prompt
+        matches: list[tuple[int, int, int]] = []   # (line_idx, col_start, col_end)
+        cur_match = -1
+
+        def _visible_rows(cur_top: int):
+            """(screen_row, line_index) pairs to paint: the pinned header rows
+            first, then the scrolling body starting at `cur_top`."""
+            for i in range(head_h):
+                yield 1 + i, i
+            for i in range(body_h):
+                idx = cur_top + i
+                if idx >= len(lines):
+                    return
+                yield 1 + head_h + i, idx
+
+        def _scroll_to(line_idx: int, cur_top: int) -> int:
+            """Scroll so `line_idx` is visible. A match inside the pinned header
+            is on screen already, so it must never drag `top` into the header."""
+            if line_idx < head_h:
+                return max(head_h, min(cur_top, max_top))
+            return max(head_h,
+                       _scroll_match_into_view(line_idx, cur_top, body_h, max_top))
+
+        def _recompute(new_top: int) -> tuple[int, int]:
+            """Recompute matches for the current `query`, then pick and scroll to a
+            match. Returns (cur_match, top)."""
+            nonlocal matches
+            matches = _preview_find_matches(lines, query)
+            if not matches:
+                return -1, max(head_h, min(new_top, max_top))
+            nxt = next((i for i, (ml, _, _) in enumerate(matches) if ml >= new_top), 0)
+            return nxt, _scroll_to(matches[nxt][0], new_top)
+
+        switch = None  # 'prev' | 'next' set when the user jumps sessions, else close
+
+        # --- inner render + key loop for the current session ---
+        while True:
+            try:
+                win.erase()
+                win.box()
+                pos_tag = f" · {sel + 1}/{total}" if multi else ""
+                title = f" Preview · {target.session_id[:8]}{pos_tag} "
+                try:
+                    win.addnstr(0, max(2, (box_w - len(title)) // 2), title,
+                                box_w - 4, header_attr)
+                except curses.error:
+                    pass
+                for row, idx in _visible_rows(top):
+                    text, attr = lines[idx]
+                    try:
+                        win.addnstr(row, 2, text, box_w - 4, attr)
+                    except curses.error:
+                        pass
+                    # overlay search highlights for any matches on this line
+                    for mi, (ml, cs, ce) in enumerate(matches):
+                        if ml != idx:
+                            continue
+                        col = 2 + display_width(text[:cs])
+                        if col >= box_w - 2:
+                            continue
+                        seg_attr = cur_attr if mi == cur_match else hl_attr
+                        try:
+                            win.addnstr(row, col, text[cs:ce], box_w - 2 - col, seg_attr)
+                        except curses.error:
+                            pass
+                pos = f" {min(top + body_h, len(lines))}/{len(lines)} "
+                prompt_attr = dim_attr
+                if notice:
+                    prompt = notice
+                    prompt_attr = header_attr
+                elif searching:
+                    cnt = f"[{(cur_match + 1) if matches else 0}/{len(matches)}]"
+                    prompt = f" /{query}▏  {cnt}  Enter find · Esc cancel "
+                elif query:
+                    cnt = f"[{(cur_match + 1) if matches else 0}/{len(matches)}]"
+                    prompt = f" /{query}  {cnt}  n/N next/prev · / edit · Esc clear "
+                else:
+                    nav = " · ←→ session" if multi else ""
+                    prompt = f" ↑↓ scroll · PgUp/PgDn · g/G{nav} · / search · d done · Del delete · q/Esc/v close "
+                try:
+                    win.addnstr(box_h - 2, 2, prompt, box_w - 4 - len(pos) - 1, prompt_attr)
+                    win.addnstr(box_h - 2, max(2, box_w - 2 - len(pos)), pos, len(pos), dim_attr)
+                except curses.error:
+                    pass
+                win.refresh()
+                ch, ch_str = _read_key(win)
+            except KeyboardInterrupt:
+                break
+
+            if ch == -1 and ch_str is None:
+                continue
+            notice = ""  # any real keypress dismisses the transient notice
+            if status_flash:  # ... and settles the Status row back to plain color
+                lines[_PREVIEW_STATUS_ROW] = _status_row(ctx.resolve(target.session_id))
+                status_flash = False
+
+            if searching:
+                # --- typing inside the `/` find prompt (incremental) ---
+                if ch in (10, 13):                       # Enter — confirm, keep highlights
+                    searching = False
+                elif ch == 27:                           # Esc — cancel search
+                    searching = False
+                    query = ""
+                    matches = []
+                    cur_match = -1
+                elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                    query = query[:-1]
+                    cur_match, top = _recompute(top)
+                elif ch == 21:                           # Ctrl-U — wipe query
+                    query = ""
+                    cur_match, top = _recompute(top)
+                elif ch_str is not None and ch_str.isprintable():
+                    query += ch_str
+                    cur_match, top = _recompute(top)
+                # any other key ignored while typing
+                continue
+
+            # --- normal preview navigation ---
+            if ch in (ord('q'), ord('Q'), ord('v'), ord('V')):
+                break
+            elif ch == 27:                               # Esc — clear search, else close
+                if query:
+                    query = ""
+                    matches = []
+                    cur_match = -1
+                else:
+                    break
+            elif multi and ch in (ord('<'), ord('['), curses.KEY_LEFT):
+                switch = 'prev'
+                break
+            elif multi and ch in (ord('>'), ord(']'), curses.KEY_RIGHT):
+                switch = 'next'
+                break
+            elif ch == ord('/'):                         # start / re-edit search
+                searching = True
+            elif ch == ord('n'):                         # next match
+                if matches:
+                    cur_match = _match_step(cur_match, len(matches), True)
+                    top = _scroll_to(matches[cur_match][0], top)
+            elif ch == ord('N'):                         # previous match
+                if matches:
+                    cur_match = _match_step(cur_match, len(matches), False)
+                    top = _scroll_to(matches[cur_match][0], top)
+            elif ch in (curses.KEY_UP, 16):
+                top = max(head_h, top - 1)
+            elif ch in (curses.KEY_DOWN, 14):
+                top = min(max_top, top + 1)
+            elif ch == curses.KEY_PPAGE:
+                top = max(head_h, top - body_h)
+            elif ch == curses.KEY_NPAGE:
+                top = min(max_top, top + body_h)
+            elif ch in (curses.KEY_HOME, ord('g')):
+                top = head_h
+            elif ch in (curses.KEY_END, ord('G')):
+                top = max_top
+            elif ch in (ord('d'), ord('D'), 4):  # d / D / Ctrl-D — toggle done on viewed session
+                st = ctx.resolve(target.session_id)
+                if done_guard_blocks(st):
+                    notice = " ● working — `claude stop` it or wait, then mark done "
+                else:
+                    now_done = mark_done(target.session_id)
+                    ctx.done = done_ids()
+                    notice = " ✓ Marked done " if now_done else " Cleared done "
+                    # Repaint the pinned Status row in place. Rebuilding every
+                    # line (the old `reload` round-trip) also threw away the
+                    # scroll position and the active search.
+                    lines[_PREVIEW_STATUS_ROW] = _status_row(
+                        ctx.resolve(target.session_id), flash=True)
+                    status_flash = True
+                    # Let the list behind the box follow the same toggle. The
+                    # callback only stages its rows on the virtual screen, so
+                    # clearok makes the next win.refresh() resend the whole box
+                    # on top of them.
+                    if on_status_change is not None:
+                        try:
+                            on_status_change()
+                        except curses.error:
+                            pass   # a too-small terminal must not kill the modal
+                        win.clearok(True)
+                    if query:
+                        matches = _preview_find_matches(lines, query)
+                        if cur_match >= len(matches):
+                            cur_match = len(matches) - 1
+            elif ch in (curses.KEY_DC, 330):     # Del — confirm, then delete viewed session
+                if _confirm_delete_modal(stdscr, [target], ctx):
+                    delete_target = target
+                    break
+                # cancelled: stay in preview — force a full repaint so the
+                # confirm box's leftovers don't bleed through (cmux/Ghostty
+                # only apply cell-diffs).
+                win.clearok(True)
+
+        if delete_target is not None:
+            break
+        if switch == 'prev':
+            sel = _preview_step(sel, total, False)
+        elif switch == 'next':
+            sel = _preview_step(sel, total, True)
+        else:
+            break
+
+    del win
+    stdscr.touchwin()
+    stdscr.refresh()
+    return delete_target
+
+
+def _help_scroll(key: int, offset: int, total: int, view_h: int,
+                 keys: tuple) -> tuple[int, bool]:
+    """Pure scroll/close logic for the help modal — no curses import, so it
+    is unit-testable. `keys` = (UP, DOWN, PPAGE, NPAGE, HOME, END) curses
+    codes. Returns (clamped_offset, should_close)."""
+    UP, DOWN, PPAGE, NPAGE, HOME, END = keys
+    maxoff = max(0, total - view_h)
+    step = max(1, view_h - 1)            # pager-style page with 1-line overlap
+    if key in (27, ord('q'), ord('Q'), 10, 13, ord('?')):
+        return max(0, min(offset, maxoff)), True
+    if key in (UP, 16, ord('k')):
+        offset -= 1
+    elif key in (DOWN, 14, ord('j')):
+        offset += 1
+    elif key == PPAGE:
+        offset -= step
+    elif key in (NPAGE, 32):             # PgDn / Space
+        offset += step
+    elif key in (HOME, ord('g')):
+        offset = 0
+    elif key in (END, ord('G')):
+        offset = maxoff
+    return max(0, min(offset, maxoff)), False
+
+
+def _show_help_modal(stdscr):
+    import curses
+    h, w = stdscr.getmaxyx()
+    box_w = min(82, max(40, w - 4))
+    box_h = min(len(HELP_LINES) + 4, max(10, h - 2))
+    try:
+        win = _centered_win(stdscr, box_h, box_w)
+    except curses.error:
+        return
+    view_h = max(1, box_h - 2)
+    total = len(HELP_LINES)
+    offset = 0
+    keys = (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE,
+            curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END)
+    try:
+        while True:
+            win.erase()
+            win.box()
+            for i, line in enumerate(HELP_LINES[offset: offset + view_h]):
+                try:
+                    attr = curses.A_BOLD if line and not line.startswith(" ") and line[-1] != "…" else curses.A_NORMAL
+                    if line == HELP_LINES[0]:
+                        attr = curses.color_pair(2) | curses.A_BOLD
+                    win.addnstr(1 + i, 2, line, box_w - 4, attr)
+                except curses.error:
+                    pass
+            try:
+                if offset > 0:
+                    win.addnstr(0, max(2, box_w - 11), " ▲ more ", 9,
+                                curses.A_DIM)
+                if offset + view_h < total:
+                    win.addnstr(box_h - 1, max(2, box_w - 11), " ▼ more ", 9,
+                                curses.A_DIM)
+            except curses.error:
+                pass
+            win.refresh()
+            offset, close = _help_scroll(win.getch(), offset, total,
+                                         view_h, keys)
+            if close:
+                break
+    finally:
+        del win
+        stdscr.touchwin()
+        stdscr.refresh()
+
+
+def _auto_rescan_modal(stdscr, enabled: bool, interval: int):
+    """Popup to pick the auto-rescan interval. Returns (enabled, interval)
+    on apply, or None on cancel."""
+    import curses
+    rows = [("Off", 0)] + [(f"{p}s", p) for p in AUTO_RESCAN_PRESETS]
+    cur = 0 if (not enabled or interval <= 0) else next(
+        (i for i, (_, v) in enumerate(rows) if v == interval), 1)
+    h, w = stdscr.getmaxyx()
+    box_w = min(40, max(24, w - 4))
+    box_h = min(len(rows) + 4, max(5, h - 2))
+    try:
+        win = _centered_win(stdscr, box_h, box_w)
+    except curses.error:
+        return None
+    try:
+        while True:
+            win.erase()
+            win.box()
+            try:
+                win.addnstr(0, 2, " auto-rescan ", box_w - 4,
+                            curses.color_pair(2) | curses.A_BOLD)
+                win.addnstr(1, 2, "↑↓/1-6  Enter apply  Esc cancel",
+                            box_w - 4, curses.A_DIM)
+            except curses.error:
+                pass
+            for i, (label, _v) in enumerate(rows):
+                mark = "▶ " if i == cur else "  "
+                attr = (curses.color_pair(1) if i == cur
+                        else curses.A_NORMAL)
+                try:
+                    win.addnstr(3 + i, 2, f"{mark}{label}", box_w - 4, attr)
+                except curses.error:
+                    pass
+            win.refresh()
+            k = win.getch()
+            if k in (27, ord('q')):                       # Esc / q
+                return None
+            if k in (curses.KEY_UP, 16):
+                cur = (cur - 1) % len(rows)
+            elif k in (curses.KEY_DOWN, 14):
+                cur = (cur + 1) % len(rows)
+            elif ord('1') <= k <= ord('6'):
+                idx = k - ord('1')
+                if idx < len(rows):
+                    cur = idx
+            elif k in (curses.KEY_ENTER, 10, 13):
+                label, v = rows[cur]
+                if v == 0:
+                    return (False, interval if interval > 0
+                            else AUTO_RESCAN_DEFAULT_INTERVAL)
+                return (True, v)
+    finally:
+        del win
+        stdscr.touchwin()
+        stdscr.refresh()
+
+
+@dataclass
+class RescanResult:
+    ctx: StatusContext
+    waiting: set[str]
+
+
+def _do_rescan(cwd_filter, days, sessions, on_progress=None) -> RescanResult:
+    """Reload sessions (in place) + status context. Shared by the manual R
+    key and the TUI auto-rescan tick.
+
+    `on_progress(done, total)` is forwarded to `load_all_sessions`, which
+    owns virtually the whole cost of a rescan: re-reading every transcript
+    whose mtime moved takes seconds on a large collection, while the status
+    capture that follows it costs a couple of milliseconds. So a percentage
+    counted over the transcript files tracks the wait a user actually sees."""
+    fresh = load_all_sessions(cwd_filter=cwd_filter, days=days, progress=False,
+                              on_progress=on_progress)
+    sessions[:] = fresh
+    ctx = StatusContext.capture()
+    return RescanResult(ctx, ctx.waiting(sessions))
+
+
+# Repaint throttle for the TUI rescan counter. A rescan calls back once per
+# transcript file — thousands of times — so the footer is redrawn at most
+# every 80ms, which keeps curses out of the scan's critical path while still
+# looking continuous.
+_RESCAN_PAINT_INTERVAL_S = 0.08
+# How long a rescan must run before the counter appears at all. A warm,
+# fully-cached rescan finishes in a few hundred milliseconds, and flashing a
+# counter for that long reads as a glitch rather than as progress.
+_RESCAN_PAINT_DELAY_S = 0.35
+
+
+def rescan_progress_text(done: int, total: int, label: str = "Rescanning…") -> str:
+    """The TUI's rescan footer text, e.g. `Rescanning… 42% (994/2370)`."""
+    return f"{label} {progress_pct(done, total)}% ({done}/{total})"
+
+
+def _rescan_progress_painter(stdscr, label: str = "Rescanning…",
+                             delay: float = _RESCAN_PAINT_DELAY_S,
+                             clock=None):
+    """Build an `on_progress(done, total)` callback that paints the rescan
+    percentage onto the TUI's bottom line.
+
+    The first paint is held back by `delay` seconds and later ones are
+    throttled by `_RESCAN_PAINT_INTERVAL_S`; a percentage that has not changed
+    since the previous paint is skipped outright. The footer is not restored
+    afterwards because the main loop redraws it on the next iteration.
+    `clock` overrides the monotonic time source (tests drive it by hand)."""
+    import curses
+    import time
+
+    now_fn = clock or time.monotonic
+    try:
+        attr = curses.color_pair(2) | curses.A_BOLD
+    except curses.error:      # no color pairs (curses never initialised)
+        attr = curses.A_BOLD
+    state = {"next_paint": now_fn() + delay, "shown": -1}
+
+    def _paint(done: int, total: int) -> None:
+        now = now_fn()
+        pct = progress_pct(done, total)
+        if now < state["next_paint"] or pct == state["shown"]:
+            return
+        state["next_paint"] = now + _RESCAN_PAINT_INTERVAL_S
+        state["shown"] = pct
+        h, w = stdscr.getmaxyx()
+        width = max(0, w - 1)
+        if width <= 0:
+            return
+        text = f" {rescan_progress_text(done, total, label)} "
+        try:
+            stdscr.addnstr(h - 1, 0, text.ljust(width), width, attr)
+            stdscr.refresh()
+        except curses.error:
+            pass
+
+    return _paint
+
+
+# ── TUI color theme palettes ────────────────────────────────────────────────
+#
+# Pair NUMBERS carry fixed meaning (1=selection, 2=header/accent, 3=working,
+# 4=cwd, 5=danger, 6=mark/done, 7=dim/ended, 8=waiting, 9=idle); only their
+# (fg, bg) differ per theme. Because every call site resolves a pair by NUMBER,
+# swapping the palette re-themes the whole UI without touching call sites.
+#
+# Both themes fix a background on EVERY pair so a theme renders identically
+# across Terminal.app / WezTerm / iTerm2 / ghostty regardless of that terminal's
+# own background (the earlier `-1`/inherit design made the dark accents — yellow
+# especially — unreadable on a light terminal). Pair 7 doubles as the
+# full-screen bg fill (via stdscr.bkgd) in BOTH themes — white-on-black under
+# dark, black-on-white under light — so untouched cells inherit the theme bg.
+#
+# DARK  = the saturated "looks good on black" scheme on a FIXED black bg.
+# LIGHT = the same hues remapped onto a FIXED white bg: the selection chip
+#         becomes a solid black bar (white-on-black, so color_pair(1) still
+#         stands out with no call-site change), the yellow header goes mono
+#         black, and idle's cyan (washes out on white) is swapped for blue.
+_BG_PAIR = 7
+_ACTIVE_THEME = "dark"
+
+
+def current_theme() -> str:
+    """The theme last applied by :func:`tui_init_colors` ("dark"|"light")."""
+    return _ACTIVE_THEME
+
+
+def tui_init_colors(theme: str, stdscr=None) -> None:
+    """Initialize the curses color palette for ``theme`` ("dark"|"light").
+
+    Safe to call repeatedly — used both at startup and on the live `t` toggle.
+    Unknown values fall back to dark. When ``stdscr`` is given, also fills the
+    whole screen with the theme background via the shared fill pair (7).
+    """
+    import curses
+    global _ACTIVE_THEME
+    _ACTIVE_THEME = "light" if theme == "light" else "dark"
+    try:
+        curses.use_default_colors()
+    except (curses.error, ValueError):
+        pass
+    B, R, G, Y = (curses.COLOR_BLACK, curses.COLOR_RED,
+                  curses.COLOR_GREEN, curses.COLOR_YELLOW)
+    BL, M, C, W = (curses.COLOR_BLUE, curses.COLOR_MAGENTA,
+                   curses.COLOR_CYAN, curses.COLOR_WHITE)
+    if _ACTIVE_THEME == "light":
+        palette = (
+            (1, W, B),   # selection — solid black bar (reverse look on white)
+            (2, B, W),   # header / accent — mono black, recedes on white
+            (3, G, W),   # working
+            (4, BL, W),  # cwd / project
+            (5, R, W),   # danger
+            (6, M, W),   # mark / done
+            (7, B, W),   # dim / ended; also the bg-fill pair
+            (8, R, W),   # waiting
+            (9, BL, W),  # idle — cyan washes out on white, use blue
+        )
+    else:
+        palette = (
+            (1, B, C),   # selection — solid cyan chip
+            (2, Y, B),   # header / accent
+            (3, G, B),   # working
+            (4, BL, B),  # cwd / project
+            (5, R, B),   # danger
+            (6, M, B),   # mark / done
+            (7, W, B),   # dim / ended; also the bg-fill pair
+            (8, R, B),   # waiting
+            (9, C, B),   # idle
+        )
+    for n, fg, bg in palette:
+        try:
+            curses.init_pair(n, fg, bg)
+        except (curses.error, ValueError):
+            pass
+    if stdscr is not None:
+        try:
+            stdscr.bkgd(" ", curses.color_pair(_BG_PAIR))
+        except (curses.error, ValueError):
+            pass
+
+
+def _orphan_relocate_flow(stdscr, target: SessionMeta):
+    """Recorded cwd is gone. Search for the moved folder and offer a
+    relocate. Returns ("relocate", new_cwd) | ("placeholder", old_cwd)
+    | ("cancel", None)."""
+    import curses
+    old_cwd = target.cwd
+
+    # status line while scanning
+    h2, w2 = stdscr.getmaxyx()
+    try:
+        stdscr.addnstr(h2 - 1, 0,
+                       " scanning for moved folder… ".ljust(w2 - 1),
+                       w2 - 1, curses.color_pair(2) | curses.A_BOLD)
+        stdscr.refresh()
+    except curses.error:
+        pass
+    cands = find_relocation_candidates(old_cwd, target)
+    kind, payload = classify_candidates(cands)
+
+    def _modal(lines: list[str], prompt: str, keymap: dict):
+        h3, w3 = stdscr.getmaxyx()
+        box_w = min(86, max(54, w3 - 6))
+        box_h = min(h3 - 2, max(9, len(lines) + 5))
+        win = _centered_win(stdscr, box_h, box_w)
+        try:
+            win.box()
+            title = " Folder moved? "
+            try:
+                win.addnstr(0, max(2, (box_w - len(title)) // 2), title,
+                            box_w - 4, curses.color_pair(5) | curses.A_BOLD)
+            except curses.error:
+                pass
+            row = 2
+            for ln in lines[:box_h - 4]:
+                try:
+                    win.addnstr(row, 3, truncate(ln, box_w - 6), box_w - 6)
+                except curses.error:
+                    pass
+                row += 1
+            try:
+                win.addnstr(box_h - 2, 3, prompt, box_w - 6, curses.A_BOLD)
+            except curses.error:
+                pass
+            win.refresh()
+            while True:
+                k = win.getch()
+                for keys, val in keymap.items():
+                    if k in keys:
+                        return val
+        finally:
+            del win
+            stdscr.touchwin()
+            stdscr.refresh()
+
+    def _notice(msg: str, sub: str):
+        lines = [msg, "", sub, "", "[press any key]"]
+        h3, w3 = stdscr.getmaxyx()
+        box_w = min(86, max(54, w3 - 6))
+        box_h = min(h3 - 2, max(7, len(lines) + 4))
+        win = _centered_win(stdscr, box_h, box_w)
+        try:
+            win.box()
+            row = 1
+            for ln in lines:
+                try:
+                    win.addnstr(row, 3, truncate(ln, box_w - 6), box_w - 6)
+                except curses.error:
+                    pass
+                row += 1
+            win.refresh()
+            win.getch()
+        finally:
+            del win
+            stdscr.touchwin()
+            stdscr.refresh()
+
+    def _manual_entry():
+        _, w3 = stdscr.getmaxyx()
+        box_w = min(86, max(54, w3 - 6))
+        win = _centered_win(stdscr, 5, box_w)
+        try:
+            curses.echo()
+            try:
+                curses.curs_set(1)
+            except curses.error:
+                pass
+            win.box()
+            try:
+                win.addnstr(1, 2, "New path for this session:", box_w - 4)
+            except curses.error:
+                pass
+            win.refresh()
+            raw = win.getstr(2, 2, box_w - 6).decode("utf-8", "replace")
+        except Exception:
+            raw = ""
+        finally:
+            curses.noecho()
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            del win
+            stdscr.touchwin()
+            stdscr.refresh()
+        p = os.path.expanduser(raw.strip())
+        return p if p and os.path.isdir(p) else None
+
+    def _do_relocate(new_cwd: str):
+        res = relocate_session(target, new_cwd, dry_run=False)
+        if res.ok and res.reason in ("ok", "samecwd"):
+            target.cwd = res.new_cwd or new_cwd
+            if res.new_path is not None:
+                target.path = res.new_path
+            return ("relocate", target.cwd)
+        return ("fail", res.message)
+
+    def _resolve(new_cwd: str):
+        r = _do_relocate(new_cwd)
+        if r[0] == "relocate":
+            return r
+        _notice(f"Relocate failed: {r[1]}",
+                "Opening an empty placeholder instead.")
+        return ("placeholder", old_cwd)
+
+    sp = shorten_path(old_cwd)
+    if kind == "confirm":
+        best = payload
+        sig = (", ".join(best.signals[:6]) or "name match")
+        lines = [
+            f"Recorded cwd is gone:  {sp}",
+            f"Best match (score {best.score}):",
+            f"  {shorten_path(best.path)}",
+            f"  signals: {sig}",
+            "",
+            "Relocate this session there and open?",
+        ]
+        choice = _modal(
+            lines,
+            " [y] relocate & open   [e] enter path   [o] placeholder   [Esc] cancel ",
+            {(ord("y"), ord("Y"), 10, 13): "y",
+             (ord("e"), ord("E")): "e",
+             (ord("o"), ord("O")): "o",
+             (27,): "esc"})
+        if choice == "y":
+            return _resolve(best.path)
+        if choice == "e":
+            p = _manual_entry()
+            return _resolve(p) if p else ("placeholder", old_cwd)
+        if choice == "o":
+            return ("placeholder", old_cwd)
+        return ("cancel", None)
+
+    if kind == "pick":
+        view = payload[:6]
+        pick_sel = 0
+        while True:
+            lines = [f"Recorded cwd is gone:  {sp}",
+                     "Pick the new location:", ""]
+            for i, c in enumerate(view):
+                mark = "›" if i == pick_sel else " "
+                sgl = (", ".join(c.signals[:4]) or "name only")
+                lines.append(f"{mark} [{i+1}] s{c.score}  "
+                             f"{shorten_path(c.path)}  ({sgl})")
+            lines += ["", "↑↓ select · Enter choose · e=enter path · "
+                          "o=placeholder · Esc=cancel"]
+            choice = _modal(
+                lines, " ↑↓  Enter  e  o  Esc ",
+                {(curses.KEY_UP, 16): "up",
+                 (curses.KEY_DOWN, 14): "down",
+                 (10, 13): "enter",
+                 (ord("e"), ord("E")): "e",
+                 (ord("o"), ord("O")): "o",
+                 (27,): "esc"})
+            if choice == "up":
+                pick_sel = (pick_sel - 1) % len(view)
+            elif choice == "down":
+                pick_sel = (pick_sel + 1) % len(view)
+            elif choice == "enter":
+                return _resolve(view[pick_sel].path)
+            elif choice == "e":
+                p = _manual_entry()
+                return _resolve(p) if p else ("placeholder", old_cwd)
+            elif choice == "o":
+                return ("placeholder", old_cwd)
+            else:
+                return ("cancel", None)
+
+    # kind == "none"
+    choice = _modal(
+        [f"Recorded cwd is gone:  {sp}",
+         "No moved-folder candidates found.", "",
+         "Enter a path, open an empty placeholder, or cancel."],
+        " [e] enter path   [o] placeholder   [Esc] cancel ",
+        {(ord("e"), ord("E")): "e",
+         (ord("o"), ord("O")): "o",
+         (27,): "esc"})
+    if choice == "e":
+        p = _manual_entry()
+        return _resolve(p) if p else ("placeholder", old_cwd)
+    if choice == "o":
+        return ("placeholder", old_cwd)
+    return ("cancel", None)
+
+
+def _status_attr(st: str):
+    import curses
+    if st == STATUS_WORKING:
+        return curses.color_pair(3) | curses.A_BOLD   # green
+    if st == STATUS_WAITING:
+        return curses.color_pair(8) | curses.A_BOLD   # red — needs you
+    if st == STATUS_DONE:
+        return curses.color_pair(6) | curses.A_BOLD   # magenta
+    if st == STATUS_IDLE:
+        return curses.color_pair(9)                    # cyan
+    return curses.color_pair(7) | curses.A_DIM         # ended (dim)
+
+
+def _confirm_delete_modal(stdscr, targets: list[SessionMeta], ctx) -> bool:
+    import curses
+    n = len(targets)
+    _, w2 = stdscr.getmaxyx()
+    box_w = min(72, max(40, w2 - 6))
+    preview = targets[:5]
+    bg_warn = bg_delete_warning([s.session_id for s in targets], ctx.jobs)
+    box_h = 7 + len(preview) + (1 if bg_warn else 0)
+    win = _centered_win(stdscr, box_h, box_w)
+    try:
+        win.box()
+        title = f" Delete {n} session{'s' if n != 1 else ''}? "
+        win.addnstr(0, max(2, (box_w - len(title)) // 2), title,
+                    box_w - 4, curses.color_pair(5) | curses.A_BOLD)
+        for i, s in enumerate(preview):
+            label = truncate(
+                f"{s.session_id[:8]}  {shorten_path(s.cwd)}",
+                box_w - 6,
+            )
+            win.addnstr(2 + i, 3, f"• {label}", box_w - 6)
+        if n > len(preview):
+            win.addnstr(2 + len(preview), 3,
+                        f"  … +{n - len(preview)} more", box_w - 6)
+        if bg_warn:
+            win.addnstr(box_h - 4, 3, truncate(bg_warn, box_w - 6),
+                        box_w - 6, curses.color_pair(5) | curses.A_BOLD)
+        msg = "This cannot be undone."
+        win.addnstr(box_h - 3, 3, msg, box_w - 6,
+                    curses.color_pair(5))
+        prompt = " [y] Yes    [n/Esc] No "
+        win.addnstr(box_h - 2, 3, prompt, box_w - 6, curses.A_BOLD)
+        win.refresh()
+        while True:
+            k = win.getch()
+            if k in (ord("y"), ord("Y")):
+                return True
+            if k in (ord("n"), ord("N"), 27, 10, 13):
+                return False
+    finally:
+        del win
+        stdscr.touchwin()
+        stdscr.refresh()
+
+
+def _delete_sessions(targets: list[SessionMeta], sessions: list[SessionMeta],
+                     marked: set[str], ctx) -> tuple[int, int]:
+    """Unlink the transcript files for `targets` and purge their cache/state/
+    mark traces. Mutates `sessions` (drops deleted rows in place), `marked`
+    (discards deleted ids), and `ctx.done`. Returns (deleted, errors).
+
+    Shared by the TUI list `Del` handler and the preview-modal delete so the
+    deletion side effects stay in one place. Only unlinks the transcript — a
+    live background process keeps running (see `bg_delete_warning`).
+    """
+    deleted = 0
+    errors = 0
+    cache = _load_cache()
+    entries = cache.setdefault("entries", {})
+    for s in targets:
+        try:
+            s.path.unlink()
+            entries.pop(str(s.path), None)
+            deleted += 1
+        except OSError:
+            errors += 1
+    _save_cache(cache)
+    state = load_state()
+    ds = state.setdefault("done", {})
+    for s in targets:
+        ds.pop(s.session_id, None)
+    save_state(state)
+    ctx.done = done_ids()
+    dead_ids = {s.session_id for s in targets}
+    sessions[:] = [s for s in sessions if s.session_id not in dead_ids]
+    marked -= dead_ids
+    return deleted, errors
+
+
+def _confirm_skip_perm_modal(stdscr, target: SessionMeta) -> bool | None:
+    """Ask whether to apply --dangerously-skip-permissions for this resume.
+
+    Returns True to resume with the flag, False to resume without it, None
+    to cancel (do not resume).
+    """
+    import curses
+    _, w2 = stdscr.getmaxyx()
+    box_w = min(72, max(48, w2 - 6))
+    box_h = 9
+    win = _centered_win(stdscr, box_h, box_w)
+    spec = agent_of(target)
+    flag = spec.skip_perm_flag
+    try:
+        win.box()
+        title = f" {flag}? "
+        win.addnstr(0, max(2, (box_w - len(title)) // 2), title,
+                    box_w - 4, curses.color_pair(5) | curses.A_BOLD)
+        label = truncate(
+            f"{target.session_id[:8]}  {shorten_path(target.cwd)}",
+            box_w - 6,
+        )
+        win.addnstr(2, 3, f"Resume: {label}", box_w - 6)
+        win.addnstr(3, 3, truncate(f"Apply {flag} for this resume?", box_w - 6),
+                    box_w - 6)
+        win.addnstr(4, 3,
+                    truncate(f"Skips all permission prompts inside {spec.bin}.",
+                             box_w - 6),
+                    box_w - 6, curses.A_DIM)
+        prompt = " [y] Yes    [n] No    [Esc] Cancel "
+        win.addnstr(box_h - 2, 3, prompt, box_w - 6, curses.A_BOLD)
+        win.refresh()
+        while True:
+            k = win.getch()
+            if k in (ord("y"), ord("Y"), 10, 13):
+                return True
+            if k in (ord("n"), ord("N")):
+                return False
+            if k == 27:
+                return None
+    finally:
+        del win
+        stdscr.touchwin()
+        stdscr.refresh()
+
+
+def _choose_cmux_mode_modal(stdscr) -> str | None:
+    """Show cmux open-mode chooser: workspace tab vs new window.
+
+    Returns "workspace", "window", or None (cancel).
+    """
+    import curses
+    _, w2 = stdscr.getmaxyx()
+    box_w = min(56, max(40, w2 - 6))
+    box_h = 7
+    win = _centered_win(stdscr, box_h, box_w)
+    try:
+        win.box()
+        title = " cmux: Open Mode "
+        win.addnstr(0, max(2, (box_w - len(title)) // 2), title,
+                    box_w - 4, curses.color_pair(2) | curses.A_BOLD)
+        win.addnstr(2, 3, "[t] Workspace tab  (current window)",
+                    box_w - 6)
+        win.addnstr(3, 3, "[w] New window",
+                    box_w - 6)
+        win.addnstr(box_h - 2, 3, " t / w / Esc cancel ",
+                    box_w - 6, curses.A_BOLD)
+        win.refresh()
+        while True:
+            k = win.getch()
+            if k in (ord("t"), ord("T"), 10, 13):
+                return "workspace"
+            if k in (ord("w"), ord("W")):
+                return "window"
+            if k == 27:
+                return None
+    finally:
+        del win
+        stdscr.touchwin()
+        stdscr.refresh()
+
+
+def _tui_footer_info(row) -> str:
+    """The footer's session line: cwd, id and (if the process is live) pid/IDE.
+
+    Shared by the main render loop and `_repaint_list_bg`, which has to rebuild
+    it whenever a done toggle drops the focused row out of the filtered view."""
+    info_bits = [
+        f"📁 {shorten_path(row.cwd)}",
+        f"id {row.session_id}",
+    ]
+    live_info = get_live_session_info(row.session_id)
+    if live_info:
+        info_bits.append(f"pid {live_info.get('pid')}")
+        if live_info.get("ideName"):
+            info_bits.append(str(live_info.get("ideName")))
+    return " " + "  ·  ".join(info_bits)
+
+
+def _tui_columns(n_items, n_sessions, w):
+    """List-view column widths: (num, status, agent, ts, sid, msgs, msg, proj).
+
+    Pure layout math shared by the header row and `_tui_draw_rows`."""
+    num_w = max(3, len(str(n_items or n_sessions)))
+    agent_w = AGENT_VIEW_WIDTH
+    ts_w = 16
+    sid_w = 8
+    msgs_w = 4
+    status_w = STATUS_WIDTH
+    # Fixed width up through MSGS column. Tight 1-space separators around
+    # ST (#→ST, ST→AGENT) and between SESSION→MSGS; the rest use 2-space
+    # separators.
+    fixed = ((1 + num_w + 1) + (status_w + 1) + (agent_w + 2) + (ts_w + 2)
+             + (sid_w + 1) + (msgs_w + 2) + 2)
+    remaining = max(30, w - fixed - 1)
+    # split remaining: ~50% message, ~50% project (project at least 20)
+    proj_w = max(20, remaining // 2)
+    msg_w = max(20, remaining - proj_w - 2)
+    return num_w, status_w, agent_w, ts_w, sid_w, msgs_w, msg_w, proj_w
+
+
+def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
+                   search_hits, ctx, w, cols):
+    """Draw the visible session rows [top, top+list_h) into stdscr.
+
+    Pure render — reads state, writes only to the screen (no state mutation)."""
+    import curses
+    num_w, status_w, agent_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
+    for i in range(list_h):
+        idx = top + i
+        if idx >= len(items):
+            break
+        s = items[idx]
+        st = ctx.resolve(s.session_id)
+        ts = fmt_ts(s.last_ts)
+        sid = s.session_id[:8]
+        is_sel = idx == sel
+        is_marked = s.session_id in marked
+        mark = "●" if is_marked else " "
+        if search_hits is not None and s.session_id in search_hits:
+            tail_raw = search_hits[s.session_id]
+        else:
+            tail_raw = s.first_user_msg or "(no user msg)"
+        msg_cell = pad_display(truncate_display(" ".join(tail_raw.split()), msg_w), msg_w)
+        proj_full = shorten_path(s.cwd)
+        if s.git_branch:
+            proj_full = f"{proj_full}  ⎇{s.git_branch}"
+        _job = ctx.jobs.get(s.session_id)
+        for _tag in (pin_marker((_job or {}).get("short"), ctx.pins),
+                     job_badge(_job), pr_badge(s.prs)):
+            if _tag:
+                proj_full = f"{proj_full}  {_tag}"
+        proj_cell = truncate_display_tail(proj_full, proj_w)
+
+        line_before_status = f"{mark}{idx + 1:>{num_w}} "
+        line_after_status = (
+            f" {(s.agent or DEFAULT_AGENT):<{agent_w}}  "
+            f"{ts:<{ts_w}}  {sid:<{sid_w}} "
+            f"{s.msg_count:>{msgs_w}}  {msg_cell}  {proj_cell}"
+        )
+
+        if is_sel:
+            attr = curses.color_pair(1)
+            try:
+                full = (line_before_status
+                        + pad_display(st, status_w)
+                        + line_after_status)
+                stdscr.addnstr(list_top + i, 0, pad_display(full, w), w, attr)
+            except curses.error:
+                pass
+        else:
+            try:
+                pre_attr = curses.color_pair(6) | curses.A_BOLD if is_marked else curses.A_NORMAL
+                stdscr.addnstr(list_top + i, 0, line_before_status, w, pre_attr)
+                pre_dw = display_width(line_before_status)
+                stdscr.addnstr(list_top + i, pre_dw,
+                               pad_display(st, status_w), w, _status_attr(st))
+                col = pre_dw + status_w
+                stdscr.addnstr(list_top + i, col, line_after_status, max(0, w - col),
+                               pre_attr)
+            except curses.error:
+                pass
+
+
+def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
+             days: int | None, skip_perm_default: bool = False,
+             hide_done_default: bool = False, theme: str = "dark",
+             agent_view_override: str | None = None):
+    import curses
+    import time
+    curses.curs_set(0)
+    cur_theme = "light" if theme == "light" else "dark"
+    tui_init_colors(cur_theme, stdscr)
+    # Default ESCDELAY is 1000ms — too slow; users see a 1s lag between
+    # pressing Esc and the TUI reacting. 25ms is enough for real escape
+    # sequences to arrive while feeling instant.
+    try:
+        curses.set_escdelay(25)
+    except (AttributeError, curses.error):
+        pass  # set_escdelay requires Python 3.9+
+    stdscr.nodelay(False)
+    stdscr.keypad(True)
+
+    sessions = sessions_ref  # mutable list we can swap contents on rescan
+    ctx = StatusContext.capture()
+    auto_enabled, auto_interval = load_auto_rescan()
+    last_rescan = time.monotonic()
+    waiting_seen = ctx.waiting(sessions)
+
+    query = ""
+    sel = 0
+    top = 0
+    marked: set[str] = set()
+    toast: str = ""
+    toast_deadline = 0.0
+    _toast_shown = ""
+    search_query: str = ""
+    search_hits: dict[str, str] | None = None
+    search_mode: bool = False  # True while typing inside the `/` prompt
+    sort_key, sort_reverse = load_sort()  # column sort (s cycles, S reverses)
+    origin: str = load_origin()  # f cycles all→user→agent, F walks backwards
+    # a cycles all→claude→codex…, A backwards; `ast pick --agent` overrides
+    # the saved view for this launch only.
+    agent_view: str = (agent_view_override if agent_view_override in agent_choices()
+                       else load_agent_view())
+    hide_done: bool = hide_done_default  # H toggle: hide 작업종료 from the view
+    cwd_only: bool = False     # C toggle: only sessions under the TUI launch cwd
+    try:
+        launch_cwd = unicodedata.normalize("NFC", os.getcwd())
+    except OSError:
+        launch_cwd = ""
+
+    def filtered() -> list[SessionMeta]:
+        if search_hits is not None:
+            pool = [s for s in sessions if s.session_id in search_hits]
+        else:
+            pool = sessions
+        if hide_done:
+            pool = [s for s in pool if s.session_id not in ctx.done]
+        if origin != "all":
+            pool = filter_origin(pool, origin)
+        if agent_view != AGENT_VIEW_ALL:
+            pool = filter_agent(pool, agent_view)
+        if cwd_only and launch_cwd:
+            pool = [s for s in pool
+                    if unicodedata.normalize("NFC", s.cwd or "").startswith(launch_cwd)]
+        if query:
+            q = query.lower()
+            pool = [s for s in pool
+                    if q in f"{s.session_id} {s.cwd} {s.first_user_msg}".lower()]
+        return sort_sessions(pool, ctx, sort_key, sort_reverse)
+
+    _in_cmux = bool(os.environ.get("CMUX_WORKSPACE_ID"))
+
+    while True:
+        if (auto_enabled and auto_interval > 0 and not search_mode
+                and time.monotonic() - last_rescan >= auto_interval):
+            last_rescan = time.monotonic()
+            try:
+                # Nobody asked for this one, so the counter only appears once
+                # the tick has run long enough to look like a freeze.
+                _r = _do_rescan(cwd_filter, days, sessions,
+                                on_progress=_rescan_progress_painter(stdscr))
+            except Exception:
+                _r = None
+            if _r is not None:
+                ctx = _r.ctx
+                _new = newly_waiting(waiting_seen, _r.waiting)
+                waiting_seen = _r.waiting
+                sel = min(sel, max(0, len(sessions) - 1))
+                top = max(0, min(top, max(0, len(sessions) - 1)))
+                if _new:
+                    try:
+                        curses.beep()
+                    except curses.error:
+                        pass
+                    _ids = sorted(i[:8] for i in _new)
+                    n = len(_new)
+                    toast = (f"⚠ {n} now waiting: " + ", ".join(_ids[:3])
+                             + ("" if n <= 3 else f" +{n-3}"))
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        items = filtered()
+        if sel >= len(items):
+            sel = max(0, len(items) - 1)
+        if sel < top:
+            top = sel
+
+        def _header_line(rows) -> str:
+            """The top status line for `rows`. Rebuilt (not cached) because the
+            row count and the ✓/○ counts both derive from `ctx`, which the
+            preview modal can mutate while the list sits behind it — see
+            `_repaint_list_bg`."""
+            mark_hint = f"  ✓{len(marked)}" if marked else ""
+            search_hint = (
+                f"  🔎 {search_query!r}→{len(search_hits)}"
+                if search_hits is not None else ""
+            )
+            scounts = ctx.counts(rows)
+            hide_hint = "  [✓ hidden]" if hide_done else ""
+            cwd_hint = f"  [📂 {shorten_path(launch_cwd)}]" if cwd_only else ""
+            auto_hint = (f"  ⟳{auto_interval}s"
+                         if (auto_enabled and auto_interval > 0) else "  ⟳off")
+            sort_hint = (f"  sort:{SORT_LABELS[sort_key]}"
+                         f"{'▼' if sort_reverse else '▲'}")
+            # Kept short and placed next to sort_hint (the other saved pref): an
+            # 80-column terminal truncates anything longer once the transient
+            # mark/search/hide/cwd hints are also on screen.
+            origin_hint = {"user": "  👤user", "agent": "  🤖agent"}.get(origin, "")
+            agent_hint = (f"  ⚙{agent_view}" if agent_view != AGENT_VIEW_ALL else "")
+            return (
+                f" agent-session-tracker v{__version__}  "
+                f"{len(rows)}/{len(sessions)}  "
+                f"{STATUS_WORKING}{scounts[STATUS_WORKING]} "
+                f"{STATUS_WAITING}{scounts[STATUS_WAITING]} "
+                f"{STATUS_IDLE}{scounts[STATUS_IDLE]} "
+                f"{STATUS_ENDED}{scounts[STATUS_ENDED]} "
+                f"{STATUS_DONE}{scounts[STATUS_DONE]}"
+                f"{auto_hint}{sort_hint}{origin_hint}{agent_hint}"
+                f"{mark_hint}{search_hint}{hide_hint}{cwd_hint}"
+                "   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit "
+            )
+
+        header = _header_line(items)
+        if search_mode:
+            prompt = f"/ {query}"
+        elif query or search_hits is not None:
+            bits = []
+            if query:
+                bits.append(f"filter={query!r}")
+            if search_hits is not None:
+                bits.append(f"text={search_query!r}→{len(search_hits)}")
+            prompt = "  " + "  ".join(bits) + "   (/ to edit, Esc/clear)"
+        else:
+            prompt = "  (press / to filter, ? for help)"
+
+        # Column widths — num, status, ts, sid, msgs, message, project
+        # The mark column (1 char) lives in `line_before_status`, so header
+        # starts with a leading space to match row alignment.
+        cols = _tui_columns(len(items), len(sessions), w)
+        num_w, status_w, agent_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
+
+        col_header = (
+            f" {'#':>{num_w}} "
+            f"{pad_display('ST', status_w)} "
+            f"{'AGENT':<{agent_w}}  "
+            f"{'LAST ACTIVITY':<{ts_w}}  "
+            f"{'SESSION':<{sid_w}} "
+            f"{'MSGS':>{msgs_w}}  "
+            f"{pad_display('MESSAGE', msg_w)}  "
+            f"PROJECT"
+        )
+        try:
+            stdscr.addnstr(0, 0, header.ljust(w), w, curses.color_pair(2) | curses.A_BOLD)
+            prompt_attr = curses.color_pair(2) | curses.A_BOLD if search_mode else curses.A_DIM
+            stdscr.addnstr(1, 0, prompt.ljust(w), w, prompt_attr)
+            stdscr.addnstr(2, 0, col_header.ljust(w - 1), w - 1,
+                           curses.A_DIM | curses.A_UNDERLINE)
+            # Highlight the active sort column's header label. col_header is
+            # pure ASCII, so character index == display column; the (x, width)
+            # of each sortable column is derived from the same field widths the
+            # f-string above used, so no width drift.
+            _ts_x = num_w + 2 + status_w + 1 + agent_w + 2
+            _sort_x = {
+                "status":  (num_w + 2, status_w),
+                "time":    (_ts_x, ts_w),
+                "msgs":    (_ts_x + ts_w + 2 + sid_w + 1, msgs_w),
+                "project": (_ts_x + ts_w + 2 + sid_w + 1
+                            + msgs_w + 2 + msg_w + 2, len("PROJECT")),
+            }.get(sort_key)
+            if _sort_x:
+                _cx, _cw = _sort_x
+                stdscr.addnstr(2, _cx, col_header[_cx:_cx + _cw], _cw,
+                               curses.color_pair(6) | curses.A_BOLD
+                               | curses.A_UNDERLINE)
+        except curses.error:
+            pass
+        if search_mode:
+            try:
+                curses.curs_set(1)
+                # Korean/Japanese/Chinese glyphs render 2 columns wide, so
+                # use display_width instead of len() to place the cursor
+                # correctly after multi-byte input.
+                stdscr.move(1, min(w - 1, display_width(prompt)))
+            except curses.error:
+                pass
+        else:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+
+        list_top = 3
+        list_h = max(1, h - list_top - 1)
+        if sel >= top + list_h:
+            top = sel - list_h + 1
+
+        _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
+                       search_hits, ctx, w, cols)
+
+        # footer line
+        if toast:
+            if toast != _toast_shown:
+                _toast_shown = toast
+                toast_deadline = time.monotonic() + 5.0
+            try:
+                stdscr.addnstr(h - 1, 0, f" {toast} ".ljust(w - 1), w - 1,
+                               curses.color_pair(5) | curses.A_BOLD)
+            except curses.error:
+                pass
+            if time.monotonic() >= toast_deadline:
+                toast = ""
+                _toast_shown = ""
+        elif items:
+            info = _tui_footer_info(items[sel])
+            try:
+                stdscr.addnstr(h - 1, 0, info.ljust(w - 1), w - 1, curses.A_DIM)
+            except curses.error:
+                pass
+        else:
+            try:
+                stdscr.addnstr(h - 1, 0, " (no matches) ", w - 1, curses.A_DIM)
+            except curses.error:
+                pass
+
+        stdscr.refresh()
+        # Read one key. We use getch() (not get_wch()) because on some
+        # terminals (notably WezTerm) get_wch() returns arrow-key escape
+        # sequences as multi-char strings instead of translating them to
+        # KEY_UP/KEY_DOWN ints. getch() + keypad(True) handles special keys
+        # reliably, and for multi-byte text input (Korean etc.) we assemble
+        # the UTF-8 sequence ourselves.
+        if auto_enabled and auto_interval > 0 and not search_mode:
+            stdscr.timeout(AUTO_RESCAN_TICK_MS)
+        else:
+            stdscr.timeout(-1)
+        try:
+            b = stdscr.getch()
+        except curses.error:
+            continue
+        except KeyboardInterrupt:
+            return None
+
+        ch_str: str | None = None
+        if b < 0:
+            continue
+        if b >= 0x100:
+            # Special key (KEY_UP/KEY_DOWN/KEY_BACKSPACE/...). No char form.
+            ch = b
+        elif b < 0x80:
+            # ASCII or control char (Enter, Esc, Tab, Ctrl-X, printable …).
+            ch = b
+            if 0x20 <= b < 0x7f:
+                ch_str = chr(b)
+        else:
+            # UTF-8 lead byte — read the remaining bytes for this character.
+            if b & 0xE0 == 0xC0:
+                n_more = 1
+            elif b & 0xF0 == 0xE0:
+                n_more = 2
+            elif b & 0xF8 == 0xF0:
+                n_more = 3
+            else:
+                continue  # invalid lead byte, drop
+            buf = bytearray([b])
+            ok = True
+            for _ in range(n_more):
+                try:
+                    nb = stdscr.getch()
+                except curses.error:
+                    ok = False
+                    break
+                if nb < 0 or nb >= 0x100:
+                    ok = False
+                    break
+                buf.append(nb)
+            if not ok:
+                continue
+            try:
+                ch_str = buf.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            ch = ord(ch_str) if len(ch_str) == 1 else -1
+
+        if search_mode:
+            # --- inside `/` filter prompt (fzf-style: nav + type at once) ---
+            if ch in (curses.KEY_UP, 16):  # ↑ / Ctrl-P — move selection up
+                sel = max(0, sel - 1)
+            elif ch in (curses.KEY_DOWN, 14):  # ↓ / Ctrl-N — move selection down
+                sel = min(max(0, len(items) - 1), sel + 1)
+            elif ch == curses.KEY_NPAGE:
+                sel = min(max(0, len(items) - 1), sel + list_h)
+            elif ch == curses.KEY_PPAGE:
+                sel = max(0, sel - list_h)
+            elif ch == curses.KEY_HOME:
+                sel = 0
+            elif ch == curses.KEY_END:
+                sel = max(0, len(items) - 1)
+            elif ch in (10, 13):  # Enter — commit filter, exit search mode
+                # Do NOT auto-open. The user usually wants to navigate the
+                # filtered result set and apply multiple actions (mark done,
+                # delete, open, ...). A second Enter in normal mode opens the
+                # selection — one extra keystroke, but far more flexible.
+                search_mode = False
+                if items:
+                    toast = (f"Filter: {len(items)} session(s)  "
+                             "↑↓ navigate · Enter open · ^D mark✓")
+            elif ch == 27:  # Esc — clear query and exit mode
+                query = ""
+                sel = 0
+                top = 0
+                search_mode = False
+                toast = "Filter cleared"
+            elif ch == 9:  # Tab — escalate to full-text search
+                if not query:
+                    toast = "Type a query first"
+                else:
+                    result = _tui_run_search(stdscr, sessions, query)
+                    if result is None:
+                        toast = "Full-text search cancelled"
+                    else:
+                        search_query = query
+                        search_hits = result
+                        sel = 0
+                        top = 0
+                        toast = f"Full-text: {len(result)} session(s) matched"
+                search_mode = False
+            elif ch == 4:  # Ctrl-D — toggle 작업종료 on the current row
+                # Mirrors normal-mode `D`; lets users mark done while still
+                # typing a filter (search mode stays active).
+                if items:
+                    target_sid = items[sel].session_id
+                    if done_guard_blocks(ctx.resolve(target_sid)):
+                        toast = f"● working — `claude stop` it or wait: {target_sid[:8]}"
+                    else:
+                        now_done = mark_done(target_sid)
+                        ctx.done = done_ids()
+                        toast = ("Marked done" if now_done
+                                 else "Cleared done") + f": {target_sid[:8]}"
+            elif ch == 18:  # Ctrl-R — rescan (mirrors normal-mode R)
+                _r = _do_rescan(
+                    cwd_filter, days, sessions,
+                    on_progress=_rescan_progress_painter(stdscr, delay=0.0))
+                ctx = _r.ctx
+                waiting_seen = _r.waiting          # silent baseline reset
+                sel = min(sel, max(0, len(sessions) - 1))
+                top = max(0, min(top, max(0, len(sessions) - 1)))
+                toast = f"Rescanned: {len(sessions)} session(s)"
+            elif ch == 1:  # Ctrl-A — mark all filtered items (toggle)
+                if items:
+                    visible_sids = {s.session_id for s in items}
+                    if visible_sids.issubset(marked):
+                        marked -= visible_sids
+                        toast = f"Cleared marks on {len(visible_sids)} session(s)"
+                    else:
+                        marked |= visible_sids
+                        toast = f"Marked {len(visible_sids)} session(s)"
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                query = query[:-1]
+                sel = 0
+                top = 0
+            elif ch == 21:  # Ctrl-U — wipe query
+                query = ""
+                sel = 0
+                top = 0
+            elif ch_str is not None and ch_str.isprintable():
+                # Unicode-aware append — accepts ASCII, Korean, Japanese,
+                # Chinese, and any other printable character including space.
+                query += ch_str
+                sel = 0
+                top = 0
+            # any other key: ignored while in search mode
+            continue
+
+        # --- normal (shortcut) mode ---
+        if ch in (curses.KEY_UP, 16):
+            sel = max(0, sel - 1)
+        elif ch in (curses.KEY_DOWN, 14):
+            sel = min(max(0, len(items) - 1), sel + 1)
+        elif ch == curses.KEY_NPAGE:
+            sel = min(max(0, len(items) - 1), sel + list_h)
+        elif ch == curses.KEY_PPAGE:
+            sel = max(0, sel - list_h)
+        elif ch == curses.KEY_HOME:
+            sel = 0
+        elif ch == curses.KEY_END:
+            sel = max(0, len(items) - 1)
+        elif ch in (10, 13):
+            # Enter — if the session is live, raise its existing terminal window;
+            # otherwise (or on focus miss) spawn `claude --resume` in a NEW
+            # terminal window. Stay in TUI either way.
+            if items:
+                target = items[sel]
+                live = get_live_session_info(target.session_id)
+                if live:
+                    ok, info = focus_existing_window(target.session_id, live)
+                    if ok:
+                        toast = f"→ focused  {target.session_id[:8]}  {info}"
+                        continue
+                job_short = job_short_for(target.session_id)
+                if job_short:
+                    # Background session — attach to the live supervisor-hosted
+                    # session (catch-up + live stream), not a transcript fork.
+                    # No orphan-relocate / skip-perm: those are resume-only.
+                    cmux_m = _choose_cmux_mode_modal(stdscr) if _in_cmux else None
+                    if _in_cmux and cmux_m is None:
+                        toast = "Attach cancelled"
+                        continue
+                    ok, info = open_in_new_terminal(
+                        target.cwd, target.session_id,
+                        cmux_mode=cmux_m, attach_short=job_short,
+                    )
+                    sid8 = target.session_id[:8]
+                    toast = (f"→ attach {sid8}  {info}" if ok
+                             else f"Attach failed: {info}  ({sid8})")
+                    continue
+                open_cwd = target.cwd
+                _spec = agent_of(target)
+                if (target.cwd and not os.path.isdir(target.cwd)
+                        and "relocate" in _spec.caps):
+                    # Recorded folder is gone: offer to point the transcript at
+                    # its new home first. Agents without the capability just
+                    # resume (the spawn recreates a placeholder folder).
+                    kind, new_cwd = _orphan_relocate_flow(stdscr, target)
+                    if kind == "cancel":
+                        toast = "Resume cancelled"
+                        continue
+                    open_cwd = new_cwd
+                if skip_perm_default:
+                    use_skip = True
+                else:
+                    choice = _confirm_skip_perm_modal(stdscr, target)
+                    if choice is None:
+                        toast = "Resume cancelled"
+                        continue
+                    use_skip = choice
+                cmux_m = None
+                if _in_cmux:
+                    cmux_m = _choose_cmux_mode_modal(stdscr)
+                    if cmux_m is None:
+                        toast = "Resume cancelled"
+                        continue
+                ok, info = open_in_new_terminal(
+                    open_cwd, target.session_id, skip_perm=use_skip,
+                    cmux_mode=cmux_m, agent=_spec.name,
+                )
+                short = target.session_id[:8]
+                flag_note = "  [skip-perm]" if use_skip else ""
+                toast = (f"→ {short}{flag_note}  {info}" if ok
+                         else f"Open failed: {info}  ({short})")
+        elif ch == 27:
+            # Esc: clear filter/search if any; otherwise quit
+            if query or search_hits is not None:
+                query = ""
+                search_query = ""
+                search_hits = None
+                sel = 0
+                top = 0
+                toast = "Filter & search cleared"
+            else:
+                return None
+        elif ch == 32:  # Space — toggle mark
+            if items:
+                sid = items[sel].session_id
+                if sid in marked:
+                    marked.discard(sid)
+                else:
+                    marked.add(sid)
+                if sel < len(items) - 1:
+                    sel += 1
+        elif ch == ord('?'):
+            _show_help_modal(stdscr)
+        elif ch in (ord('v'), ord('V')):
+            if items:
+                def _repaint_list_bg() -> None:
+                    """Repaint the list *behind* the open preview modal.
+
+                    `d` inside the modal toggles 작업종료 on `ctx`, but the list
+                    around the modal box was painted before it opened, so its ST
+                    glyph, the header's ✓/○ counts and — with `H` (hide ✓) on —
+                    the row's very presence would keep showing the pre-toggle
+                    state until the modal closed. Only the virtual screen is
+                    written (`noutrefresh`); the modal's own `refresh()` flushes
+                    both in one update, so it never blinks.
+
+                    `filtered()` runs again here, so a row the toggle just hid
+                    disappears and a status sort re-orders, exactly as it will
+                    once the modal closes. The modal keeps indexing into its own
+                    frozen `items`, so its ‹/› walk is unaffected; only this
+                    background copy of the list moves. Cursor and scroll are
+                    re-clamped by the same rules as the main loop, so the row
+                    highlighted behind the box is the one that stays focused
+                    after the modal closes.
+
+                    `cols` is deliberately reused rather than recomputed: it
+                    keeps the rows aligned with the column header on row 2,
+                    which this repaint does not touch.
+                    """
+                    rows = filtered()
+                    bsel = min(sel, max(0, len(rows) - 1))
+                    btop = min(top, max(0, len(rows) - 1))
+                    if bsel < btop:
+                        btop = bsel
+                    elif bsel >= btop + list_h:
+                        btop = bsel - list_h + 1
+                    try:
+                        stdscr.addnstr(0, 0, _header_line(rows).ljust(w), w,
+                                       curses.color_pair(2) | curses.A_BOLD)
+                    except curses.error:
+                        pass
+                    # Rows are drawn without trailing padding and the set can
+                    # now shrink, so wipe the strip first or the vanished row
+                    # (or a longer previous one) bleeds through underneath.
+                    blank = " " * max(0, w - 1)
+                    for _i in range(list_h):
+                        try:
+                            stdscr.addnstr(list_top + _i, 0, blank, w - 1)
+                        except curses.error:
+                            pass
+                    _tui_draw_rows(stdscr, rows, btop, bsel, list_top, list_h,
+                                   marked, search_hits, ctx, w, cols)
+                    if not toast:   # a live toast owns the footer line
+                        foot = _tui_footer_info(rows[bsel]) if rows else " (no matches) "
+                        try:
+                            stdscr.addnstr(h - 1, 0, foot.ljust(w - 1), w - 1,
+                                           curses.A_DIM)
+                        except curses.error:
+                            pass
+                    stdscr.noutrefresh()
+
+                # The preview modal already ran its own delete confirmation, so
+                # a non-None return is an explicit, confirmed delete request.
+                dreq = _preview_modal(stdscr, items, sel, ctx,
+                                      on_status_change=_repaint_list_bg)
+                if dreq is not None:
+                    deleted, errors = _delete_sessions([dreq], sessions, marked, ctx)
+                    sel = max(0, min(sel, len(filtered()) - 1))
+                    top = max(0, min(top, max(0, len(filtered()) - 1)))
+                    toast = f"Deleted {deleted} session(s)" + (f", {errors} failed" if errors else "")
+        elif ch in (ord('e'), ord('E')):
+            if items:
+                target = items[sel]
+                try:
+                    dest = export_session(target, "md", None)
+                    toast = f"Exported: {dest}"
+                except Exception as exc:
+                    toast = f"Export failed: {exc}"
+        elif ch in (ord('o'), ord('O')):
+            # Open the focused session's folder in a new terminal window —
+            # a plain interactive shell at the recorded cwd, no claude command.
+            if items:
+                target = items[sel]
+                cmux_m = None
+                # Skip the cmux chooser when the cwd is gone anyway; the
+                # spawn call below fails fast with the relocate hint.
+                if _in_cmux and target.cwd and os.path.isdir(target.cwd):
+                    cmux_m = _choose_cmux_mode_modal(stdscr)
+                    if cmux_m is None:
+                        toast = "Open folder cancelled"
+                        continue
+                ok, info = open_folder_in_new_terminal(target.cwd,
+                                                       cmux_mode=cmux_m)
+                toast = (f"→ folder {shorten_path(target.cwd)}  {info}" if ok
+                         else f"Open folder failed: {info}")
+        elif ch in (ord('D'), ord('d'), 4):  # D / d / Ctrl-D
+            if marked:
+                target_sids = [s.session_id for s in sessions if s.session_id in marked]
+                allowed = [s for s in target_sids
+                           if not done_guard_blocks(ctx.resolve(s))]
+                skipped = len(target_sids) - len(allowed)
+                for sid in allowed:
+                    set_done(sid, True)
+                ctx.done = done_ids()
+                marked.clear()
+                toast = f"Marked done: {len(allowed)} session(s)"
+                if skipped:
+                    toast += f" · skipped {skipped} ● working (`claude stop` / --force)"
+            elif items:
+                target_sid = items[sel].session_id
+                if done_guard_blocks(ctx.resolve(target_sid)):
+                    toast = f"● working — stop first (Ctrl-X) or wait: {target_sid[:8]}"
+                else:
+                    now_done = mark_done(target_sid)
+                    ctx.done = done_ids()
+                    toast = ("Marked done" if now_done else "Cleared done") \
+                            + f": {target_sid[:8]}"
+        elif ch in (ord('a'), ord('A')):  # cycle agent view (A = backwards)
+            agent_view = cycle_agent(agent_view, -1 if ch == ord('A') else 1)
+            save_agent_view(agent_view)
+            sel = 0
+            top = 0
+            toast = ("Agent: all" if agent_view == AGENT_VIEW_ALL
+                     else f"Agent: {agent_view} only")
+        elif ch in (ord('i'), ord('I')):  # auto-rescan interval popup
+            _res = _auto_rescan_modal(stdscr, auto_enabled, auto_interval)
+            if _res is not None:
+                auto_enabled, auto_interval = _res
+                save_auto_rescan(auto_enabled, auto_interval)
+                last_rescan = time.monotonic()
+                toast = ("Auto-rescan: off" if not auto_enabled
+                         else f"Auto-rescan: every {auto_interval}s")
+        elif ch == ord('s'):  # cycle sort column → reset to its natural dir
+            i = SORT_KEYS.index(sort_key) if sort_key in SORT_KEYS else 0
+            sort_key = SORT_KEYS[(i + 1) % len(SORT_KEYS)]
+            sort_reverse = _SORT_DEFAULT_DESC[sort_key]
+            save_sort(sort_key, sort_reverse)
+            sel = 0
+            top = 0
+            toast = (f"Sort: {SORT_LABELS[sort_key]} "
+                     f"{'▼ desc' if sort_reverse else '▲ asc'}")
+        elif ch == ord('S'):  # reverse the current sort direction
+            sort_reverse = not sort_reverse
+            save_sort(sort_key, sort_reverse)
+            sel = 0
+            top = 0
+            toast = (f"Sort: {SORT_LABELS[sort_key]} "
+                     f"{'▼ desc' if sort_reverse else '▲ asc'}")
+        elif ch in (ord('f'), ord('F')):  # cycle origin filter (F = backwards)
+            origin = cycle_origin(origin, -1 if ch == ord('F') else 1)
+            save_origin(origin)
+            sel = 0
+            top = 0
+            toast = ("Origin: all (user + agent)" if origin == "all"
+                     else f"Origin: {ORIGIN_LABELS[origin]} only")
+        elif ch in (ord('t'), ord('T')):
+            # Live theme toggle (dark ↔ light): re-init the palette in place and
+            # persist the concrete choice. The next render redraws the frame on
+            # the freshly filled background.
+            cur_theme = "light" if cur_theme == "dark" else "dark"
+            tui_init_colors(cur_theme, stdscr)
+            save_theme(cur_theme)
+            toast = f"Theme: {cur_theme}"
+        elif ch in (ord('H'), ord('h')):
+            # No Ctrl-H alias: Ctrl-H == ASCII 8 == Backspace on most terminals.
+            hide_done = not hide_done
+            sel = 0
+            top = 0
+            toast = ("Hiding done (press H again to show)"
+                     if hide_done else "Showing all statuses")
+        elif ch in (ord('C'), ord('c')):
+            cwd_only = not cwd_only
+            sel = 0
+            top = 0
+            if cwd_only:
+                toast = (f"Only sessions under {shorten_path(launch_cwd)} (press C again to clear)"
+                         if launch_cwd else "No launch cwd available")
+                if not launch_cwd:
+                    cwd_only = False
+            else:
+                toast = "Showing sessions from all cwds"
+        elif ch in (ord('R'), ord('r'), 18):  # R / r / Ctrl-R
+            toast = "Rescanning…"
+            try:
+                stdscr.addnstr(h - 1, 0, f" {toast} ".ljust(w - 1), w - 1,
+                               curses.color_pair(2) | curses.A_BOLD)
+                stdscr.refresh()
+            except curses.error:
+                pass
+            # The user asked for this rescan and is already looking at the
+            # footer, so the percentage starts immediately (no paint delay).
+            _r = _do_rescan(cwd_filter, days, sessions,
+                            on_progress=_rescan_progress_painter(stdscr, delay=0.0))
+            ctx = _r.ctx
+            waiting_seen = _r.waiting          # manual: silent baseline reset
+            sel = min(sel, max(0, len(sessions) - 1))
+            top = max(0, min(top, max(0, len(sessions) - 1)))
+            _tc = ctx.counts(sessions)
+            toast = (f"Rescanned: {len(sessions)} session(s)  "
+                     f"{STATUS_WORKING}{_tc[STATUS_WORKING]} "
+                     f"{STATUS_WAITING}{_tc[STATUS_WAITING]} "
+                     f"{STATUS_IDLE}{_tc[STATUS_IDLE]} "
+                     f"{STATUS_ENDED}{_tc[STATUS_ENDED]} "
+                     f"{STATUS_DONE}{_tc[STATUS_DONE]}")
+        elif ch in (curses.KEY_DC, 330):
+            targets: list[SessionMeta]
+            if marked:
+                targets = [s for s in sessions if s.session_id in marked]
+            elif items:
+                targets = [items[sel]]
+            else:
+                targets = []
+            if targets and _confirm_delete_modal(stdscr, targets, ctx):
+                deleted, errors = _delete_sessions(targets, sessions, marked, ctx)
+                sel = max(0, min(sel, len(filtered()) - 1))
+                top = max(0, min(top, max(0, len(filtered()) - 1)))
+                toast = f"Deleted {deleted} session(s)" + (f", {errors} failed" if errors else "")
+        elif ch == 24:  # Ctrl-X — clear marks
+            marked.clear()
+        elif ch == 1:  # Ctrl-A — mark all filtered items (toggle)
+            if items:
+                visible_sids = {s.session_id for s in items}
+                if visible_sids.issubset(marked):
+                    marked -= visible_sids
+                    toast = f"Cleared marks on {len(visible_sids)} session(s)"
+                else:
+                    marked |= visible_sids
+                    toast = f"Marked {len(visible_sids)} session(s)"
+        elif ch == ord('/'):
+            search_mode = True  # next iteration renders the `/` prompt with a cursor
+        # all other keys (letters, digits, etc.) are ignored in normal mode
+
+
+def cmd_pick(args: argparse.Namespace) -> int:
+    import curses
+    import locale
+    # Enable the user's locale (usually UTF-8) so `get_wch()` can decode
+    # multi-byte input such as Korean/Japanese/Chinese characters in the
+    # `/` filter prompt. Safe to call multiple times.
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    print("Loading sessions…", file=sys.stderr, end="", flush=True)
+    sessions = load_all_sessions(
+        cwd_filter=args.cwd,
+        days=args.days,
+        progress=True,
+    )
+    if not sessions:
+        print("\r(no sessions found)            ")
+        return 0
+    skip_perm = bool(getattr(args, "skip_perm", False))
+    hide_done = bool(getattr(args, "hide_done", False))
+    theme = resolve_theme(load_theme(), getattr(args, "theme", None))
+    # Ghostty (and cmux, which embeds Ghostty) advertise TERM=xterm-ghostty,
+    # whose terminfo entry the system ncurses DB frequently lacks. initscr()
+    # would then die with "setupterm: could not find terminal" and the TUI
+    # never opens — to the user it just looks like `ast` does nothing. Probe
+    # the current TERM up front and transparently fall back to a near-universal
+    # entry so the picker still launches.
+    try:
+        curses.setupterm()
+    except curses.error:
+        orig = os.environ.get("TERM", "")
+        os.environ["TERM"] = "xterm-256color"
+        print(f"\r(terminfo for TERM={orig!r} not found; "
+              f"using xterm-256color)            ", file=sys.stderr)
+    try:
+        curses.wrapper(_pick_ui, sessions, args.cwd, args.days, skip_perm,
+                       hide_done, theme, getattr(args, "agent", None))
+    except KeyboardInterrupt:
+        pass
+    # The TUI handles Enter by spawning a new terminal window, so we don't
+    # need to exec `claude` from this process — we just return after the
+    # user quits with Esc.
+    return 0
+
+
+# ---------- CLI: relocate / backup / restore / stats ----------
+
+def encode_cwd(cwd: str) -> str:
+    # Claude Code normalizes to NFC before replacing non-[A-Za-z0-9-] with '-'.
+    # macOS hands back NFD from getcwd(); normalize first so Korean/other non-ASCII
+    # paths land in the same folder Claude Code itself uses.
+    cwd = unicodedata.normalize("NFC", cwd)
+    return re.sub(r"[^A-Za-z0-9\-]", "-", cwd)
+
+
+def _rewrite_cwd_stream(src, dst, new_cwd: str, rewrite=None,
+                        old_cwd: str = "") -> int:
+    """Copy jsonl lines src->dst, retargeting each event's recorded cwd.
+
+    `rewrite` is the owning agent's per-event editor (claude's top-level
+    `cwd` key by default); `old_cwd` lets an agent match the path it is
+    replacing. Returns the count of events actually changed; blank /
+    non-JSON lines pass through untouched. Shared by _rewrite_cwd_inplace
+    and relocate_session."""
+    edit = rewrite or _claude_rewrite_event_cwd
+    rewritten = 0
+    for line in src:
+        stripped = line.strip()
+        if not stripped:
+            dst.write(line)
+            continue
+        try:
+            evt = json.loads(stripped)
+        except json.JSONDecodeError:
+            dst.write(line)
+            continue
+        if isinstance(evt, dict) and edit(evt, new_cwd, old_cwd):
+            rewritten += 1
+        dst.write(json.dumps(evt, ensure_ascii=False) + "\n")
+    return rewritten
+
+
+def _rewrite_cwd_inplace(path: Path, new_cwd: str, rewrite=None,
+                         old_cwd: str = "") -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as src, \
+             tmp.open("w", encoding="utf-8") as dst:
+            _rewrite_cwd_stream(src, dst, new_cwd, rewrite, old_cwd)
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+
+
+_WALK_SKIP = {".git", "node_modules", ".venv", "venv", "__pycache__",
+              ".cache", "Library", "System", ".Trash", ".npm", ".cargo",
+              "dist", "build", ".next", ".terraform"}
+
+
+def _relocate_search_roots(old_cwd: str, launch_cwd: str | None = None) -> list[str]:
+    """{ nearest existing ancestor of old_cwd, launch cwd, $HOME }, realpath +
+    NFC, deduped, with any root that is a subpath of another dropped."""
+    cands: list[str] = []
+    p = Path(old_cwd)
+    for anc in [p, *p.parents]:
+        if anc.is_dir():
+            cands.append(str(anc))
+            break
+    if launch_cwd is None:
+        try:
+            launch_cwd = os.getcwd()
+        except OSError:
+            launch_cwd = ""
+    if launch_cwd:
+        cands.append(launch_cwd)
+    cands.append(str(Path.home()))
+    norm: list[str] = []
+    for c in cands:
+        try:
+            rp = os.path.realpath(c)
+        except OSError:
+            continue
+        rp = unicodedata.normalize("NFC", rp)
+        if rp and os.path.isdir(rp) and rp not in norm:
+            norm.append(rp)
+    # drop a root that lives under another root already in the set
+    keep: list[str] = []
+    for r in norm:
+        if not any(r != o and (r == o or r.startswith(o.rstrip("/") + "/"))
+                   for o in norm):
+            keep.append(r)
+    return keep or norm
+
+
+def _filter_basename_dirs(stdout: str, base: str) -> list[str]:
+    """Keep lines from a finder's stdout that are real dirs whose basename
+    matches `base`. Shared post-filter for _mdfind_dirs / _fd_dirs."""
+    res = []
+    for ln in stdout.splitlines():
+        ln = ln.strip()
+        if ln and os.path.isdir(ln) and os.path.basename(ln.rstrip("/")) == base:
+            res.append(ln)
+    return res
+
+
+def _mdfind_dirs(base: str, deadline: float) -> list[str]:
+    """macOS Spotlight only. Empty list on any non-darwin / missing / error."""
+    if sys.platform != "darwin":
+        return []
+    import shutil
+    import subprocess
+    import time
+    if not shutil.which("mdfind"):
+        return []
+    budget = max(0.2, deadline - time.monotonic())
+    safe_base = base.replace("\\", "\\\\").replace('"', '\\"')
+    try:
+        out = subprocess.run(
+            ["mdfind",
+             f'kMDItemFSName == "{safe_base}" && kMDItemContentType == "public.folder"'],
+            capture_output=True, text=True, timeout=budget,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return []
+    return _filter_basename_dirs(out.stdout, base)
+
+
+def _fd_dirs(base: str, roots: list[str], deadline: float) -> list[str]:
+    """`fd`/`fdfind` if present. Empty on missing binary / error."""
+    import shutil
+    import subprocess
+    import time
+    fd = shutil.which("fd") or shutil.which("fdfind")
+    if not fd or not roots:
+        return []
+    budget = max(0.2, deadline - time.monotonic())
+    argv = [fd, "-t", "d", "-a", "-F", base, *roots]
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=budget)
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return []
+    return _filter_basename_dirs(out.stdout, base)
+
+
+def _walk_dirs(base: str, roots: list[str], deadline: float,
+               max_depth: int = 8) -> list[str]:
+    """Bounded os.walk fallback. Depth-limited, skip-set, time-bounded.
+
+    NOTE: directories whose basename is in _WALK_SKIP or starts with '.' are
+    pruned for performance, so a target folder named like a skip entry
+    (e.g. 'build'/'dist') is not found by this fallback. mdfind/fd run first
+    and are unaffected.
+    """
+    import time
+    res: list[str] = []
+    for root in roots:
+        root = root.rstrip("/")
+        base_depth = root.count(os.sep)
+        for dirpath, dirnames, _ in os.walk(root):
+            if time.monotonic() > deadline:
+                return res
+            depth = dirpath.count(os.sep) - base_depth
+            if depth >= max_depth:
+                kept = [d for d in dirnames
+                        if d not in _WALK_SKIP and not d.startswith(".")]
+                if base in kept:
+                    res.append(os.path.join(dirpath, base))
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames
+                           if d not in _WALK_SKIP and not d.startswith(".")]
+            for d in dirnames:
+                if d == base:
+                    res.append(os.path.join(dirpath, d))
+    return res
+
+
+def _session_file_fingerprint(path: "Path", *, limit: int = 40,
+                               max_bytes: int = 512_000) -> set[str]:
+    """Distinct basenames of the files a session touched, via the owning
+    agent's extractor. Bounded read; never raises."""
+    fn = agent_for_path(path).file_fingerprint or _claude_file_fingerprint
+    return fn(path, limit=limit, max_bytes=max_bytes)
+
+
+# apply_patch spells its targets out in a header line; view_image and
+# exec_command carry paths inside a JSON `arguments` string.
+_CODEX_PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$",
+                                  re.MULTILINE)
+_CODEX_ABS_PATH_RE = re.compile(r"/(?:[\w.@+-]+/)+[\w.@+-]+\.[A-Za-z0-9]{1,8}")
+
+
+def _codex_file_fingerprint(path: "Path", *, limit: int = 40,
+                            max_bytes: int = 512_000) -> set[str]:
+    """Basenames from a codex rollout: apply_patch targets, viewed images and
+    absolute paths quoted inside exec_command arguments."""
+    names: set[str] = set()
+
+    def _add(raw: str) -> None:
+        base = os.path.basename(raw.strip().rstrip("/"))
+        if base:
+            names.add(base)
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            read = 0
+            for line in f:
+                read += len(line.encode("utf-8", errors="replace"))
+                if read > max_bytes or len(names) >= limit:
+                    break
+                line = line.strip()
+                if not line or '"response_item"' not in line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = evt.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                ptype = payload.get("type")
+                if ptype == "custom_tool_call":
+                    blob = payload.get("input")
+                    if isinstance(blob, str):
+                        for m in _CODEX_PATCH_FILE_RE.finditer(blob):
+                            _add(m.group(1))
+                        for m in _CODEX_ABS_PATH_RE.finditer(blob):
+                            _add(m.group(0))
+                elif ptype == "function_call":
+                    args = payload.get("arguments")
+                    if not isinstance(args, str):
+                        continue
+                    try:
+                        parsed = json.loads(args)
+                    except json.JSONDecodeError:
+                        parsed = {}
+                    if isinstance(parsed, dict) and isinstance(parsed.get("path"), str):
+                        _add(parsed["path"])
+                    cmd = parsed.get("cmd") if isinstance(parsed, dict) else None
+                    if isinstance(cmd, str):
+                        for m in _CODEX_ABS_PATH_RE.finditer(cmd):
+                            _add(m.group(0))
+                if len(names) >= limit:
+                    break
+    except OSError:
+        return set()
+    return set(list(names)[:limit])
+
+
+def _claude_file_fingerprint(path: "Path", *, limit: int = 40,
+                             max_bytes: int = 512_000) -> set[str]:
+    """Distinct basenames of file paths the session touched (Read/Edit/Write/
+    NotebookEdit tool inputs). Bounded read; never raises."""
+    names: set[str] = set()
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            read = 0
+            for line in f:
+                read += len(line.encode("utf-8", errors="replace"))
+                if read > max_bytes or len(names) >= limit:
+                    break
+                line = line.strip()
+                if not line or '"file_path"' not in line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = evt.get("message") or {}
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if not isinstance(content, list):
+                    continue
+                # len(names) is re-checked after every add below, so the set
+                # is capped at exactly `limit` (no per-line overshoot).
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    inp = block.get("input")
+                    if isinstance(inp, dict):
+                        fp = inp.get("file_path")
+                        if isinstance(fp, str) and fp:
+                            names.add(os.path.basename(fp.rstrip("/")))
+                            if len(names) >= limit:
+                                break
+    except OSError:
+        return set()
+    return names
+
+
+def _scan_present(dpath: str, fp: set) -> set:
+    """Names from fingerprint `fp` found directly in `dpath` or one level below.
+
+    Bounded two-level os.scandir; never raises (returns whatever it found).
+    Extracted from find_relocation_candidates to keep that scan loop shallow."""
+    present: set[str] = set()
+    try:
+        with os.scandir(dpath) as it:
+            for e in it:
+                nm = e.name
+                if nm in fp:
+                    present.add(nm)
+                elif e.is_dir(follow_symlinks=False):
+                    try:
+                        for e2 in os.scandir(e.path):
+                            if e2.name in fp:
+                                present.add(e2.name)
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+    return present
+
+
+def find_relocation_candidates(old_cwd: str, target: "SessionMeta", *,
+                                time_budget: float = 2.0,
+                                max_results: int = 8,
+                                _roots: list[str] | None = None
+                                ) -> list["Candidate"]:
+    """Find directories the moved folder may now live at, ranked by how many
+    of the session's referenced files they contain. Never raises.
+
+    If the session referenced no files (empty fingerprint) every candidate
+    scores 0 (plus a +1 ".git" nudge); the caller's confidence gate then
+    routes to a manual pick rather than auto-confirm — intended graceful
+    degradation, not a bug.
+    """
+    import time
+    try:
+        base = unicodedata.normalize("NFC",
+                                     os.path.basename(old_cwd.rstrip("/")))
+        if not base:
+            return []
+        deadline = time.monotonic() + time_budget
+
+        # _roots is a test seam: when explicitly provided, search ONLY those
+        # roots via the bounded walk (mdfind is system-wide and ignores roots,
+        # which would make seeded tests non-deterministic on macOS). Production
+        # callers never pass _roots and get the full mdfind -> fd -> walk path.
+        if _roots is not None:
+            roots = _roots
+            dirs = _walk_dirs(base, roots, deadline)
+        else:
+            roots = _relocate_search_roots(old_cwd)
+            dirs = _mdfind_dirs(base, deadline)
+            if not dirs:
+                dirs = _fd_dirs(base, roots, deadline)
+            if not dirs:
+                dirs = _walk_dirs(base, roots, deadline)
+
+        old_real = os.path.realpath(old_cwd) if old_cwd else ""
+        seen: set[str] = set()
+        norm_dirs: list[str] = []
+        for dpath in dirs:
+            try:
+                rp = unicodedata.normalize("NFC", os.path.realpath(dpath))
+            except OSError:
+                continue
+            if rp in seen or not os.path.isdir(rp) or rp == old_real:
+                continue
+            seen.add(rp)
+            norm_dirs.append(rp)
+
+        fp = _session_file_fingerprint(target.path)
+        results: list[Candidate] = []
+        for dpath in norm_dirs:
+            if time.monotonic() > deadline:
+                break
+            # eligibility: relocate would refuse if same-id exists at target
+            proj = PROJECTS_DIR / encode_cwd(dpath)
+            if (proj / target.path.name).exists():
+                continue
+            present = _scan_present(dpath, fp)
+            score = len(present)
+            signals = sorted(present)
+            # isdir() on the candidate dir itself; unrelated to _walk_dirs
+            # pruning ".git" from its descent.
+            if os.path.isdir(os.path.join(dpath, ".git")):
+                score += 1
+                signals.append(".git")
+            results.append(Candidate(path=dpath, score=score, signals=signals))
+
+        results.sort(key=lambda c: (c.score, -len(c.path)), reverse=True)
+        return results[:max_results]
+    except Exception:
+        return []
+
+
+def classify_candidates(
+    cands: list["Candidate"],
+) -> tuple[str, "Candidate"] | tuple[str, list["Candidate"]]:
+    """('confirm', best) | ('pick', cands) | ('none', []).
+
+    'confirm' only when the top score clears HIGH_CONFIDENCE_SCORE AND is
+    either the lone candidate or beats the runner-up by >= CONFIDENCE_MARGIN.
+    """
+    if not cands:
+        return ("none", [])
+    top = cands[0]
+    if top.score >= HIGH_CONFIDENCE_SCORE and (
+        len(cands) == 1 or top.score - cands[1].score >= CONFIDENCE_MARGIN
+    ):
+        return ("confirm", top)
+    return ("pick", cands)
+
+
+def relocate_session(target: "SessionMeta", new_cwd: str, *,
+                      keep_original: bool = False,
+                      force: bool = False,
+                      dry_run: bool = False) -> "RelocateResult":
+    """Pure relocate core (no prints, no input()). Rewrites the transcript's
+    recorded cwd to new_cwd and, for agents whose storage path encodes that
+    cwd (claude), moves the transcript (+ subagents subdir) into
+    PROJECTS_DIR/encode_cwd(new_cwd). Agents whose path carries no cwd (codex:
+    a dated rollout) are rewritten where they lie. Atomic via temp file +
+    replace. Refuses to overwrite an existing same-id session at the target.
+
+    dry_run=True validates and fills derived paths WITHOUT mutating.
+    """
+    spec = agent_of(target)
+    new_cwd = str(Path(new_cwd).expanduser())
+    if not new_cwd.startswith("/"):
+        new_cwd = str(Path(new_cwd).resolve())
+
+    if not force and not Path(new_cwd).is_dir():
+        return RelocateResult(False, f"Target folder does not exist: {new_cwd}",
+                               new_cwd=new_cwd, old_cwd=target.cwd, reason="nodir")
+
+    if new_cwd == target.cwd:
+        return RelocateResult(True, f"Session already has cwd={new_cwd} — nothing to do.",
+                              new_cwd=new_cwd, old_cwd=target.cwd, reason="samecwd")
+
+    moved_to = spec.relocated_path(target.path, new_cwd) if spec.relocated_path else None
+    in_place = moved_to is None
+    new_path = target.path if in_place else moved_to
+
+    if in_place and keep_original:
+        # Nowhere to put the copy: the rewrite would have to edit the very
+        # file the flag asks us to preserve.
+        return RelocateResult(
+            False,
+            f"--keep-original cannot be honored for {spec.name} sessions: the "
+            f"transcript stays at {target.path}, so rewriting its cwd would "
+            f"change the original.\nRe-run without --keep-original to rewrite "
+            f"it in place, or copy the file yourself first.",
+            new_path=target.path, new_cwd=new_cwd, old_cwd=target.cwd,
+            reason="keeporiginal")
+    old_subdir = target.path.parent / target.path.stem
+    new_subdir = old_subdir if in_place else new_path.parent / target.path.stem
+
+    if not in_place and new_path.exists():
+        return RelocateResult(
+            False,
+            f"Target path already exists: {new_path}\n"
+            f"(a session with the same id lives there — refusing to overwrite)",
+            new_path=new_path, new_cwd=new_cwd, old_cwd=target.cwd,
+            old_subdir=old_subdir, new_subdir=new_subdir, reason="collision")
+
+    if dry_run:
+        return RelocateResult(True, "(dry run — nothing changed)",
+                              new_path=new_path, new_cwd=new_cwd, old_cwd=target.cwd,
+                              old_subdir=old_subdir, new_subdir=new_subdir, reason="ok")
+
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = new_path.with_suffix(".jsonl.tmp")
+    rewritten = 0
+    try:
+        with target.path.open("r", encoding="utf-8", errors="replace") as src, \
+             tmp_path.open("w", encoding="utf-8") as dst:
+            rewritten = _rewrite_cwd_stream(src, dst, new_cwd,
+                                            spec.rewrite_event_cwd, target.cwd)
+        tmp_path.replace(new_path)
+    except OSError as e:
+        tmp_path.unlink(missing_ok=True)
+        return RelocateResult(False, f"Failed to write new session file: {e}",
+                              new_path=new_path, new_cwd=new_cwd, old_cwd=target.cwd,
+                              old_subdir=old_subdir, new_subdir=new_subdir,
+                              reason="writefail")
+
+    sub_moved = False
+    sub_warn = ""
+    if not in_place and old_subdir.is_dir():
+        try:
+            if keep_original:
+                import shutil
+                shutil.copytree(old_subdir, new_subdir)
+            else:
+                new_subdir.parent.mkdir(parents=True, exist_ok=True)
+                old_subdir.rename(new_subdir)
+            sub_moved = True
+            if new_subdir.is_dir():
+                for sub_jsonl in new_subdir.glob("subagents/*.jsonl"):
+                    _rewrite_cwd_inplace(sub_jsonl, new_cwd)
+        except OSError as e:
+            sub_warn = f"Warning: could not relocate subagents dir: {e}"
+
+    orig_warn = ""
+    if not in_place and not keep_original:
+        try:
+            target.path.unlink()
+        except OSError as e:
+            orig_warn = f"Warning: failed to remove original {target.path}: {e}"
+
+    # Both ends of the move: the old path's entry is now wrong (the file is
+    # gone, or its cwd was rewritten in place) and the new path must be read
+    # fresh. Every other session keeps its index entry.
+    invalidate_cache_entries({target.path, new_path})
+
+    msg = (f"✓ Relocated session (rewrote cwd on {rewritten} event(s))"
+           + (", subagents moved" if sub_moved else "")
+           + (", transcript kept in place" if in_place else ""))
+    return RelocateResult(True, msg, new_path=new_path, new_cwd=new_cwd,
+                          old_cwd=target.cwd, old_subdir=old_subdir,
+                          new_subdir=new_subdir, rewritten=rewritten,
+                          sub_moved=sub_moved, reason="ok",
+                          )._with_warnings(sub_warn, orig_warn)
+
+
+def confirm(prompt: str) -> bool:
+    """Interactive y/N gate shared by relocate / backup / restore. Returns
+    True iff the user typed y/yes; otherwise prints 'Aborted.' and returns
+    False. Callers still own the `if not args.yes:` guard and dry-run path."""
+    if input(prompt).strip().lower() in ("y", "yes"):
+        return True
+    print("Aborted.")
+    return False
+
+
+def cmd_relocate(args: argparse.Namespace) -> int:
+    target = require_session(args.session_id)
+    if target is None:
+        return 1
+    if not require_cap(target, "relocate", "relocate"):
+        return 1
+
+    preview = relocate_session(target, args.new_cwd,
+                               keep_original=args.keep_original,
+                               force=args.force, dry_run=True)
+    if preview.reason == "nodir":
+        print(f"Target folder does not exist: {preview.new_cwd}\n"
+              f"(use --force to relocate anyway)", file=sys.stderr)
+        return 1
+    if preview.reason == "samecwd":
+        print(preview.message)
+        return 0
+    if preview.reason in ("collision", "keeporiginal"):
+        print(preview.message, file=sys.stderr)
+        return 1
+
+    print(f"Session:  {target.session_id}")
+    print(f"From cwd: {shorten_path(target.cwd)}")
+    print(f"To   cwd: {shorten_path(preview.new_cwd)}")
+    # An agent whose storage path carries no cwd (codex) keeps its file, so
+    # there is no second path to show and no move to announce.
+    in_place = preview.new_path == target.path
+    print(f"File:     {shorten_path(str(target.path))}")
+    if not in_place:
+        print(f"     →    {shorten_path(str(preview.new_path))}")
+        if preview.old_subdir and preview.old_subdir.is_dir():
+            print(f"Subagents: {shorten_path(str(preview.old_subdir))}")
+            print(f"      →    {shorten_path(str(preview.new_subdir))}")
+    if in_place:
+        print("Mode:     rewrite in place (transcript stays where it is)")
+    else:
+        print("Mode:     " + ("copy (originals will be kept)"
+                              if args.keep_original else "move"))
+
+    if args.dry_run:
+        print("(dry run — nothing changed)")
+        return 0
+
+    if not args.yes:
+        if not confirm("Proceed? [y/N] "):
+            return 0
+
+    result = relocate_session(target, args.new_cwd,
+                              keep_original=args.keep_original,
+                              force=args.force, dry_run=False)
+    if not result.ok:
+        print(result.message, file=sys.stderr)
+        return 1
+    # Preserve original streams: 'Warning:' lines to stderr, success to stdout.
+    _msg_lines = result.message.split("\n")
+    _warn = [ln for ln in _msg_lines if ln.startswith("Warning:")]
+    _main = [ln for ln in _msg_lines if not ln.startswith("Warning:")]
+    for _w in _warn:
+        print(_w, file=sys.stderr)
+    if _main:
+        print("\n".join(_main))
+    return 0
+
+
+def _human(n: int) -> str:
+    nf = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if nf < 1024:
+            return f"{nf:.1f}{unit}" if unit != "B" else f"{int(nf)}{unit}"
+        nf /= 1024
+    return f"{nf:.1f}TB"
+
+
+# A backup tarball keeps one top-level directory per agent — "projects/…"
+# for claude (unchanged from the single-agent format, so older archives still
+# restore) and "codex/…" for codex rollouts. The manifest records the agent
+# and the full member name so a restore never has to guess.
+
+def archive_member_for(meta) -> "tuple[str, str] | None":
+    """(relpath under the agent's data root, member name inside the tarball)
+    for one session, or None when its agent has no archive layout or the
+    transcript sits outside that root."""
+    spec = agent_of(meta)
+    root = spec.data_root() if spec.data_root else None
+    if root is None or not spec.archive_prefix:
+        return None
+    try:
+        rel = str(meta.path.relative_to(root))
+    except ValueError:
+        return None
+    return rel, f"{spec.archive_prefix}/{rel}"
+
+
+def archive_spec_for_member(name: str) -> "AgentSpec | None":
+    """The AgentSpec owning a tarball member, keyed by its top-level dir."""
+    prefix = name.split("/", 1)[0]
+    for spec in AGENTS.values():
+        if spec.archive_prefix and spec.archive_prefix == prefix:
+            return spec
+    return None
+
+
+def archive_manifest_key(entry: dict) -> str:
+    """Member name for a manifest entry. Archives written before the
+    multi-agent split carry only `relpath`, always under "projects/"."""
+    arc = entry.get("arcname")
+    if arc:
+        return str(arc)
+    rel = entry.get("relpath") or ""
+    if not rel:
+        return ""
+    spec = AGENTS.get(entry.get("agent") or DEFAULT_AGENT) or AGENTS[DEFAULT_AGENT]
+    return f"{spec.archive_prefix or 'projects'}/{rel}"
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    if args.before:
+        try:
+            cutoff = datetime.strptime(args.before, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            print(f"--before must be YYYY-MM-DD (got {args.before!r})", file=sys.stderr)
+            return 2
+    else:
+        days = args.days if args.days is not None else 90
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    sessions = load_all_sessions(progress=True)
+    old = [s for s in sessions if s.last_ts and s.last_ts < cutoff]
+    if args.cwd:
+        old = [s for s in old if s.cwd.startswith(args.cwd)]
+
+    if not old:
+        print(f"(no sessions older than {cutoff.astimezone().strftime('%Y-%m-%d')})")
+        return 0
+
+    # Sessions whose agent has no archive layout cannot be stored; drop them
+    # here so neither the count, the manifest nor the tar loop trips over one.
+    stored: dict[str, tuple[str, str]] = {}
+    unarchivable = []
+    for s in old:
+        member = archive_member_for(s)
+        if member is None:
+            unarchivable.append(s)
+        else:
+            stored[s.session_id] = member
+    if unarchivable:
+        old = [s for s in old if s.session_id in stored]
+        print(f"(skipping {len(unarchivable)} session(s) whose transcripts sit "
+              f"outside a known agent data root)", file=sys.stderr)
+        if not old:
+            print("(nothing left to archive)")
+            return 0
+
+    total_bytes = 0
+    for s in old:
+        try:
+            total_bytes += s.path.stat().st_size
+        except OSError:
+            pass
+
+    cutoff_label = cutoff.astimezone().strftime("%Y-%m-%d")
+    print(f"Sessions older than {cutoff_label}: {len(old)} ({_human(total_bytes)})")
+
+    if args.dry_run:
+        for s in old[:20]:
+            print(f"  {s.session_id[:8]}  {fmt_ts(s.last_ts):<17}  {shorten_path(s.cwd)}")
+        if len(old) > 20:
+            print(f"  … +{len(old) - 20} more")
+        print("(dry run — nothing written)")
+        return 0
+
+    if args.out:
+        out_path = Path(args.out).expanduser()
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        # ast's own home, not Claude Code's config dir: an archive can now
+        # carry codex rollouts too, and it is ast's artifact either way.
+        out_path = CACHE_DIR / "backups" / f"sessions-{stamp}.tar.gz"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not args.yes:
+        action = "archive and DELETE" if args.delete else "archive"
+        print(f"Will {action} {len(old)} session(s) → {shorten_path(str(out_path))}")
+        if not confirm("Proceed? [y/N] "):
+            return 0
+
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "cutoff": cutoff.isoformat(),
+        "count": len(old),
+        "sessions": [
+            {
+                "session_id": s.session_id,
+                "cwd": s.cwd,
+                "first_ts": s.first_ts.isoformat() if s.first_ts else None,
+                "last_ts": s.last_ts.isoformat() if s.last_ts else None,
+                "msg_count": s.msg_count,
+                "first_user_msg": s.first_user_msg,
+                "agent": s.agent or DEFAULT_AGENT,
+                "relpath": stored[s.session_id][0],
+                "arcname": stored[s.session_id][1],
+            }
+            for s in old
+        ],
+    }
+    written = 0
+    failed: list[str] = []
+    try:
+        with tarfile.open(out_path, "w:gz") as tar:
+            mf_bytes = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+            mf_info = tarfile.TarInfo(name="manifest.json")
+            mf_info.size = len(mf_bytes)
+            mf_info.mtime = int(datetime.now().timestamp())
+            import io
+            tar.addfile(mf_info, io.BytesIO(mf_bytes))
+            for i, s in enumerate(old, 1):
+                try:
+                    tar.add(str(s.path), arcname=stored[s.session_id][1])
+                    written += 1
+                except OSError as e:
+                    failed.append(f"{s.session_id}: {e}")
+                if sys.stderr.isatty():
+                    sys.stderr.write(f"\rArchiving… {i}/{len(old)}")
+                    sys.stderr.flush()
+        if sys.stderr.isatty():
+            sys.stderr.write("\r" + " " * 40 + "\r")
+    except OSError as e:
+        print(f"Backup failed: {e}", file=sys.stderr)
+        return 1
+
+    archive_size = out_path.stat().st_size
+    print(f"✓ Wrote {written}/{len(old)} sessions → {shorten_path(str(out_path))} ({_human(archive_size)})")
+    if failed:
+        print(f"  {len(failed)} file(s) failed to archive", file=sys.stderr)
+        for f in failed[:5]:
+            print(f"    {f}", file=sys.stderr)
+
+    if args.delete:
+        if failed and not args.force:
+            print("Refusing to delete originals because some files failed to archive (use --force to override).",
+                  file=sys.stderr)
+            return 1
+        cache = _load_cache()
+        entries = cache.setdefault("entries", {})
+        deleted = 0
+        for s in old:
+            if f"{s.session_id}" in {t.split(":")[0] for t in failed}:
+                continue
+            try:
+                s.path.unlink()
+                entries.pop(str(s.path), None)
+                deleted += 1
+            except OSError as e:
+                print(f"  Could not remove {s.path}: {e}", file=sys.stderr)
+        _save_cache(cache)
+        print(f"✓ Removed {deleted} original session file(s).")
+
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    archive = Path(args.archive).expanduser()
+    if not archive.exists():
+        print(f"Archive not found: {archive}", file=sys.stderr)
+        return 1
+
+    try:
+        tar = tarfile.open(archive, "r:*")
+    except tarfile.TarError as e:
+        print(f"Cannot open archive: {e}", file=sys.stderr)
+        return 1
+
+    manifest: dict | None = None
+    members: list[tarfile.TarInfo] = []
+    try:
+        for m in tar.getmembers():
+            if not m.isfile():
+                continue
+            if m.name == "manifest.json":
+                try:
+                    f = tar.extractfile(m)
+                    if f is not None:
+                        manifest = json.loads(f.read().decode("utf-8"))
+                except Exception:
+                    pass
+                continue
+            if m.name.endswith(".jsonl") and archive_spec_for_member(m.name):
+                members.append(m)
+
+        if not members:
+            print("(archive contains no session files)")
+            return 0
+
+        cwd_filter = args.cwd
+        # Keyed by tar member name so claude's "projects/…" and codex's
+        # "codex/…" entries never collide; archives written before the
+        # multi-agent split resolve through archive_manifest_key().
+        manifest_by_member: dict[str, dict] = {}
+        if manifest:
+            for entry in manifest.get("sessions", []):
+                key = archive_manifest_key(entry)
+                if key:
+                    manifest_by_member[key] = entry
+
+        if cwd_filter:
+            kept = []
+            for m in members:
+                meta = manifest_by_member.get(m.name)
+                meta_cwd = (meta or {}).get("cwd", "")
+                if meta_cwd.startswith(cwd_filter):
+                    kept.append(m)
+            members = kept
+
+        total_bytes = sum(m.size for m in members)
+
+        print(f"Archive: {shorten_path(str(archive))}")
+        if manifest:
+            print(f"Created: {manifest.get('created_at', '?')}")
+            print(f"Cutoff:  {manifest.get('cutoff', '?')}")
+        print(f"Files:   {len(members)} ({_human(total_bytes)})")
+
+        # Each member restores under its own agent's data root, so one archive
+        # can carry claude transcripts and codex rollouts at once.
+        dest_roots: list[Path] = []
+        conflicts: list[tuple[tarfile.TarInfo, Path]] = []
+        plans: list[tuple[tarfile.TarInfo, Path, str]] = []
+        unsafe = 0
+        for m in members:
+            spec = archive_spec_for_member(m.name)
+            dest_root = spec.data_root() if spec and spec.data_root else None
+            if dest_root is None:
+                unsafe += 1
+                continue
+            if dest_root not in dest_roots:
+                dest_roots.append(dest_root)
+            rel = m.name.split("/", 1)[1] if "/" in m.name else ""
+            dest = dest_root / rel
+            # Guard against tar path traversal: a crafted member name like
+            # projects/../../../x.jsonl would otherwise land outside the root.
+            dest_root_real = os.path.realpath(dest_root)
+            dest_real = os.path.realpath(dest)
+            if dest_real != dest_root_real and \
+                    not dest_real.startswith(dest_root_real + os.sep):
+                print(f"  Skipping unsafe path outside "
+                      f"{shorten_path(str(dest_root))}: {m.name}", file=sys.stderr)
+                unsafe += 1
+                continue
+            action = "write"
+            if dest.exists():
+                if args.on_conflict == "skip":
+                    action = "skip"
+                elif args.on_conflict == "overwrite":
+                    action = "overwrite"
+                elif args.on_conflict == "rename":
+                    action = "rename"
+                conflicts.append((m, dest))
+            plans.append((m, dest, action))
+
+        if conflicts:
+            print(f"Conflicts: {len(conflicts)} existing file(s)  → policy: {args.on_conflict}")
+
+        if args.dry_run:
+            print("\nPlan (dry run):")
+            counts = {"write": 0, "skip": 0, "overwrite": 0, "rename": 0}
+            for m, dest, action in plans[:20]:
+                rel = m.name.split("/", 1)[1] if "/" in m.name else m.name
+                meta = manifest_by_member.get(m.name, {})
+                label = meta.get("first_user_msg") or rel
+                print(f"  [{action:<9}] {truncate(label, 80)}")
+                counts[action] = counts.get(action, 0) + 1
+            if len(plans) > 20:
+                print(f"  … +{len(plans) - 20} more")
+            summary = ", ".join(f"{k}:{v}" for k, v in counts.items() if v)
+            print(f"\n({summary}) — nothing written")
+            return 0
+
+        if not args.yes:
+            where = ", ".join(shorten_path(str(r)) for r in dest_roots) or "(nothing)"
+            if not confirm(f"Restore {len(plans)} file(s) to {where}? [y/N] "):
+                return 0
+
+        written = 0
+        skipped = 0
+        errors = 0
+        touched: "set[Path]" = set()
+        for i, (m, dest, action) in enumerate(plans, 1):
+            if action == "skip":
+                skipped += 1
+                continue
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if action == "rename" and dest.exists():
+                    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                    dest = dest.with_suffix(f".restored-{stamp}.jsonl")
+                src = tar.extractfile(m)
+                if src is None:
+                    errors += 1
+                    continue
+                with open(dest, "wb") as out:
+                    while True:
+                        chunk = src.read(65536)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                written += 1
+                touched.add(dest)
+            except OSError as e:
+                errors += 1
+                print(f"  Failed {m.name}: {e}", file=sys.stderr)
+            if sys.stderr.isatty():
+                sys.stderr.write(f"\rRestoring… {i}/{len(plans)}")
+                sys.stderr.flush()
+        if sys.stderr.isatty():
+            sys.stderr.write("\r" + " " * 40 + "\r")
+
+        # Only the restored transcripts need re-reading. A restore that
+        # rewrites a handful of sessions out of thousands used to throw the
+        # whole index away, which made the next listing a full cold scan.
+        invalidate_cache_entries(touched)
+
+        print(f"✓ Restored {written} file(s)" +
+              (f", skipped {skipped}" if skipped else "") +
+              (f", {unsafe} unsafe" if unsafe else "") +
+              (f", {errors} error(s)" if errors else ""))
+        return 1 if (errors or unsafe) else 0
+    finally:
+        tar.close()
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    sessions = load_all_sessions()
+    ctx = StatusContext.capture()
+    total_msgs = sum(s.msg_count for s in sessions)
+    print(f"Total sessions:  {len(sessions)}")
+    print(f"Total messages:  {total_msgs}")
+    counts = ctx.counts(sessions)
+    for g in STATUS_ALL:
+        print(f"  {status_label(g)}: {counts[g]}")
+    if not sessions:
+        return 0
+    by_cwd: dict[str, tuple[int, int, datetime | None]] = {}
+    for s in sessions:
+        count, msgs, last = by_cwd.get(s.cwd, (0, 0, None))
+        if not last or (s.last_ts and s.last_ts > last):
+            last = s.last_ts
+        by_cwd[s.cwd] = (count + 1, msgs + s.msg_count, last)
+    rows = sorted(by_cwd.items(), key=lambda kv: kv[1][0], reverse=True)
+    print(f"\n{'SESSIONS':>8} {'MSGS':>7}  {'LAST':<17}  PROJECT")
+    print("-" * 90)
+    for cwd, (n, msgs, last) in rows[: args.top]:
+        print(f"{n:>8} {msgs:>7}  {fmt_ts(last):<17}  {shorten_path(cwd)}")
+    return 0
+
+
+def find_session(prefix: str) -> SessionMeta | None:
+    matches: list[Path] = []
+    for p in all_session_files():
+        if agent_for_path(p).session_id_of(p).startswith(prefix):
+            matches.append(p)
+    if not matches:
+        for p in all_subagent_files():
+            if p.stem.startswith(prefix):
+                matches.append(p)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        print(f"Ambiguous id {prefix!r} — {len(matches)} matches:", file=sys.stderr)
+        for m in matches[:10]:
+            print(f"  {m.stem}", file=sys.stderr)
+        return None
+    match = matches[0]
+    # Subagent transcripts aren't in the session index (load_all_sessions
+    # excludes them and would prune any entry we wrote → churn), so parse them
+    # directly instead of through the persistent cache.
+    if "subagents" in match.parts:
+        return load_session_meta(match)
+    # Cache-first: a warm index (populated by the last `ast list`) lets a
+    # single `ast show`/`resume`/… lookup skip the full transcript parse.
+    cache = _load_cache()
+    entries = cache.setdefault("entries", {})
+    meta, fresh = _meta_for_path(match, entries)
+    if fresh and meta:
+        _save_cache(cache)
+    return meta
+
+
+def require_session(prefix: str) -> "SessionMeta | None":
+    """find_session + the standard not-found guard. Returns the resolved
+    session, or prints the miss message to stderr and returns None so the
+    caller can `return 1`. (find_session already prints its own message
+    for the ambiguous case; this preserves that two-line behavior.)"""
+    target = find_session(prefix)
+    if not target:
+        print(f"(no session matching {prefix!r})", file=sys.stderr)
+        return None
+    return target
+
+
+# ---------- argparse / main ----------
+
+def _build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="ast",
+        description=f"agent-session-tracker — browse, search, and track Claude Code + Codex sessions (v{__version__})",
+    )
+    ap.add_argument("-V", "--version", action="version",
+                    version=f"agent-session-tracker v{__version__}")
+    ap.add_argument("--tui", action="store_true",
+                    help="launch the interactive TUI (same as `ast pick`); "
+                         "the default at a terminal, so this only matters "
+                         "when stdin/stdout is not a tty")
+    ap.add_argument("--skip-perm", dest="skip_perm", action="store_true",
+                    help="pass --dangerously-skip-permissions when resuming "
+                         "(TUI & resume). Without it, the TUI prompts per resume.")
+    ap.add_argument("--hide-done", dest="hide_done", action="store_true",
+                    help="start the TUI with 작업완료(done) sessions hidden "
+                         "(toggle in-TUI with H)")
+    ap.add_argument("--theme", choices=THEME_CHOICES, default=None,
+                    help="TUI color theme (default: saved choice, else "
+                         "auto-detect via COLORFGBG; toggle in-TUI with t)")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p_pick = sub.add_parser("pick", help="interactive picker (TUI)")
+    p_pick.add_argument("--cwd", type=str, default=None, help="filter by cwd prefix")
+    p_pick.add_argument("--days", type=int, default=None, help="only last N days")
+    # default=SUPPRESS so an omitted flag here does NOT clobber a top-level
+    # --hide-done (argparse parses subcommands into a fresh namespace, then
+    # copies set attrs back over the parent's). Mirrors how --skip-perm stays
+    # top-level only; here we accept it in both positions for convenience.
+    p_pick.add_argument("--hide-done", dest="hide_done", action="store_true",
+                        default=argparse.SUPPRESS,
+                        help="start with 작업완료(done) sessions hidden "
+                             "(toggle with H)")
+    # default=SUPPRESS so an omitted flag here does NOT clobber a top-level
+    # --theme (same pattern as --hide-done above).
+    p_pick.add_argument("--theme", choices=THEME_CHOICES,
+                        default=argparse.SUPPRESS,
+                        help="TUI color theme (toggle in-TUI with t)")
+    p_pick.add_argument("--agent", choices=agent_choices(), default=None,
+                        help="start in one agent CLI's view (default: the "
+                             "last view saved by the `a` key)")
+    p_pick.set_defaults(func=cmd_pick)
+
+    p_list = sub.add_parser("list", help="list sessions (CLI, with status column)")
+    p_list.add_argument("--limit", type=int, default=30)
+    p_list.add_argument("--cwd", type=str, default=None, help="filter by cwd prefix")
+    p_list.add_argument("--days", type=int, default=None, help="only last N days")
+    p_list.add_argument("--sort", choices=SORT_KEYS, default=None,
+                        help="sort column: time|status|msgs|message|project "
+                             "(default: saved TUI preference)")
+    p_list.add_argument("--reverse", action="store_true",
+                        help="reverse the sort direction")
+    p_list.add_argument("--status", type=str, default=None,
+                        choices=("working", "waiting", "idle", "ended",
+                                 "done", "active"),
+                        help="filter by status")
+    p_list.add_argument("--origin", choices=ORIGIN_CHOICES, default=None,
+                        help="who started the session: all|user|agent "
+                             "(agent = SDK-spawned; default: saved TUI preference)")
+    p_list.add_argument("--json", action="store_true",
+                        help="emit machine-readable JSON (for cst.app) instead of the table")
+    p_list.add_argument("--agent", choices=agent_choices(), default=None,
+                        help="show one agent CLI's sessions (default: the "
+                             "view saved by the TUI `a` key, else all)")
+    p_list.set_defaults(func=cmd_list)
+
+    p_search = sub.add_parser("search", help="keyword search across sessions")
+    p_search.add_argument("query")
+    p_search.add_argument("--limit", type=int, default=20)
+    p_search.add_argument("--cwd", type=str, default=None)
+    p_search.add_argument("--origin", choices=ORIGIN_CHOICES, default=None,
+                          help="who started the session: all|user|agent "
+                               "(default: saved TUI preference)")
+    p_search.add_argument("-i", "--ignore-case", action="store_true")
+    p_search.add_argument("--agent", choices=agent_choices(), default=None,
+                          help="restrict to one agent CLI's sessions "
+                               "(default: the saved TUI view, else all)")
+    p_search.set_defaults(func=cmd_search)
+
+    p_show = sub.add_parser("show", help="print a session transcript")
+    p_show.add_argument("session_id")
+    p_show.add_argument("--max-chars", type=int, default=500)
+    p_show.add_argument("--head-chars", type=int, default=0,
+                        help="cap TOTAL transcript output (0 = unlimited); "
+                             "stops reading the file early for fast previews")
+    p_show.add_argument("--with-subagents", action="store_true")
+    p_show.set_defaults(func=cmd_show)
+
+    p_sub = sub.add_parser("subagents", help="list subagents of a session")
+    p_sub.add_argument("session_id")
+    p_sub.set_defaults(func=cmd_subagents)
+
+    p_reloc = sub.add_parser("relocate", help="rewrite a session's recorded cwd")
+    p_reloc.add_argument("session_id")
+    p_reloc.add_argument("new_cwd")
+    p_reloc.add_argument("--keep-original", action="store_true")
+    p_reloc.add_argument("--force", action="store_true")
+    p_reloc.add_argument("--dry-run", action="store_true")
+    p_reloc.add_argument("-y", "--yes", action="store_true")
+    p_reloc.set_defaults(func=cmd_relocate)
+
+    p_export = sub.add_parser("export", help="export session transcript to a file")
+    p_export.add_argument("session_id")
+    p_export.add_argument("--format", choices=("md", "txt"), default="md",
+                          help="output format: md (default) or txt")
+    p_export.add_argument("--out", type=str, default=None,
+                          help="output file or directory path (default: current dir)")
+    p_export.set_defaults(func=cmd_export)
+
+    p_resume = sub.add_parser("resume", help="emit a cd+resume command")
+    p_resume.add_argument("session_id")
+    p_resume.add_argument("--print-only", action="store_true")
+    p_resume.add_argument("--spawn", action="store_true",
+                          help="actually open/attach the session in a new terminal (used by cst.app)")
+    p_resume.add_argument("--terminal", metavar="NAME",
+                          help="with --spawn: force the terminal app "
+                               "(wezterm|iterm|ghostty|kitty|alacritty|terminal); "
+                               "default: $TERM_PROGRAM, else Terminal.app")
+    p_resume.set_defaults(func=cmd_resume)
+
+    p_open = sub.add_parser("open",
+                            help="open the session's folder in a new terminal "
+                                 "(the TUI `o` key; plain shell, no claude)")
+    p_open.add_argument("session_id")
+    p_open.add_argument("--terminal", metavar="NAME",
+                        help="force the terminal app "
+                             "(wezterm|iterm|ghostty|kitty|alacritty|terminal); "
+                             "default: $TERM_PROGRAM, else Terminal.app")
+    p_open.set_defaults(func=cmd_open)
+
+    p_backup = sub.add_parser("backup", help="archive old sessions into tar.gz")
+    p_backup.add_argument("--days", type=int, default=None)
+    p_backup.add_argument("--before", type=str, default=None)
+    p_backup.add_argument("--cwd", type=str, default=None)
+    p_backup.add_argument("--out", type=str, default=None)
+    p_backup.add_argument("--delete", action="store_true")
+    p_backup.add_argument("--force", action="store_true")
+    p_backup.add_argument("--dry-run", action="store_true")
+    p_backup.add_argument("-y", "--yes", action="store_true")
+    p_backup.set_defaults(func=cmd_backup)
+
+    p_restore = sub.add_parser("restore", help="restore sessions from a tar.gz")
+    p_restore.add_argument("archive")
+    p_restore.add_argument("--cwd", type=str, default=None)
+    p_restore.add_argument("--on-conflict", choices=("skip", "overwrite", "rename"),
+                           default="skip")
+    p_restore.add_argument("--dry-run", action="store_true")
+    p_restore.add_argument("-y", "--yes", action="store_true")
+    p_restore.set_defaults(func=cmd_restore)
+
+    p_stats = sub.add_parser("stats", help="summary stats")
+    p_stats.add_argument("--top", type=int, default=15)
+    p_stats.set_defaults(func=cmd_stats)
+
+    p_done = sub.add_parser("done",
+                            help="mark session(s) as done (bulk via --filter)")
+    p_done.add_argument("session_id", nargs="*",
+                        help="session id prefix(es); omit when using --filter")
+    p_done.add_argument("--filter", metavar="TEXT",
+                        help="bulk mode: mark every session whose id+cwd+first "
+                             "user message contains TEXT — same matching as "
+                             "the TUI / filter (case-insensitive)")
+    p_done.add_argument("--cwd", help="with --filter: restrict to this cwd prefix")
+    p_done.add_argument("--days", type=int,
+                        help="with --filter: only last N days")
+    p_done.add_argument("--status",
+                        choices=["working", "waiting", "idle", "ended", "active"],
+                        help="with --filter: restrict to this status")
+    p_done.add_argument("-y", "--yes", action="store_true",
+                        help="skip the bulk confirmation prompt")
+    p_done.add_argument("--force", action="store_true",
+                        help="mark done even if the session is actively working")
+    p_done.set_defaults(func=cmd_done)
+
+    p_bg = sub.add_parser(
+        "bg", help="dispatch a new background session (claude --bg <prompt>)")
+    p_bg.add_argument("prompt", nargs="*", help="the task to run in background")
+    p_bg.add_argument("--name", help="display name for the session")
+    p_bg.set_defaults(func=cmd_bg)
+
+    p_jobs = sub.add_parser(
+        "jobs", help="list all agent-view background jobs (incl. exec)")
+    p_jobs.set_defaults(func=cmd_jobs)
+
+    p_stop = sub.add_parser(
+        "stop", help="stop a live background session (claude stop <short>)")
+    p_stop.add_argument("session_id")
+    p_stop.set_defaults(func=cmd_stop)
+
+    p_logs = sub.add_parser(
+        "logs", help="show a background session's recent output (claude logs)")
+    p_logs.add_argument("session_id")
+    p_logs.set_defaults(func=cmd_logs)
+
+    p_undone = sub.add_parser("undone", help="clear done flag")
+    p_undone.add_argument("session_id")
+    p_undone.set_defaults(func=cmd_undone)
+
+    p_rm = sub.add_parser("rm",
+                          help="remove (unlink) session transcript(s) "
+                               "(bulk via --filter/--status/--older-than)")
+    p_rm.add_argument("session_id", nargs="*",
+                      help="session id prefix(es); omit when using a selector")
+    p_rm.add_argument("--filter", metavar="TEXT",
+                      help="bulk mode: remove every session whose id+cwd+first "
+                           "user message contains TEXT — same matching as the "
+                           "TUI / filter (case-insensitive)")
+    p_rm.add_argument("--cwd", help="bulk mode: restrict to this cwd prefix")
+    p_rm.add_argument("--status",
+                      choices=["working", "waiting", "idle", "ended", "done",
+                               "active"],
+                      help="bulk mode: restrict to this status")
+    g_rm_time = p_rm.add_mutually_exclusive_group()
+    g_rm_time.add_argument("--days", type=int,
+                           help="bulk mode: only the last N days (recent) — "
+                                "NOT 'older than N days'; use --older-than for "
+                                "that (note: ast backup --days means the "
+                                "opposite)")
+    g_rm_time.add_argument("--older-than", dest="older_than", type=int,
+                           metavar="N",
+                           help="bulk mode: only sessions last active more "
+                                "than N days ago")
+    g_rm_time.add_argument("--before", metavar="YYYY-MM-DD",
+                           help="bulk mode: only sessions last active before "
+                                "this date")
+    p_rm.add_argument("--dry-run", dest="dry_run", action="store_true",
+                      help="show what would be removed without unlinking")
+    p_rm.add_argument("-y", "--yes", action="store_true",
+                      help="skip confirmation (required when non-interactive)")
+    p_rm.add_argument("--force", action="store_true",
+                      help="single id: remove without confirmation (implies "
+                           "-y); bulk mode: include live ● / ! sessions too — "
+                           "the confirmation prompt still applies, pass -y to "
+                           "skip it")
+    p_rm.set_defaults(func=cmd_rm)
+
+    p_live = sub.add_parser("live",
+                            help="list live Claude Code processes (from ~/.claude/sessions/)")
+    p_live.add_argument("--all", action="store_true",
+                        help="include stale registry entries (dead PIDs)")
+    p_live.set_defaults(func=cmd_live)
+
+    p_phook = sub.add_parser(
+        "prompt-hook",
+        help="UserPromptSubmit hook: intercept /done & /undone (0 tokens)")
+    p_phook.set_defaults(func=cmd_prompt_hook)
+
+    p_shook = sub.add_parser(
+        "status-hook",
+        help="lifecycle hook: record working/waiting/idle into state.json")
+    p_shook.add_argument("event", nargs="?", default=None,
+                         help="event name (fallback when stdin has no "
+                              "hook_event_name)")
+    p_shook.set_defaults(func=cmd_status_hook)
+
+    p_ihook = sub.add_parser(
+        "install-hook",
+        help="wire prompt-hook into ~/.claude/settings.json (idempotent)")
+    p_ihook.add_argument("--settings", default=str(SETTINGS_PATH_DEFAULT),
+                         help="settings.json path "
+                              "(default: ~/.claude/settings.json)")
+    p_ihook.set_defaults(func=cmd_install_hook)
+
+    p_uhook = sub.add_parser(
+        "uninstall-hook",
+        help="remove prompt-hook from settings.json (keeps other hooks)")
+    p_uhook.add_argument("--settings", default=str(SETTINGS_PATH_DEFAULT),
+                         help="settings.json path "
+                              "(default: ~/.claude/settings.json)")
+    p_uhook.set_defaults(func=cmd_uninstall_hook)
+
+    return ap
+
+
+def _stdio_is_interactive() -> bool:
+    """True when both stdin and stdout are a terminal.
+
+    The picker is what plain `ast` runs, and curses needs a real tty for it.
+    A piped, redirected or agent-driven invocation has none, so the caller
+    gets the table instead of a curses failure."""
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (ValueError, OSError):   # detached / closed streams
+        return False
+
+
+def main() -> int:
+    seed_from_cst_home()
+    ap = _build_parser()
+    args = ap.parse_args()
+
+    skip_perm = bool(getattr(args, "skip_perm", False))
+    hide_done = bool(getattr(args, "hide_done", False))
+    theme = getattr(args, "theme", None)
+
+    # No subcommand: synthesize the default one FROM the parser so its
+    # defaults can never drift from the subparser definition (the old
+    # hand-built Namespaces silently broke when an arg was added). The picker
+    # is the default — bare `ast` in a terminal opens the TUI. Without a tty
+    # (a pipe, a redirect, an agent tool call, cst.app) it falls back to the
+    # list, so those callers keep working; `--tui` forces the picker either
+    # way, and `ast list` asks for the table at a terminal.
+    if not getattr(args, "cmd", None):
+        want_pick = getattr(args, "tui", False) or _stdio_is_interactive()
+        default_cmd = "pick" if want_pick else "list"
+        args = ap.parse_args([default_cmd])
+        args.skip_perm = skip_perm
+        args.hide_done = hide_done
+        # Re-parsing builds a fresh namespace, so carry the top-level --theme
+        # back (mirrors skip_perm/hide_done) — else `ast --tui --theme light`
+        # would silently drop the theme.
+        args.theme = theme
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
