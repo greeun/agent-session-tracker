@@ -1,6 +1,6 @@
 # agent-session-tracker
 
-로컬 코딩 에이전트 세션을 **상태(작업중/대기/유휴/종료/완료) 추적과 함께** 브라우징·검색·재개·내보내기·백업하는 도구입니다. Claude Code와 OpenAI Codex의 세션을 한 목록에서 함께 다룹니다. 터미널에서 `ast`를 실행하면 curses TUI가 열리고, 파이프나 리다이렉트로 넘기거나 스크립트에서 호출하면 표 형식 목록을 출력합니다.
+로컬 코딩 에이전트 세션을 **상태(작업중/대기/유휴/종료/완료) 추적과 함께** 브라우징·검색·재개·내보내기·백업하는 도구입니다. Claude Code, OpenAI Codex, ChatGPT 데스크톱 앱의 세션을 한 목록에서 함께 다룹니다. 터미널에서 `ast`를 실행하면 curses TUI가 열리고, 파이프나 리다이렉트로 넘기거나 스크립트에서 호출하면 표 형식 목록을 출력합니다.
 
 Claude Code만 추적하던 [`claude-session-tracker`](https://github.com/greeun/claude-session-tracker)(`cst`)의 포크입니다. 에이전트 CLI마다 `AgentSpec` 어댑터 하나가 공통 세션 모델에 연결되므로, 어느 에이전트가 만든 세션이든 모든 명령이 동일하게 동작하고 **AGENT** 열이 출처를 알려 줍니다. 원본이 `claude-sessions`에 더했던 기능은 그대로 유지합니다: `~/.claude/sessions/<pid>.json` 라이브 프로세스 레지스트리를 이용한 STATUS 컬럼, Claude Code 라이프사이클 훅을 이용한 정밀 오버레이, 사용자 주도 "done(완료)" 플래그, fzf 스타일 필터링. **Python stdlib만 사용 — 외부 의존성 없음, Python 3.10+.**
 
@@ -14,11 +14,11 @@ Claude Code는 모든 대화를 `~/.claude/projects/` 아래 `.jsonl` 트랜스�
 - "**내 입력을 기다리는** 세션은 어떤 거지?" (권한 결정 등)
 - "이미 끝낸 건 어떻게 표시해 두지?"
 - "2주 전에 인증 마이그레이션 세팅하던 세션 어디 갔지?"
-- "그 작업을 Claude Code에서 했던가, Codex에서 했던가?"
+- "그 작업을 Claude Code에서 했던가, Codex에서 했던가, ChatGPT에서 물어봤던가?"
 
 `ast`가 한 화면에서 다 해결합니다. Codex는 세션을 `~/.codex/sessions/` 아래에
-자체 형식으로 저장하기 때문에, 통합 브라우저가 없으면 두 군데를 각각 뒤져야
-합니다.
+자체 형식으로 저장하고, ChatGPT 데스크톱 앱도 대화를 같은 위치에 저장합니다.
+그래서 통합 브라우저가 없으면 두 군데를 각각 뒤져야 합니다.
 
 ---
 
@@ -35,7 +35,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. 확인
 ast --version
-# agent-session-tracker v1.0.0
+# agent-session-tracker v1.1.0
 
 # 4. (선택) 토큰 0짜리 done!/undone! 프롬프트 훅 + 상태 정밀 레이어 설치
 ast install-hook
@@ -88,7 +88,7 @@ ast export <id>               # 트랜스크립트를 ./<id>.md로 출력
 ast stats                     # 요약 (프로젝트·상태 분포)
 ast list --sort msgs          # 컬럼 정렬 (time|status|msgs|message|project; --reverse로 방향 반전)
 ast list --origin user        # 사용자가 시작한 세션만 (--origin agent는 SDK가 생성한 것만)
-ast list --agent codex        # 특정 에이전트 CLI의 세션만 (all|claude|codex; TUI `a` 키로 순환)
+ast list --agent chatgpt      # 특정 에이전트의 세션만 (all|claude|codex|chatgpt; TUI `a` 키로 순환)
 ast jobs                      # agent-view 백그라운드 세션 (claude --bg)
 ast --skip-perm --tui         # 재개 시 --dangerously-skip-permissions 자동 적용
 ast --theme light --tui       # TUI 색 테마 지정(auto|dark|light; `t`/`T`로 실시간 토글)
@@ -114,7 +114,7 @@ ast --theme light --tui       # TUI 색 테마 지정(auto|dark|light; `t`/`T`�
 
 ---
 
-## 멀티 에이전트: Codex CLI 세션
+## 멀티 에이전트: Codex CLI와 ChatGPT 앱 세션
 
 `ast`는 Claude 전용이 아닙니다. `tracker.py`는 에이전트 CLI마다
 `AgentSpec` 하나를 `AGENTS`에 등록하고(데이터 루트, 트랜스크립트 탐색, 공통
@@ -146,6 +146,32 @@ MESSAGE 열과 트랜스크립트에는 사람이 입력한 내용만 보입니�
 프롬프트 안에 적힌 경로는 메타데이터가 아니라 내용이기 때문입니다. 다음
 어댑터는 Gemini CLI입니다.
 
+### ChatGPT 데스크톱 앱
+
+ChatGPT 데스크톱 앱(`/Applications/ChatGPT.app`, 번들 ID `com.openai.codex`)은
+codex의 스레드 저장소를 그대로 사용합니다. 앱에서 나눈 대화는
+`$CODEX_HOME/sessions` 아래에 codex 형식의 일반 rollout으로 저장됩니다. `ast`는
+이 스레드를 별도의 **`chatgpt`** 에이전트로 표시하므로, `--agent chatgpt`나
+TUI `a` 키로 codex 작업과 나누어 볼 수 있습니다.
+
+구분 기준은 스레드를 만든 앱이 아니라, 스레드에 기록된 cwd입니다.
+
+| 기록된 cwd | 에이전트 |
+|:--|:--|
+| `~/Documents/Codex/<날짜>/<slug>`: 프로젝트 없이 시작한 대화 | `chatgpt` |
+| `$CODEX_HOME/.chatgpt-projects/<프로젝트 ID>`: ChatGPT 프로젝트 안의 대화 | `chatgpt` |
+| 그 밖의 경로(앱에서 실제 저장소를 열고 작업한 경우 포함) | `codex` |
+
+rollout의 `originator` 필드는 구분 기준으로 쓸 수 없습니다. 앱 빌드에 따라
+값이 바뀌었고(`Codex Desktop` → `codex_work_desktop`), 앱에서 저장소를 열고
+작업할 때에도 같은 값이 기록되기 때문입니다. 표시 이름을 제외한 나머지는 모두
+codex와 같습니다. 파싱, 재개(`codex resume <uuid>`), flock 기반 실행 감지,
+재배치, 서브에이전트, 백업이 codex 코드로 처리되며, 백업 멤버도 `codex/…`
+아래에 저장되므로 이전 빌드로도 복원할 수 있습니다. 표시 이름은 색인을 읽을
+때마다 다시 계산되므로, 업그레이드한 뒤에 재색인할 필요가 없습니다.
+chatgpt.com(웹·모바일)에만 있는 대화는 디스크에 rollout이 없으므로 목록에
+나타나지 않습니다.
+
 ---
 
 ## CLI 레퍼런스
@@ -166,17 +192,17 @@ MESSAGE 열과 트랜스크립트에는 사람이 입력한 내용만 보입니�
 ast list [--limit 30] [--cwd PREFIX] [--days N]
          [--status working|waiting|idle|ended|done|active]
          [--sort time|status|msgs|message|project] [--reverse]
-         [--origin all|user|agent] [--agent all|claude|codex] [--json]
+         [--origin all|user|agent] [--agent all|claude|codex|chatgpt] [--json]
 ```
 
 ```
-agent-session-tracker v1.0.0
-  #  ST  AGENT   LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
-  1  ●   claude  2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
-  2  !   claude  2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
-  3  ◦   codex   2026-05-24 01:15  019cb053    12  실패건을 해결하라.        ~/project/url-shortener
-  4  ✓   claude  2026-05-24 01:15  6a33a615    25  잔여 작업 내역을 커밋…    ~/project/csm
-  5  ○   claude  2026-05-23 21:24  afbd9e28   241  pnpm 적용 되어 있는가?    ~/project/url-shortener
+agent-session-tracker v1.1.0
+  #  ST  AGENT    LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
+  1  ●   claude   2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
+  2  !   claude   2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
+  3  ◦   codex    2026-05-24 01:15  019cb053    12  실패건을 해결하라.        ~/project/url-shortener
+  4  ✓   chatgpt  2026-05-24 01:15  01a07c61     4  서비스기획의 역할은?      ~/Documents/Codex/2026-05-24/new-chat
+  5  ○   claude   2026-05-23 21:24  afbd9e28   241  pnpm 적용 되어 있는가?    ~/project/url-shortener
 ```
 
 - 번호는 1부터, 1000개 이상 세션은 자동으로 컬럼 폭 확장
@@ -196,8 +222,8 @@ agent-session-tracker v1.0.0
   감추지 않는다. 명시적 `--origin`은 일회성이고, 플래그가 없으면 저장된 TUI
   설정(`f`/`F`)을 사용하며, 필터가 걸린 상태는 요약 줄에 `[origin:user]`로
   표시된다. `ast search`도 같은 플래그를 지원.
-- **에이전트:** `--agent all|claude|codex` (기본 `all`). 특정 에이전트 CLI의
-  세션만 보여 준다. 명시적 `--agent`는 일회성이고, 플래그가 없으면 TUI `a` 키가
+- **에이전트:** `--agent all|claude|codex|chatgpt` (기본 `all`). 특정 에이전트의
+  세션만 보여 준다(`chatgpt`는 ChatGPT 데스크톱 앱 대화이며, 위 설명 참고). 명시적 `--agent`는 일회성이고, 플래그가 없으면 TUI `a` 키가
   마지막으로 저장한 뷰를 사용하며, 요약 줄에 `[agent:codex]`로 표시된다.
   `ast search`와 `ast pick`도 같은 플래그를 지원.
 - **`--json`** — 테이블 대신 기계가 읽는 JSON으로 출력
@@ -207,7 +233,7 @@ agent-session-tracker v1.0.0
 ### `ast pick` / `--tui` — 인터랙티브 TUI
 
 ```bash
-ast pick [--cwd PREFIX] [--days N] [--agent all|claude|codex]
+ast pick [--cwd PREFIX] [--days N] [--agent all|claude|codex|chatgpt]
 ast --tui            # 동일
 ```
 
@@ -471,7 +497,7 @@ fzf 스타일 필터, 상태 글리프, 모달, 액션 키를 갖춘 curses 선�
 | **`H`** / **`h`** | hide-done 토글 — ✓ 행 숨김/표시 (`Ctrl-H`는 Backspace라 별칭 없음) |
 | **`C`** / **`c`** | cwd-only 토글 — TUI 실행 cwd 아래의 세션만 표시 (NFC-정규화 prefix 매치) |
 | **`R`** / **`r`** / **`Ctrl-R`** | 세션 목록 + 라이브 프로세스 레지스트리 재스캔. 재스캔이 진행되는 동안 하단 줄에 진행률이 표시됩니다 — `Rescanning… 42% (994/2370)`. 자동 재스캔도 같은 진행률을 표시하지만, 약 0.35초를 넘겨 실행될 때에만 나타납니다 (캐시가 이미 채워진 재스캔은 그 전에 끝나므로 표시되지 않습니다). |
-| **`a`** / **`A`** | 에이전트 뷰 순환: `all → claude → codex` (`A`는 역방향). `all`이 아닐 때 헤더에 `⚙codex` 표시. 저장되며 `ast list --agent`와 공유. |
+| **`a`** / **`A`** | 에이전트 뷰 순환: `all → claude → codex → chatgpt` (`A`는 역방향). `all`이 아닐 때 헤더에 `⚙codex` 표시. 저장되며 `ast list --agent`와 공유. |
 | **`i`** / **`I`** | 자동 재스캔 간격 팝업 (Off / 5 / 10 / 30 / 60 / 120초; 기본 ON 10초, `state.json`에 저장; 세션이 **새로** `!` 대기로 전이 시 `curses.beep()` + 고정 TUI 토스트 — macOS 데스크톱 알림 없음). 1.18 이전에는 `a` 키였음. |
 | **`s`** | 정렬 컬럼 순환 (화면 컬럼 순서대로): `status → time → msgs → message → project` (해당 컬럼의 자연 방향으로 리셋). 헤더에 `sort:<col>▼/▲` 표시 + 활성 컬럼 하이라이트. 저장됨. |
 | **`S`** | 현재 정렬 방향 반전. 저장됨. |
@@ -504,7 +530,7 @@ fzf 스타일 필터, 상태 글리프, 모달, 액션 키를 갖춘 curses 선�
 ### 헤더
 
 ```
- agent-session-tracker v1.0.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.1.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — 보이는 행 / 전체 세션 수
@@ -627,7 +653,7 @@ TUI에서 `Enter`를 누르면 **현재 쓰는 터미널 앱과 동일한 앱의
 | `~/.claude/settings.json` | Claude Code 설정 (cst가 훅 항목을 기록) | 아니오 — `ast uninstall-hook`로 ast 항목만 제거 |
 | `~/.claude/jobs/<short>/state.json` | agent-view 백그라운드 잡 상태 (읽기 전용) | 건드리지 말 것 |
 | `~/.claude/jobs/pins.json` | agent-view 핀 집합 (읽기 전용; cst는 쓰지 않음) | 건드리지 말 것 |
-| `$CODEX_HOME/sessions/**/rollout-*.jsonl` | Codex CLI 트랜스크립트 (기본 `~/.codex`; 읽기 전용) | 건드리지 말 것 |
+| `$CODEX_HOME/sessions/**/rollout-*.jsonl` | Codex CLI 트랜스크립트와 ChatGPT 데스크톱 앱 대화 (기본 `~/.codex`; 읽기 전용) | 건드리지 말 것 |
 | `$CODEX_HOME/thread-writer-locks/<uuid>.lock` | codex의 스레드별 writer 잠금 — cst는 flock 탐지로 실행 여부만 확인 (읽기 전용) | 건드리지 말 것 |
 | `~/.ast/index.json` | mtime/size 무효화 세션 메타 캐시 (스키마 6, 항목마다 `agent` 보유) | 예 (다음 실행 시 재생성) |
 | `~/.ast/state.json` | done 플래그 + 훅 상태 오버레이 + 사용자 설정(자동 재스캔·테마·정렬·생성 주체·에이전트 뷰) | 예 (모든 `✓` 마크·오버레이·설정 초기화) |
@@ -706,7 +732,7 @@ export AST_INDEX_DIR="$HOME/.cache/ast"
     "reverse": true
   },
   "origin": "all" | "user" | "agent",
-  "agent": "all" | "claude" | "codex"
+  "agent": "all" | "claude" | "codex" | "chatgpt"
 }
 ```
 
@@ -781,6 +807,8 @@ ast relocate <id> ~/project/actual-folder -y
 명령까지 확장했습니다.
 
 - codex 세션을 Claude Code 세션과 나란히 탐색·파싱·목록·검색·재개·재배치·백업·복원
+- ChatGPT 데스크톱 앱이 codex rollout 사이에 저장하는 대화를 별도의 `chatgpt`
+  에이전트로 표시함
 - 백업 아카이브가 에이전트별로 구분되고(`projects/…`, `codex/…`) manifest에 각
   세션의 에이전트가 기록됨. `cst`가 만든 아카이브도 그대로 복원됨
 - `ast relocate`는 codex 세션의 기록된 cwd를 제자리에서 재작성하고,
@@ -797,7 +825,7 @@ ast relocate <id> ~/project/actual-folder -y
 `ast`는 상위 집합. 모든 `claude-sessions` 서브커맨드 유지 + 추가:
 
 - **#** 번호 컬럼 + **ST** 글리프 컬럼 + **AGENT** 컬럼 + **PROJECT** 컬럼을 매 행에 표시
-- **멀티 에이전트:** Codex CLI 세션을 Claude 세션과 나란히 목록·검색·조회·내보내기·재개·상태 추적 (`--agent`, TUI `a`)
+- **멀티 에이전트:** Codex CLI 세션과 ChatGPT 데스크톱 앱 대화를 Claude 세션과 나란히 목록·검색·조회·내보내기·재개·상태 추적 (`--agent`, TUI `a`)
 - **`done`**, **`undone`**, **`live`**, **`export`**, **`bg`** / **`jobs`** / **`stop`** / **`logs`** (agent-view 백그라운드 세션), **`install-hook`** / **`uninstall-hook`** / **`prompt-hook`** / **`status-hook`** 서브커맨드
 - `ast list --sort time|status|msgs|message|project [--reverse]` 컬럼 정렬
 - `ast list --origin all|user|agent` (및 `ast search --origin`) — SDK가 생성한 세션을 숨기거나, 그것만 보기
