@@ -1,15 +1,16 @@
 ---
 name: agent-session-tracker
-description: Track live/waiting/ended/done status of Claude Code sessions — and Codex CLI sessions alongside them. List, search, resume, export, backup, restore sessions via `ast` CLI or TUI. Use when user says "list sessions", "세션 상태", "ast", "session tracker", "codex 세션", or wants to resume/search/export/backup sessions.
-version: 1.0.0
+description: Track live/waiting/ended/done status of Claude Code sessions — and Codex CLI sessions and ChatGPT desktop app conversations alongside them. List, search, resume, export, backup, restore sessions via `ast` CLI or TUI. Use when user says "list sessions", "세션 상태", "ast", "session tracker", "codex 세션", "chatgpt 세션", "ChatGPT 앱 대화", or wants to resume/search/export/backup sessions.
+version: 1.1.0
 ---
 
 # agent-session-tracker
 
 Tracks **every local coding-agent session in one place**. Forked from
 `claude-session-tracker` (itself a fork of `claude-sessions`), which tracked
-Claude Code alone; here an `AgentSpec` adapter per CLI (`claude`, `codex`;
-gemini planned) feeds one shared session model, so `list` / `search` / `show`
+Claude Code alone; here an `AgentSpec` adapter per CLI (`claude`, `codex`,
+plus `chatgpt` for the ChatGPT desktop app's threads in codex's store; gemini
+planned) feeds one shared session model, so `list` / `search` / `show`
 / `export` / `resume` / `done` / `relocate` / `backup` / `restore` / TUI work
 the same for every agent and an **AGENT** column says which one wrote each
 session. On top of the original: live status tracking, a precision hook
@@ -28,7 +29,7 @@ process is ended/job-state; a live one resolves overlay → registry → `●`):
   in TUI, `ast done <id>`, or the `done!` prompt hook). Persists in
   `~/.ast/state.json`.
 
-Main script: `tracker.py` (stdlib only, Python 3.10+, v1.0.0). Installed as
+Main script: `tracker.py` (stdlib only, Python 3.10+, v1.1.0). Installed as
 `~/.local/bin/ast`. All `~/.claude/...` data paths honor `$CLAUDE_CONFIG_DIR`
 (same convention as Claude Code itself) and `~/.codex/...` honors
 `$CODEX_HOME` (Codex's own convention); ast's own files live under `~/.ast`
@@ -59,6 +60,7 @@ hook sets is possible but redundant — each writes its own home, so pick one.
 - "세션 검색해서 새 창에서 이어서 작업"
 - "트랜스크립트 파일로 내보내줘" / "export 세션"
 - "코덱스 세션도 같이 보여줘" / "어제 codex로 뭐 했지"
+- "ChatGPT 앱에서 물어본 대화 찾아줘" / "chatgpt 세션만 보여줘"
 - Anything `cst` / `claude-sessions` did — list / search / show / resume /
   backup / restore / relocate / stats / subagents — `ast` is a drop-in
   superset that also covers Codex.
@@ -90,11 +92,12 @@ ast list --origin user    # who started it: all(default)|user|agent
                           #   user  = typed in a terminal (agent-view bg jobs included)
                           #   agent = SDK-spawned (security-review hooks, claude -p, tooling)
                           #   no --origin uses the saved TUI origin pref; same flag on `search`
-ast list --agent codex    # one agent CLI's sessions: all(default)|claude|codex
+ast list --agent codex    # one agent's sessions: all(default)|claude|codex|chatgpt
+                          #   chatgpt = ChatGPT desktop app conversations (see Multi-agent)
                           #   no --agent uses the view the TUI `a` key last saved;
                           #   same flag on `search` and `pick`; summary shows [agent:codex]
 ast list --json           # machine-readable JSON instead of the table (cst.app contract;
-                          #   each session carries "agent": "claude"|"codex")
+                          #   each session carries "agent": "claude"|"codex"|"chatgpt")
 ast search "<query>"      # full-text transcript search (OR via `|`, -i = ignore case)
 ast show <id>             # transcript with Status header (--max-chars, --with-subagents;
                           #   --head-chars N caps TOTAL output & stops reading early — fast preview)
@@ -231,7 +234,7 @@ stale `!` self-heals to `◦` to avoid a stuck state.
   transcript scan: `Rescanning… 42% (994/2370)`. An auto-rescan tick shows
   the same counter, but only once it has run past ~0.35s, so a warm scan
   stays silent.
-- **`a`** — cycle the agent view (all→claude→codex) · **`A`** — cycle
+- **`a`** — cycle the agent view (all→claude→codex→chatgpt) · **`A`** — cycle
   backwards. Header shows `⚙codex` when not `all`; the last view is saved in
   `state.json` and reused by `ast list` / `ast search` without `--agent`.
 - **`i` / `I`** — auto-rescan interval popup (Off / 5 / 10 / 30 / 60 / 120s;
@@ -270,7 +273,7 @@ stale `!` self-heals to `◦` to avoid a stuck state.
 (workspace tab vs new window) · orphan-relocate (confirm/pick/none stages
 with manual-entry and placeholder escape hatches).
 
-## Multi-agent (codex)
+## Multi-agent (codex, chatgpt)
 
 `tracker.py` keeps one `AgentSpec` per CLI in `AGENTS` (data root, transcript
 discovery + parsing into `Turn`s, resume argv, live probe, capability set).
@@ -300,10 +303,24 @@ every `turn_context`, the `world_state` snapshot and matching
 path inside a prompt is content, not metadata. Gemini CLI is the next adapter (its `~/.gemini/tmp/<project>/chats`
 JSONL format is already researched, not yet wired in).
 
+**chatgpt** — the ChatGPT desktop app (`/Applications/ChatGPT.app`, bundle id
+`com.openai.codex`) stores its conversations as ordinary codex rollouts in
+`$CODEX_HOME/sessions`. They are listed as agent `chatgpt` when the recorded
+cwd is one of the app's own workspace dirs — `~/Documents/Codex/<date>/<slug>`
+(a chat without a project) or `$CODEX_HOME/.chatgpt-projects/<id>` (a ChatGPT
+project) — and as `codex` otherwise, including a real repository opened in the
+app. `originator` is not the key: it changed between app builds and is the same
+for repository work. Everything but the label is codex's: resume is
+`codex resume <uuid>`, status comes from the same flock probe, relocate /
+subagents / backup (members under `codex/…`) behave as in the codex column.
+Conversations that exist only on chatgpt.com (web / mobile) are not on disk and
+are not listed. To find a ChatGPT chat: `ast search "<text>" --agent chatgpt`.
+
 ## Differences from claude-session-tracker (cst)
 
 - **Codex sessions are first-class**: discovered, parsed, listed, searched,
   resumed, relocated, archived and restored next to Claude Code sessions
+- **ChatGPT desktop app conversations** get their own `chatgpt` agent
 - Backup tarballs group members by agent (`projects/…`, `codex/…`) and the
   manifest records each session's agent; `cst`-era archives still restore
 - Data home is `~/.ast` (`$AST_HOME`), seeded once from `~/.cst/state.json`
@@ -362,10 +379,12 @@ relocate with cwd rewrite, interactive delete, multi-select marks.
   (working/waiting/idle resolved from the hook overlay, else the registry).
 - `~/.claude/settings.json` — ast's hook entries live here under `hooks`.
 - `$CODEX_HOME/sessions/**/rollout-*.jsonl` (default `~/.codex`) — Codex CLI
-  transcripts; `$CODEX_HOME/thread-writer-locks/<uuid>.lock` — flock held by a
+  transcripts and ChatGPT desktop app conversations;
+  `$CODEX_HOME/thread-writer-locks/<uuid>.lock` — flock held by a
   live codex thread (ast probes it, never writes it).
 - `~/.ast/index.json` (`$AST_INDEX_DIR/index.json` when set) —
-  mtime/size-invalidated indexing cache (schema 6; entries carry `agent`). Safe
+  mtime/size-invalidated indexing cache (schema 6; entries carry `agent`, which
+  is re-derived from the cached cwd on read for codex/chatgpt). Safe
   to delete — but it is what keeps a listing fast: a warm cache answers in
   milliseconds, while rebuilding it from scratch re-reads every transcript.
   Commands that move or overwrite a transcript (`relocate`, `restore`) drop only
@@ -373,7 +392,7 @@ relocate with cwd rewrite, interactive delete, multi-select marks.
 - `~/.cst/state.json` — read once on first run to seed `~/.ast/state.json`,
   never written.
 - `~/.ast/state.json` — overlay storing
-  `{done: {sid: ts}, status: {sid: {state, event, ts}}, auto_rescan: {enabled, interval}, theme: "auto"|"dark"|"light", sort: {key, reverse}, origin: "all"|"user"|"agent", agent: "all"|"claude"|"codex"}`.
+  `{done: {sid: ts}, status: {sid: {state, event, ts}}, auto_rescan: {enabled, interval}, theme: "auto"|"dark"|"light", sort: {key, reverse}, origin: "all"|"user"|"agent", agent: "all"|"claude"|"codex"|"chatgpt"}`.
   Safe to delete (clears all ✓ marks, status overlay, auto-rescan / theme /
   sort / origin / agent-view prefs).
 - `~/.claude/jobs/pins.json` — agent-view pin set (read-only; ast never writes).

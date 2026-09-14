@@ -1,6 +1,6 @@
 # agent-session-tracker
 
-Browse, search, resume, export, back up, and **track the live/waiting/ended/done status** of every local coding-agent session — Claude Code and OpenAI Codex in one list. Run `ast` in a terminal and the curses TUI opens; pipe or redirect it, or call it from a script, and you get the table instead.
+Browse, search, resume, export, back up, and **track the live/waiting/ended/done status** of every local coding-agent session — Claude Code, OpenAI Codex and the ChatGPT desktop app in one list. Run `ast` in a terminal and the curses TUI opens; pipe or redirect it, or call it from a script, and you get the table instead.
 
 A fork of [`claude-session-tracker`](https://github.com/greeun/claude-session-tracker) (`cst`), which tracked Claude Code alone. One `AgentSpec` adapter per agent CLI feeds a single session model, so every command works the same whichever agent wrote the session, and an AGENT column says which one did. Everything `cst` added over `claude-sessions` is kept: a STATUS column driven by the `~/.claude/sessions/<pid>.json` live-process registry, a precision overlay from Claude Code lifecycle hooks, a user-driven "task done" flag, and an fzf-style filter experience. **Stdlib-only, zero dependencies, Python 3.10+.**
 
@@ -14,11 +14,12 @@ Claude Code stores every conversation as a `.jsonl` transcript under `~/.claude/
 - "Which one is **waiting on me** for a permission decision?"
 - "Which ones did I finish and can ignore?"
 - "Where's that session from two weeks ago that set up the auth migration?"
-- "Was that in Claude Code or in Codex?"
+- "Was that in Claude Code, in Codex, or in a ChatGPT chat?"
 
 `ast` answers all five in one view with zero dependencies. Codex keeps its
-sessions in `~/.codex/sessions/` in a format of its own, so without a single
-browser you end up searching two places by hand.
+sessions in `~/.codex/sessions/` in a format of its own — and the ChatGPT
+desktop app writes its conversations there too — so without a single browser
+you end up searching two places by hand.
 
 ---
 
@@ -35,7 +36,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. Verify
 ast --version
-# agent-session-tracker v1.0.0
+# agent-session-tracker v1.1.0
 
 # 4. (optional) wire the 0-token done!/undone! prompt hook + status precision layer
 ast install-hook
@@ -87,7 +88,7 @@ ast export <id>               # write transcript to ./<id>.md
 ast stats                     # counts, top projects, status breakdown
 ast list --sort msgs          # sort by a column (time|status|msgs|message|project; --reverse flips)
 ast list --origin user        # only sessions you started (--origin agent = SDK-spawned)
-ast list --agent codex        # one agent CLI's sessions (all|claude|codex; TUI `a` cycles)
+ast list --agent chatgpt      # one agent's sessions (all|claude|codex|chatgpt; TUI `a` cycles)
 ast jobs                      # agent-view background sessions (claude --bg)
 ast --skip-perm --tui         # auto-apply --dangerously-skip-permissions on resume
 ast --theme light --tui       # force a TUI color theme (auto|dark|light; `t`/`T` toggles live)
@@ -113,7 +114,7 @@ Status is **computed fresh on every command invocation** — there is no backgro
 
 ---
 
-## Multi-agent: Codex CLI sessions
+## Multi-agent: Codex CLI and ChatGPT app sessions
 
 Since 1.18 `ast` is not Claude-only. `tracker.py` keeps one `AgentSpec` per
 agent CLI in `AGENTS` — data root, transcript discovery, parsing into a shared
@@ -145,6 +146,31 @@ in `session_meta`, every `turn_context`, the `world_state` snapshot and any
 alone, since a path inside a prompt is content rather than metadata. Gemini
 CLI is the next adapter.
 
+### ChatGPT desktop app
+
+The ChatGPT desktop app (`/Applications/ChatGPT.app`, bundle id
+`com.openai.codex`) runs on codex's thread store: a conversation there is an
+ordinary rollout under `$CODEX_HOME/sessions`, in the codex format. `ast` lists
+those threads under their own **`chatgpt`** agent, so `--agent chatgpt` and the
+TUI `a` key separate them from codex work.
+
+The split follows the cwd the thread was recorded in, not the app that wrote it:
+
+| Recorded cwd | Agent |
+|:--|:--|
+| `~/Documents/Codex/<date>/<slug>` — a chat without a project | `chatgpt` |
+| `$CODEX_HOME/.chatgpt-projects/<project-id>` — a chat inside a ChatGPT project | `chatgpt` |
+| Anything else, including a real repository opened in the app | `codex` |
+
+The rollout's `originator` looks like the obvious key but is not usable: it
+changed between app builds (`Codex Desktop` → `codex_work_desktop`) and stays
+the same when the app works on a repository. Everything below the label is
+codex's — parsing, resume (`codex resume <uuid>`), the flock live probe,
+relocate, subagents and backup (members stay under `codex/…`, so archives
+remain restorable by earlier builds). The label is re-derived whenever the
+index is read, so upgrading needs no re-index. Conversations that exist only on
+chatgpt.com (web or mobile) have no rollout on disk and are not listed.
+
 ---
 
 ## CLI reference
@@ -165,17 +191,17 @@ CLI is the next adapter.
 ast list [--limit 30] [--cwd PREFIX] [--days N]
          [--status working|waiting|idle|ended|done|active]
          [--sort time|status|msgs|message|project] [--reverse]
-         [--origin all|user|agent] [--agent all|claude|codex] [--json]
+         [--origin all|user|agent] [--agent all|claude|codex|chatgpt] [--json]
 ```
 
 ```
-agent-session-tracker v1.0.0
-  #  ST  AGENT   LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
-  1  ●   claude  2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
-  2  !   claude  2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
-  3  ◦   codex   2026-05-24 01:15  019cb053    12  실패건을 해결하라.        ~/project/url-shortener
-  4  ✓   claude  2026-05-24 01:15  6a33a615    25  잔여 작업 내역을 커밋…    ~/project/csm
-  5  ○   claude  2026-05-23 21:24  afbd9e28   241  pnpm 적용 되어 있는가?    ~/project/url-shortener
+agent-session-tracker v1.1.0
+  #  ST  AGENT    LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
+  1  ●   claude   2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
+  2  !   claude   2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
+  3  ◦   codex    2026-05-24 01:15  019cb053    12  실패건을 해결하라.        ~/project/url-shortener
+  4  ✓   chatgpt  2026-05-24 01:15  01a07c61     4  서비스기획의 역할은?      ~/Documents/Codex/2026-05-24/new-chat
+  5  ○   claude   2026-05-23 21:24  afbd9e28   241  pnpm 적용 되어 있는가?    ~/project/url-shortener
 ```
 
 - Row numbers start at 1; column auto-expands for 1000+ sessions.
@@ -197,8 +223,8 @@ agent-session-tracker v1.0.0
   one-off; with no flag the saved TUI preference (`f`/`F`) is used, and an
   active filter is announced as `[origin:user]` in the summary line. The same
   flag works on `ast search`.
-- **Agent:** `--agent all|claude|codex` (default `all`) shows one agent CLI's
-  sessions. An explicit `--agent` is a one-off; with no flag the view the TUI
+- **Agent:** `--agent all|claude|codex|chatgpt` (default `all`) shows one
+  agent's sessions (`chatgpt` = ChatGPT desktop app conversations, see above). An explicit `--agent` is a one-off; with no flag the view the TUI
   `a` key last saved is used, announced as `[agent:codex]` in the summary
   line. Same flag on `ast search` and `ast pick`.
 - **`--json`** emits the list as machine-readable JSON instead of the table
@@ -208,7 +234,7 @@ agent-session-tracker v1.0.0
 ### `ast pick` / `--tui` — interactive TUI
 
 ```bash
-ast pick [--cwd PREFIX] [--days N] [--agent all|claude|codex]
+ast pick [--cwd PREFIX] [--days N] [--agent all|claude|codex|chatgpt]
 ast --tui            # equivalent
 ```
 
@@ -476,7 +502,7 @@ A curses picker with fzf-style filter, status glyphs, modals, and action keys. *
 | **`H`** / **`h`** | Toggle hide-done — hide/show ✓ rows (no `Ctrl-H` alias — that's Backspace) |
 | **`C`** / **`c`** | Toggle cwd-only — show only sessions under the TUI's launch cwd (NFC-normalized prefix match) |
 | **`R`** / **`r`** / **`Ctrl-R`** | Rescan sessions + live-process registry. The footer counts the scan while it runs — `Rescanning… 42% (994/2370)`. An auto-rescan tick shows the same counter once it has run past ~0.35s (a warm, fully-cached scan finishes before that and stays silent). |
-| **`a`** / **`A`** | Cycle the agent view: `all → claude → codex` (`A` backwards). Header shows `⚙codex` when not `all`. Persisted, shared with `ast list --agent`. |
+| **`a`** / **`A`** | Cycle the agent view: `all → claude → codex → chatgpt` (`A` backwards). Header shows `⚙codex` when not `all`. Persisted, shared with `ast list --agent`. |
 | **`i`** / **`I`** | Auto-rescan interval popup (Off / 5 / 10 / 30 / 60 / 120s; default ON 10s, persisted in `state.json`; `curses.beep()` + a sticky TUI toast when a session newly enters `!` waiting — no macOS desktop notification). Was `a` before 1.18. |
 | **`s`** | Cycle sort column in on-screen column order: `status → time → msgs → message → project` (resets to the column's natural direction). Header shows `sort:<col>▼/▲` and highlights the active column. Persisted. |
 | **`S`** | Reverse the current sort direction. Persisted. |
@@ -509,7 +535,7 @@ A cursor appears on the prompt line. Live filtering happens as you type.
 ### Header bar
 
 ```
- agent-session-tracker v1.0.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.1.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — visible rows / total sessions
@@ -632,7 +658,7 @@ Equivalent manual entry (one event shown):
 | `~/.claude/settings.json` | Claude Code settings (ast writes hook entries here) | No — `ast uninstall-hook` only removes ast entries |
 | `~/.claude/jobs/<short>/state.json` | Agent-view background-job state (read-only) | Leave alone |
 | `~/.claude/jobs/pins.json` | Agent-view pin set (read-only; ast never writes) | Leave alone |
-| `$CODEX_HOME/sessions/**/rollout-*.jsonl` | Codex CLI transcripts (default `~/.codex`; read-only) | Leave alone |
+| `$CODEX_HOME/sessions/**/rollout-*.jsonl` | Codex CLI transcripts, plus the ChatGPT desktop app's conversations (default `~/.codex`; read-only) | Leave alone |
 | `$CODEX_HOME/thread-writer-locks/<uuid>.lock` | Codex's per-thread writer lock — ast probes the flock for liveness (read-only) | Leave alone |
 | `~/.ast/index.json` | mtime/size-invalidated session-metadata cache (schema 6, entries carry `agent`) | Yes — regenerates on next run |
 | `~/.ast/state.json` | done flags + hook status overlay + user prefs (auto-rescan, theme, sort, origin, agent view) | Yes — clears all `✓` marks, overlay, and prefs |
@@ -712,7 +738,7 @@ existing install and no warm cache is thrown away.
     "reverse": true
   },
   "origin": "all" | "user" | "agent",
-  "agent": "all" | "claude" | "codex"
+  "agent": "all" | "claude" | "codex" | "chatgpt"
 }
 ```
 
@@ -789,6 +815,8 @@ data commands:
 
 - Codex sessions are discovered, parsed, listed, searched, resumed, relocated,
   archived and restored alongside Claude Code ones
+- ChatGPT desktop app conversations, which the app stores among codex's
+  rollouts, are listed as their own `chatgpt` agent
 - Backup tarballs group members per agent (`projects/…`, `codex/…`) and the
   manifest records each session's agent; archives written by `cst` still
   restore unchanged
@@ -807,7 +835,7 @@ to `~/.claude/projects`).
 `ast` is a superset. Every `claude-sessions` subcommand is preserved, plus:
 
 - **#** row-number column + **ST** glyph column + **AGENT** column + **PROJECT** column on every row
-- **Multi-agent:** Codex CLI sessions listed, searched, shown, exported, resumed and status-tracked next to Claude's (`--agent`, TUI `a`)
+- **Multi-agent:** Codex CLI sessions and ChatGPT desktop app conversations listed, searched, shown, exported, resumed and status-tracked next to Claude's (`--agent`, TUI `a`)
 - **`done`**, **`undone`**, **`live`**, **`export`**, **`bg`** / **`jobs`** / **`stop`** / **`logs`** (agent-view background sessions), **`install-hook`** / **`uninstall-hook`** / **`prompt-hook`** / **`status-hook`** subcommands
 - `ast list --sort time|status|msgs|message|project [--reverse]` column sort
 - `ast list --origin all|user|agent` (and `ast search --origin`) — hide SDK-spawned sessions, or show only those
