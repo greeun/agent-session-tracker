@@ -15,7 +15,7 @@ Data sources:
 """
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 import argparse
 import json
@@ -642,6 +642,143 @@ def _codex_subagents_of(parent_path: Path) -> list[tuple[Path, dict]]:
 def _chatgpt_workspace_roots() -> tuple[Path, ...]:
     return (Path.home() / "Documents" / "Codex",
             CODEX_HOME / ".chatgpt-projects")
+
+
+def _codex_available() -> bool:
+    """True when a `codex` CLI is on PATH (isolated for tests)."""
+    import shutil
+    return shutil.which("codex") is not None
+
+
+def _run_codex(argv: list[str]) -> int:
+    """Run the real `codex` CLI quietly; its exit code, or 1 if it cannot be
+    launched. Isolated so restore's registration step is unit-testable."""
+    import shutil
+    import subprocess
+    codex = shutil.which("codex") or "codex"
+    try:
+        return subprocess.run([codex, *argv], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              env={**os.environ, "CODEX_HOME": str(CODEX_HOME)}).returncode
+    except OSError as e:
+        print(f"[ast] failed to run 'codex {' '.join(argv)}': {e}", file=sys.stderr)
+        return 1
+
+
+def _codex_state_db() -> "Path | None":
+    """codex's thread index (`state_<n>.sqlite`, the highest n), or None when
+    no state DB exists yet — codex then builds one from the rollouts itself
+    on its next start."""
+    best: "tuple[int, Path] | None" = None
+    try:
+        for cand in CODEX_HOME.glob("state_*.sqlite"):
+            m = re.match(r"^state_(\d+)\.sqlite$", cand.name)
+            if m and (best is None or int(m.group(1)) > best[0]):
+                best = (int(m.group(1)), cand)
+    except OSError:
+        return None
+    return best[1] if best else None
+
+
+def _path_prefix_swap(path: str, old_root: str, new_root: str) -> "str | None":
+    """`path` with `old_root` replaced by `new_root` when `path` is `old_root`
+    or lies below it (whole components only); None when it is not."""
+    if not old_root or not new_root or old_root == new_root:
+        return None
+    old_root = old_root.rstrip("/") or "/"
+    if path == old_root:
+        return new_root
+    if path.startswith(old_root + "/"):
+        return new_root.rstrip("/") + path[len(old_root):]
+    return None
+
+
+def remap_source_cwd(cwd: str, source: "dict | None") -> str:
+    """The cwd a rollout should carry on *this* machine.
+
+    A backup's manifest records the `source` machine's home and CODEX_HOME;
+    a cwd below either is moved under the local equivalent, so a ChatGPT
+    project mirror (`$CODEX_HOME/.chatgpt-projects/<id>`) or a projectless
+    chat (`~/Documents/Codex/…`) lines up with the app here even when the
+    user name differs. Archives without `source` fall back to the shape of
+    those two paths. Anything else is returned unchanged."""
+    if not cwd:
+        return cwd
+    if source:
+        for old, new in ((str(source.get("codex_home") or ""), str(CODEX_HOME)),
+                         (str(source.get("home") or ""), str(Path.home()))):
+            swapped = _path_prefix_swap(cwd, old, new)
+            if swapped is not None:
+                return swapped
+        return cwd
+    for marker, new_root in (("/.codex/", str(CODEX_HOME)),
+                             ("/Documents/Codex/", str(Path.home() / "Documents" / "Codex"))):
+        i = cwd.find(marker)
+        if i > 0:
+            return new_root.rstrip("/") + "/" + cwd[i + len(marker):]
+    return cwd
+
+
+def _codex_register_threads(sids: list[str], names: dict[str, str],
+                            parents: list[str]) -> "tuple[int, str | None]":
+    """Give codex / the ChatGPT app a `threads` row for each restored rollout.
+
+    Codex lists threads from its state DB and does not rescan the sessions
+    dir once that DB exists, so a copied rollout stays invisible. Looking a
+    thread up by id (`codex archive` then `codex unarchive`) makes codex
+    read-repair the row from the rollout; archiving a parent also archives
+    its spawned children, so every restored id that ends up archived is
+    unarchived afterwards. A manifest `thread_name` fills an empty `name`.
+    Returns (rows registered, note) — the note explains a skipped step."""
+    import sqlite3
+    db = _codex_state_db()
+    if db is None:
+        return 0, ("codex state DB not found; codex will index the rollouts "
+                   "itself on its next start")
+    if not _codex_available():
+        cmds = "; ".join(f"codex archive {sid} && codex unarchive {sid}" for sid in parents)
+        return 0, ("`codex` is not on PATH — register the thread(s) by hand: " + cmds)
+
+    def _rows() -> dict[str, tuple[int, str]]:
+        con = sqlite3.connect(db)
+        try:
+            q = ",".join("?" * len(sids))
+            return {r[0]: (int(r[1] or 0), r[2] or "") for r in con.execute(
+                f"select id, archived, name from threads where id in ({q})", sids)}
+        except sqlite3.Error as e:
+            raise OSError(f"cannot read {db}: {e}")
+        finally:
+            con.close()
+
+    before = _rows()
+    missing = [s for s in parents if s not in before] + \
+              [s for s in sids if s not in before and s not in parents]
+    for sid in missing:
+        if sid in _rows():
+            continue            # a parent's archive already pulled it in
+        _run_codex(["archive", sid])
+        _run_codex(["unarchive", sid])
+    after = _rows()
+    for sid, (archived, _) in after.items():
+        if archived and (sid not in before or not before[sid][0]):
+            _run_codex(["unarchive", sid])
+    after = _rows()
+    registered = len([s for s in after if s not in before])
+    to_name = [(names[s], s) for s, (_, nm) in after.items() if not nm and names.get(s)]
+    if to_name:
+        con = sqlite3.connect(db)
+        try:
+            con.executemany("update threads set name=? where id=? and (name is null or name='')",
+                            to_name)
+            con.commit()
+        except sqlite3.Error as e:
+            return registered, f"could not set thread name(s) in {db.name}: {e}"
+        finally:
+            con.close()
+    still_missing = [s for s in sids if s not in after]
+    note = (f"{len(still_missing)} thread(s) not registered: " + ", ".join(s[:8] for s in still_missing)
+            if still_missing else None)
+    return registered, note
 
 
 def _codex_listed_as(cwd: str) -> str:
@@ -7420,6 +7557,9 @@ def cmd_backup(args: argparse.Namespace) -> int:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "cutoff": cutoff.isoformat() if cutoff is not None else None,
         "selection": {"ids": ids, "filter": needle} if explicit else None,
+        # Where the archive was written, so a restore on another machine can
+        # move codex cwds under that machine's home / CODEX_HOME.
+        "source": {"home": str(Path.home()), "codex_home": str(CODEX_HOME)},
         "count": len(old),
         "sessions": [
             {
@@ -7644,6 +7784,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
         errors = 0
         titled = 0
         touched: "set[Path]" = set()
+        codex_written: list[tuple[Path, str]] = []   # (dest, member name)
         for i, (m, dest, action) in enumerate(plans, 1):
             if action == "skip":
                 skipped += 1
@@ -7665,6 +7806,8 @@ def cmd_restore(args: argparse.Namespace) -> int:
                         out.write(chunk)
                 written += 1
                 touched.add(dest)
+                if archive_spec_for_member(m.name) is CODEX_AGENT and dest.suffix == ".jsonl":
+                    codex_written.append((dest, m.name))
                 entry = manifest_by_member.get(m.name)
                 if entry and entry.get("thread_name") and \
                         archive_spec_for_member(m.name) is CODEX_AGENT:
@@ -7688,13 +7831,43 @@ def cmd_restore(args: argparse.Namespace) -> int:
         # Only the restored transcripts need re-reading. A restore that
         # rewrites a handful of sessions out of thousands used to throw the
         # whole index away, which made the next listing a full cold scan.
+        # --- codex / ChatGPT-app follow-up: cwd on this machine, then a row
+        # in codex's thread index (see remap_source_cwd / _codex_register_threads).
+        remapped = 0
+        registered = 0
+        reg_note: str | None = None
+        if codex_written:
+            source = (manifest or {}).get("source") if manifest else None
+            if not getattr(args, "keep_cwd", False):
+                for dest, _name in codex_written:
+                    old_cwd = str(_codex_read_session_meta(dest).get("cwd") or "")
+                    new_cwd = remap_source_cwd(old_cwd, source)
+                    if new_cwd != old_cwd:
+                        _rewrite_cwd_inplace(dest, new_cwd, _codex_rewrite_event_cwd, old_cwd)
+                        remapped += 1
+            if not getattr(args, "no_register", False):
+                sids = [_codex_session_id_of(d) for d, _ in codex_written]
+                parents = [s for s in sids if any(
+                    (manifest_by_member.get(n) or {}).get("session_id") == s
+                    for _, n in codex_written)]
+                names = {str(e.get("session_id")): str(e["thread_name"])
+                         for e in manifest_by_member.values()
+                         if e.get("thread_name") and e.get("session_id")}
+                try:
+                    registered, reg_note = _codex_register_threads(sids, names, parents)
+                except OSError as e:
+                    reg_note = str(e)
         invalidate_cache_entries(touched)
 
         print(f"✓ Restored {written} file(s)" +
+              (f", {remapped} cwd(s) moved under this machine's home" if remapped else "") +
+              (f", registered {registered} thread(s) with codex" if registered else "") +
               (f", skipped {skipped}" if skipped else "") +
               (f", {titled} thread name(s) added to session index" if titled else "") +
               (f", {unsafe} unsafe" if unsafe else "") +
               (f", {errors} error(s)" if errors else ""))
+        if reg_note:
+            print(f"  note: {reg_note}")
         return 1 if (errors or unsafe) else 0
     finally:
         tar.close()
@@ -7934,6 +8107,13 @@ def _build_parser() -> argparse.ArgumentParser:
                            default="skip")
     p_restore.add_argument("--dry-run", action="store_true")
     p_restore.add_argument("-y", "--yes", action="store_true")
+    p_restore.add_argument("--keep-cwd", dest="keep_cwd", action="store_true",
+                           help="leave codex rollout cwds as recorded on the "
+                                "source machine instead of moving them under "
+                                "this machine's home / CODEX_HOME")
+    p_restore.add_argument("--no-register", dest="no_register", action="store_true",
+                           help="do not run `codex archive`/`unarchive` to add "
+                                "restored threads to codex's state DB")
     p_restore.set_defaults(func=cmd_restore)
 
     p_stats = sub.add_parser("stats", help="summary stats")

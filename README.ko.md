@@ -35,7 +35,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. 확인
 ast --version
-# agent-session-tracker v1.2.0
+# agent-session-tracker v1.3.0
 
 # 4. (선택) 토큰 0짜리 done!/undone! 프롬프트 훅 + 상태 정밀 레이어 설치
 ast install-hook
@@ -196,7 +196,7 @@ ast list [--limit 30] [--cwd PREFIX] [--days N]
 ```
 
 ```
-agent-session-tracker v1.2.0
+agent-session-tracker v1.3.0
   #  ST  AGENT    LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
   1  ●   claude   2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
   2  !   claude   2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
@@ -372,6 +372,15 @@ ast restore ~/.ast/backups/sessions-20260524.tar.gz --on-conflict rename -y
 
 `restore` 충돌 정책: `skip`(기본) · `overwrite` · `rename` (`<id>.restored-<ts>.jsonl`로 저장).
 
+#### codex / ChatGPT 앱 스레드를 다른 컴퓨터에서 복원할 때
+
+롤아웃 파일을 복사하는 것만으로는 ChatGPT 데스크톱 앱(그리고 `codex resume` 선택 화면)에 그 대화가 나타나지 않습니다. codex는 상태 DB(`$CODEX_HOME/state_<n>.sqlite`)에서 스레드 목록을 읽고, 그 DB가 이미 있으면 sessions 폴더를 다시 훑지 않습니다. 또 롤아웃에 기록된 cwd는 원본 컴퓨터의 `/Users/<user>/.codex/.chatgpt-projects/<id>`라서, 사용자 이름이 다른 컴퓨터의 프로젝트 폴더와 맞지 않습니다. 그래서 `restore`는 codex 롤아웃을 쓴 뒤 두 단계를 더 수행합니다.
+
+1. **cwd를 이 컴퓨터 기준으로 이동.** manifest의 `source`(백업한 컴퓨터의 home과 `CODEX_HOME`)를 현재 값으로 바꿔 codex가 cwd를 기록한 모든 자리에 반영합니다. 프로젝트 대화는 `$CODEX_HOME/.chatgpt-projects/<id>` 아래로, 프로젝트 없는 대화는 `~/Documents/Codex/…` 아래로 옮겨집니다. `source`가 없는 아카이브(v1.2.0)는 이 두 경로의 모양으로 추정합니다. `--keep-cwd`로 끌 수 있습니다.
+2. **codex 상태 DB에 행 등록.** 행이 없는 복원 스레드마다 `codex archive <id>` 뒤 `codex unarchive <id>`를 실행해 codex가 롤아웃에서 행을 다시 만들게 합니다. 부모와 함께 보관 처리된 하위 스레드는 다시 unarchive하고, manifest의 `thread_name`으로 빈 `name`을 채웁니다. `--no-register`로 끌 수 있습니다. `codex`가 PATH에 없으면 실행할 명령을 대신 출력하고, 상태 DB가 아직 없으면 codex가 다음 실행 때 롤아웃에서 직접 만듭니다.
+
+실제 `~/.codex`에 복원할 때는 ChatGPT 앱을 먼저 종료하고, 복원 후 다시 실행하세요.
+
 ### `ast relocate <id> <new-cwd>` — cwd 수정
 
 ```bash
@@ -542,7 +551,7 @@ fzf 스타일 필터, 상태 글리프, 모달, 액션 키를 갖춘 curses 선�
 ### 헤더
 
 ```
- agent-session-tracker v1.2.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.3.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — 보이는 행 / 전체 세션 수
