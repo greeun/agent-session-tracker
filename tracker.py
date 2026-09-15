@@ -15,7 +15,7 @@ Data sources:
 """
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import json
@@ -26,7 +26,7 @@ import sys
 import tarfile
 import unicodedata
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator
@@ -265,6 +265,11 @@ class AgentSpec:
     # folders when relocating an orphaned session. Each agent records tool
     # calls differently, so the extraction lives with the agent.
     file_fingerprint: "Callable[..., set] | None" = None
+    # A store more than one app writes to: (cwd) -> the AGENTS key a
+    # transcript is listed under (the ChatGPT desktop app keeps its threads
+    # among codex's). The owning spec still reads, relocates and archives the
+    # file; only the label and the `--agent` view move. None = always `name`.
+    listed_as: "Callable[[str], str] | None" = None
 
 
 def _path_under(path: Path, root: Path) -> bool:
@@ -540,8 +545,9 @@ def codex_live_info(session_id: str) -> dict | None:
     rollout = _codex_rollout_for(session_id)
     if rollout is not None:
         meta = _codex_read_session_meta(rollout)
+    cwd = meta.get("cwd") or ""
     return {"sessionId": session_id, "pid": _lock_holder_pid(lock),
-            "cwd": meta.get("cwd") or "", "agent": "codex"}
+            "cwd": cwd, "agent": _codex_listed_as(cwd)}
 
 
 # Codex stores the session cwd in several nested places: `session_meta.cwd`,
@@ -617,6 +623,34 @@ def _codex_subagents_of(parent_path: Path) -> list[tuple[Path, dict]]:
     return out
 
 
+# ---- chatgpt (ChatGPT desktop app) -----------------------------------------
+# The ChatGPT desktop app (bundle id com.openai.codex) runs on codex's thread
+# store: its conversations are ordinary rollouts under $CODEX_HOME/sessions,
+# in the codex format to the byte, so CODEX_AGENT keeps owning, parsing,
+# relocating and archiving them. What sets them apart is the cwd the app gives
+# a thread that has no repository: ~/Documents/Codex/<date>/<slug> for a plain
+# chat, $CODEX_HOME/.chatgpt-projects/<project-id> for one inside a ChatGPT
+# project. `originator` looks like the obvious key but is the wrong one: it
+# changed between app builds ("Codex Desktop" → "codex_work_desktop"), and the
+# app writes the same value when it works on a real repository — which is
+# codex work and stays listed as codex. Verified against app build 26.908.
+
+def _chatgpt_workspace_roots() -> tuple[Path, ...]:
+    return (Path.home() / "Documents" / "Codex",
+            CODEX_HOME / ".chatgpt-projects")
+
+
+def _codex_listed_as(cwd: str) -> str:
+    """"chatgpt" for a thread the ChatGPT app ran in one of its own workspace
+    dirs, "codex" for everything else (the roots themselves included)."""
+    if cwd:
+        path = Path(cwd)
+        for root in _chatgpt_workspace_roots():
+            if path != root and path.is_relative_to(root):
+                return "chatgpt"
+    return "codex"
+
+
 CODEX_AGENT = AgentSpec(
     name="codex", bin="codex", resume_label="codex resume",
     owns=lambda p: _path_under(p, CODEX_SESSIONS_DIR),
@@ -636,9 +670,23 @@ CODEX_AGENT = AgentSpec(
     relocated_path=lambda p, new_cwd: None,
     subagents_of=_codex_subagents_of,
     file_fingerprint=lambda p, **kw: _codex_file_fingerprint(p, **kw),
+    listed_as=_codex_listed_as,
 )
 
-AGENTS: dict[str, AgentSpec] = {"claude": CLAUDE_AGENT, "codex": CODEX_AGENT}
+CHATGPT_AGENT = replace(
+    CODEX_AGENT, name="chatgpt",
+    # Discovery and liveness stay with codex, which already walks every
+    # rollout and probes every writer lock in the shared store; doing it here
+    # too would list each thread twice and flock-probe each lock twice.
+    owns=lambda p: False,
+    session_files=lambda include_subagents=False: [],
+    live_probe=None, live_info=None,
+)
+
+# Registry order is the `a` cycle order. codex precedes chatgpt so that
+# archive_spec_for_member() resolves their shared "codex/" prefix to codex.
+AGENTS: dict[str, AgentSpec] = {"claude": CLAUDE_AGENT, "codex": CODEX_AGENT,
+                                "chatgpt": CHATGPT_AGENT}
 DEFAULT_AGENT = "claude"
 
 
@@ -670,6 +718,12 @@ def agent_of(meta) -> AgentSpec:
         return spec
     path = getattr(meta, "path", None)
     return agent_for_path(path) if path else AGENTS[DEFAULT_AGENT]
+
+
+def listed_agent(spec: AgentSpec, cwd: str) -> str:
+    """The AGENTS key a transcript owned by `spec`, recorded in `cwd`, is
+    listed under — `spec.name` unless the store is shared (see `listed_as`)."""
+    return spec.listed_as(cwd) if spec.listed_as else spec.name
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
@@ -2334,7 +2388,7 @@ def save_origin(origin: str) -> None:
 # `ast list`/`ast search` fall back to that same pref unless `--agent` is given.
 
 AGENT_VIEW_ALL = "all"
-AGENT_VIEW_WIDTH = 6   # AGENT column width: fits "claude" / "codex" / "gemini"
+AGENT_VIEW_WIDTH = max(map(len, AGENTS))   # AGENT column width: the longest name
 
 
 def agent_choices() -> tuple:
@@ -2650,6 +2704,7 @@ def load_session_meta(path: Path, fast: bool = False) -> SessionMeta | None:
     if meta.msg_count == 0:
         return None
     meta.prs = list(refs.values())
+    meta.agent = listed_agent(spec, meta.cwd)
     return meta
 
 
@@ -2788,10 +2843,16 @@ def _meta_to_cache(m: SessionMeta) -> dict:
 
 
 def _meta_from_cache(d: dict, path: Path) -> SessionMeta:
+    # The listed agent is re-derived rather than trusted: for a shared store it
+    # is a function of the cached cwd, so an index written before that rule
+    # existed (or changed) needs no _CACHE_SCHEMA bump and no cold re-index.
+    cwd = d.get("cwd", "")
+    agent = d.get("agent") or DEFAULT_AGENT
+    spec = AGENTS.get(agent)
     return SessionMeta(
         session_id=d["session_id"],
         path=path,
-        cwd=d.get("cwd", ""),
+        cwd=cwd,
         first_ts=parse_ts(d.get("first_ts")),
         last_ts=parse_ts(d.get("last_ts")),
         msg_count=d.get("msg_count", 0),
@@ -2799,7 +2860,7 @@ def _meta_from_cache(d: dict, path: Path) -> SessionMeta:
         git_branch=d.get("git_branch", ""),
         prs=d.get("prs") or [],
         entrypoint=d.get("entrypoint", ""),
-        agent=d.get("agent") or DEFAULT_AGENT,
+        agent=listed_agent(spec, cwd) if spec else agent,
     )
 
 
@@ -3274,6 +3335,7 @@ def cmd_search(args: argparse.Namespace) -> int:
                 snippet = text[start:end].replace("\n", " ")
                 matches.append((ts, turn.etype, snippet))
         if matches and (not args.cwd or meta.cwd.startswith(args.cwd)):
+            meta.agent = listed_agent(spec, meta.cwd)
             hits.append((meta, matches))
     # A session copied into two project dirs would otherwise report its hits
     # twice; dedupe_sessions hands back the very objects it kept.
