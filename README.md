@@ -36,7 +36,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. Verify
 ast --version
-# agent-session-tracker v1.1.0
+# agent-session-tracker v1.2.0
 
 # 4. (optional) wire the 0-token done!/undone! prompt hook + status precision layer
 ast install-hook
@@ -195,7 +195,7 @@ ast list [--limit 30] [--cwd PREFIX] [--days N]
 ```
 
 ```
-agent-session-tracker v1.1.0
+agent-session-tracker v1.2.0
   #  ST  AGENT    LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
   1  ●   claude   2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
   2  !   claude   2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
@@ -338,21 +338,34 @@ ast live          # only PIDs that respond to kill -0
 ast live --all    # include stale registry entries (dead PIDs too)
 ```
 
-### `ast backup` / `ast restore` — archive old sessions
+### `ast backup` / `ast restore` — archive old sessions, or carry named ones
 
 ```bash
 ast backup --days 90 --dry-run
 ast backup --days 90 --delete -y
 ast backup --before 2026-01-01 --cwd ~/project/old --out /tmp/old.tar.gz
+ast backup 01a0a576 --out ~/Desktop/chat.tar.gz -y        # one session, any age
+ast backup --filter "학습 앱 기획" --out ~/Desktop/chat.tar.gz -y
 ast restore ~/.ast/backups/sessions-20260524.tar.gz --on-conflict rename -y
 ```
+
+Two ways to choose what goes in. With no ids and no `--filter`, `backup` is
+the housekeeping tool it always was: sessions whose last activity is older
+than the cutoff. Name sessions (id prefixes, `--filter`, or both) and it
+becomes a migration tool: exactly those sessions, however recent, ready to
+`restore` on another machine. Either way each session travels with its
+subagent transcripts (claude `subagents/*.jsonl` + `.meta.json`, codex child
+rollouts), and a codex / ChatGPT-app thread carries its title from
+`session_index.jsonl` so it shows up by name after the restore.
 
 `backup` options:
 
 | Flag | Meaning |
 |---|---|
-| `--days N` | Archive sessions whose last activity is older than N days (default: 90 when neither `--days` nor `--before` is given) |
-| `--before YYYY-MM-DD` | Archive sessions before a specific date (overrides `--days`) |
+| `ID …` | Session id prefixes to archive regardless of age (an unknown or ambiguous prefix is an error) |
+| `--filter TEXT` | Also archive sessions whose id, cwd or first user message contains TEXT (case-insensitive) |
+| `--days N` / `--older-than N` | Archive sessions whose last activity is **older** than N days (default: 90 when no ids, `--filter`, `--days` or `--before` is given). Note this is the opposite of `ast list --days` |
+| `--before YYYY-MM-DD` | Archive sessions before a specific date (overrides `--days`); with ids / `--filter` it narrows that selection |
 | `--cwd PREFIX` | Restrict to sessions under this cwd |
 | `--out PATH` | Output archive path (default: `~/.ast/backups/sessions-<timestamp>.tar.gz`) |
 | `--delete` | Remove originals after a successful archive |
@@ -535,7 +548,7 @@ A cursor appears on the prompt line. Live filtering happens as you type.
 ### Header bar
 
 ```
- agent-session-tracker v1.1.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.2.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — visible rows / total sessions

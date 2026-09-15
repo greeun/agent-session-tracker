@@ -35,7 +35,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. 확인
 ast --version
-# agent-session-tracker v1.1.0
+# agent-session-tracker v1.2.0
 
 # 4. (선택) 토큰 0짜리 done!/undone! 프롬프트 훅 + 상태 정밀 레이어 설치
 ast install-hook
@@ -196,7 +196,7 @@ ast list [--limit 30] [--cwd PREFIX] [--days N]
 ```
 
 ```
-agent-session-tracker v1.1.0
+agent-session-tracker v1.2.0
   #  ST  AGENT    LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
   1  ●   claude   2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
   2  !   claude   2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
@@ -336,21 +336,33 @@ ast live          # kill -0 응답하는 PID만
 ast live --all    # 죽은 PID(유령 레지스트리 항목)까지 포함
 ```
 
-### `ast backup` / `ast restore` — 오래된 세션 아카이빙
+### `ast backup` / `ast restore` — 오래된 세션 아카이빙, 또는 지정한 세션 이동
 
 ```bash
 ast backup --days 90 --dry-run
 ast backup --days 90 --delete -y
 ast backup --before 2026-01-01 --cwd ~/project/old --out /tmp/old.tar.gz
+ast backup 01a0a576 --out ~/Desktop/chat.tar.gz -y        # 세션 1건, 날짜 무관
+ast backup --filter "학습 앱 기획" --out ~/Desktop/chat.tar.gz -y
 ast restore ~/.ast/backups/sessions-20260524.tar.gz --on-conflict rename -y
 ```
+
+대상을 고르는 방식은 두 가지입니다. id도 `--filter`도 지정하지 않으면 예전과
+같은 정리용 명령으로, 최종 활동이 기준일보다 오래된 세션을 담습니다. 세션을
+지정하면(id 접두어, `--filter`, 또는 둘 다) 이동용 명령이 되어, 아무리 최근
+세션이라도 지정한 것만 담아 다른 컴퓨터에서 `restore`할 수 있게 합니다. 어느
+쪽이든 각 세션의 하위 전사본(claude `subagents/*.jsonl` + `.meta.json`, codex
+하위 롤아웃)이 함께 들어가고, codex / ChatGPT 앱 스레드는 `session_index.jsonl`에
+기록된 제목을 함께 가져가서 복원 뒤에도 같은 이름으로 표시됩니다.
 
 `backup` 옵션:
 
 | 플래그 | 의미 |
 |---|---|
-| `--days N` | 최종 활동이 N일 이전인 세션을 아카이브 (기본: `--days`·`--before` 모두 생략 시 90일) |
-| `--before YYYY-MM-DD` | 특정 날짜 이전 세션을 아카이브 (`--days`보다 우선) |
+| `ID …` | 날짜와 무관하게 아카이브할 세션 id 접두어 (없거나 여러 개에 걸치면 오류) |
+| `--filter TEXT` | id·cwd·첫 사용자 메시지에 TEXT가 포함된 세션도 아카이브 (대소문자 무시) |
+| `--days N` / `--older-than N` | 최종 활동이 N일보다 **오래된** 세션을 아카이브 (기본: id·`--filter`·`--days`·`--before` 모두 생략 시 90일). `ast list --days`와 반대 의미 |
+| `--before YYYY-MM-DD` | 특정 날짜 이전 세션을 아카이브 (`--days`보다 우선). id / `--filter`와 함께 쓰면 그 선택을 다시 좁힘 |
 | `--cwd PREFIX` | 해당 cwd 아래 세션으로 제한 |
 | `--out PATH` | 아카이브 경로 (기본: `~/.ast/backups/sessions-<timestamp>.tar.gz`) |
 | `--delete` | 성공적으로 아카이브된 원본 제거 |
@@ -530,7 +542,7 @@ fzf 스타일 필터, 상태 글리프, 모달, 액션 키를 갖춘 curses 선�
 ### 헤더
 
 ```
- agent-session-tracker v1.1.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.2.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — 보이는 행 / 전체 세션 수

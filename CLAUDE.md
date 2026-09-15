@@ -360,6 +360,35 @@ path, where `--force` still implies `-y` — it does **not** also skip bulk
 mode's confirmation prompt (mirrors `_bulk_done`). Deletion itself goes
 through `_delete_sessions`, shared with the TUI `Del` key.
 
+### backup by name (`ast backup <id>… --filter`) and companions
+
+`cmd_backup` has two selection modes. With no positional ids and no
+`--filter` it is the housekeeping tool: `last_ts` must precede the cutoff
+(`--before`, else `--days`/`--older-than` N, default 90 — note `--days` here
+means *older than*, the opposite of `list`/`rm --days`). With ids and/or
+`--filter` it is a migration tool: each id is a unique prefix over
+`load_all_sessions()` (unknown or ambiguous → rc 1, nothing written), `--filter`
+is the same id+cwd+first_user_msg substring as `_rm_candidates`, `--cwd` still
+narrows the pool, and a cutoff applies only when one was given explicitly.
+The manifest records `cutoff: null` + `selection: {ids, filter}` for that
+mode; the summary line reads `Selected sessions:` instead of `Sessions older
+than`.
+
+Both modes pack companions: `archive_companions(meta)` = the session's
+`list_subagents()` files (claude `subagents/*.jsonl` plus each `.meta.json`,
+codex rollouts whose `parent_thread_id` is the session) as members under the
+same `archive_prefix`, listed per session in the manifest's `subagents`. A
+codex/chatgpt session also carries `thread_name` from
+`$CODEX_HOME/session_index.jsonl` (`CODEX_SESSION_INDEX`, re-pointed by tests;
+read through `_codex_thread_name`). `cmd_restore` therefore accepts
+`.meta.json` members, resolves a subagent member's cwd filter and dry-run
+label through `parent_of_member`, and after writing a codex transcript whose
+manifest entry has a `thread_name` calls `_codex_index_append` — appends one
+`{id, thread_name, updated_at}` line unless the index already names that id,
+so a second restore or a pre-existing title never duplicates it, and a
+skipped/unwritten transcript never touches the index. Archives written before
+this (no `subagents`/`thread_name` keys) restore unchanged.
+
 ## Development Notes
 
 - Tests live under `tests/` (stdlib `unittest`, run with `python3 -m pytest -q` or `python3 -m unittest discover -s tests`) — one `test_*.py` per feature; add one when you add a feature. They load `tracker.py` via `importlib` and stub `CACHE_DIR`/`STATE_PATH` into a tempdir for state tests. **Any test that stubs `PROJECTS_DIR` must also stub `CODEX_SESSIONS_DIR` / `CODEX_LOCKS_DIR`** (the session universe now spans every agent; an unstubbed codex root leaks the real `~/.codex` rollouts into the fixture and slows the run)

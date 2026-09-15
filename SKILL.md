@@ -1,7 +1,7 @@
 ---
 name: agent-session-tracker
 description: Track live/waiting/ended/done status of Claude Code sessions — and Codex CLI sessions and ChatGPT desktop app conversations alongside them. List, search, resume, export, backup, restore sessions via `ast` CLI or TUI. Use when user says "list sessions", "세션 상태", "ast", "session tracker", "codex 세션", "chatgpt 세션", "ChatGPT 앱 대화", or wants to resume/search/export/backup sessions.
-version: 1.1.0
+version: 1.2.0
 ---
 
 # agent-session-tracker
@@ -29,7 +29,7 @@ process is ended/job-state; a live one resolves overlay → registry → `●`):
   in TUI, `ast done <id>`, or the `done!` prompt hook). Persists in
   `~/.ast/state.json`.
 
-Main script: `tracker.py` (stdlib only, Python 3.10+, v1.1.0). Installed as
+Main script: `tracker.py` (stdlib only, Python 3.10+, v1.2.0). Installed as
 `~/.local/bin/ast`. All `~/.claude/...` data paths honor `$CLAUDE_CONFIG_DIR`
 (same convention as Claude Code itself) and `~/.codex/...` honors
 `$CODEX_HOME` (Codex's own convention); ast's own files live under `~/.ast`
@@ -118,10 +118,21 @@ ast done --filter TEXT [-y] [--force] [--cwd PFX] [--days N] [--status S]
 ast live [--all]          # live Claude Code processes (--all shows stale entries)
 ast stats [--top N]       # counts + top projects
 ast subagents <parent-id> # Task-tool subagents
-ast backup [--days N|--before YYYY-MM-DD] [--cwd PFX] [--out PATH]
-           [--delete] [--force] [--dry-run] [-y]   # default: --days 90
+ast backup [--days N|--older-than N|--before YYYY-MM-DD] [--cwd PFX]
+           [--out PATH] [--delete] [--force] [--dry-run] [-y]
+                          # housekeeping: sessions OLDER than the cutoff
+                          #   (default 90 days). --days here means "older
+                          #   than N days" — the opposite of `list --days`
+ast backup <id> [<id> ...] [--filter TEXT] [--out PATH] [-y]
+                          # migration: the named sessions (id prefixes and/or
+                          #   the id+cwd+first-msg substring), no age cutoff
+                          #   unless one is given. Either form also packs each
+                          #   session's subagent transcripts and, for codex /
+                          #   chatgpt, its thread title from session_index.jsonl
 ast restore <archive.tar.gz> [--cwd PFX]
             [--on-conflict skip|overwrite|rename] [--dry-run] [-y]
+                          # puts subagents back beside their parent and adds
+                          #   a missing thread title to session_index.jsonl
 ast relocate <id> <new-cwd> [--keep-original] [--force] [--dry-run] [-y]
 ast rm <id> [<id> ...] [--dry-run] [-y] [--force]   # unlink session transcript(s)
                           #   (only removes the transcript; a live bg process keeps
