@@ -36,7 +36,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. Verify
 ast --version
-# agent-session-tracker v1.2.0
+# agent-session-tracker v1.3.0
 
 # 4. (optional) wire the 0-token done!/undone! prompt hook + status precision layer
 ast install-hook
@@ -195,7 +195,7 @@ ast list [--limit 30] [--cwd PREFIX] [--days N]
 ```
 
 ```
-agent-session-tracker v1.2.0
+agent-session-tracker v1.3.0
   #  ST  AGENT    LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
   1  ●   claude   2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
   2  !   claude   2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
@@ -375,6 +375,15 @@ rollouts), and a codex / ChatGPT-app thread carries its title from
 
 `restore` conflict policies: `skip` (default) · `overwrite` · `rename` (writes `<id>.restored-<ts>.jsonl`).
 
+#### Restoring codex / ChatGPT-app threads on another machine
+
+Copying a rollout is not enough for the ChatGPT desktop app (or `codex resume`'s picker) to show it: codex lists threads from its state DB (`$CODEX_HOME/state_<n>.sqlite`) and does not rescan the sessions dir once that DB exists, and the rollout's recorded cwd is the *source* machine's `/Users/<user>/.codex/.chatgpt-projects/<id>`, which does not match the project dir on a machine with a different user name. `restore` therefore finishes each written codex rollout in two steps:
+
+1. **cwd moved under this machine.** The manifest's `source` (the backing-up machine's home and `CODEX_HOME`) is swapped for the local values in every place codex records the cwd, so a project chat lands under `$CODEX_HOME/.chatgpt-projects/<id>` and a projectless chat under `~/Documents/Codex/…`. Archives without `source` (v1.2.0) fall back to the shape of those two paths. `--keep-cwd` disables this.
+2. **Row in codex's state DB.** For every restored thread with no row, `restore` runs `codex archive <id>` then `codex unarchive <id>`, which makes codex read-repair the row from the rollout; children archived alongside a parent are unarchived again, and the manifest's `thread_name` fills an empty `name`. `--no-register` disables this. When `codex` is not on PATH the commands are printed for you; when there is no state DB yet, codex builds one from the rollouts on its next start.
+
+Quit the ChatGPT app before restoring into its live `~/.codex`, then start it again.
+
 ### `ast relocate <id> <new-cwd>` — fix a session's recorded cwd
 
 ```bash
@@ -548,7 +557,7 @@ A cursor appears on the prompt line. Live filtering happens as you type.
 ### Header bar
 
 ```
- agent-session-tracker v1.2.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.3.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — visible rows / total sessions
