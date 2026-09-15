@@ -389,6 +389,44 @@ so a second restore or a pre-existing title never duplicates it, and a
 skipped/unwritten transcript never touches the index. Archives written before
 this (no `subagents`/`thread_name` keys) restore unchanged.
 
+### restore finishes codex threads for this machine (cwd remap + state DB row)
+
+Verified against codex-cli 0.154 / the ChatGPT desktop app: the app lists
+threads from `$CODEX_HOME/state_<n>.sqlite` (`threads` table; `state_5` today,
+`_codex_state_db()` picks the highest n), builds that DB from rollouts **only
+when it is absent** at startup (`codex doctor`'s `state.rollout_db_parity`
+check says as much), and read-repairs a missing row when a thread is looked
+up by id (`find_thread_path_by_id` → `read_repair_rollout_path: upsert_needed`
+in the binary). `codex migrate-rollouts` is unrelated — it converts legacy
+rollout format and reports `already paginated` for modern ones. So a copied
+rollout stays invisible, and its recorded cwd
+(`/Users/<src-user>/.codex/.chatgpt-projects/<id>`) does not match the local
+project dir when the user name differs — the app assigns a thread to a project
+by that cwd.
+
+`cmd_backup` records `manifest.source = {home, codex_home}`. `cmd_restore`,
+after the write loop, for every written codex `.jsonl` (`codex_written`):
+
+1. `remap_source_cwd(cwd, source)` swaps the source `codex_home` prefix, else
+   the source `home` prefix, for the local `CODEX_HOME` / `Path.home()`
+   (`_path_prefix_swap` matches whole components, so `/Users/alice2` never
+   matches `/Users/alice`). Without `source` (v1.2.0 archives) it keys on
+   `/.codex/` and `/Documents/Codex/` in the path. The rewrite goes through
+   `_rewrite_cwd_inplace(dest, new, _codex_rewrite_event_cwd, old)`, the same
+   routine relocate uses, and happens **before** registration so the row codex
+   creates already carries the local cwd. `--keep-cwd` skips it.
+2. `_codex_register_threads(sids, names, parents)`: no state DB → note (codex
+   will build it); no `codex` on PATH (`_codex_available`) → the manual
+   `archive && unarchive` commands are printed; otherwise every id without a
+   row gets `codex archive` + `codex unarchive` through `_run_codex` (quiet,
+   `CODEX_HOME` passed through), parents first — archiving a parent archives
+   its children too, so any restored id left `archived=1` that was not archived
+   before is unarchived, and a manifest `thread_name` is written into an empty
+   `name` with stdlib `sqlite3`. A pre-existing row is never touched (its name
+   included). `--no-register` skips it. Both stubs (`_run_codex`,
+   `_codex_available`) are what `tests/test_restore_register.py` replaces; its
+   fake codex mimics the insert-on-archive and archive-children behaviour.
+
 ## Development Notes
 
 - Tests live under `tests/` (stdlib `unittest`, run with `python3 -m pytest -q` or `python3 -m unittest discover -s tests`) — one `test_*.py` per feature; add one when you add a feature. They load `tracker.py` via `importlib` and stub `CACHE_DIR`/`STATE_PATH` into a tempdir for state tests. **Any test that stubs `PROJECTS_DIR` must also stub `CODEX_SESSIONS_DIR` / `CODEX_LOCKS_DIR`** (the session universe now spans every agent; an unstubbed codex root leaks the real `~/.codex` rollouts into the fixture and slows the run)

@@ -1,7 +1,7 @@
 ---
 name: agent-session-tracker
 description: Track live/waiting/ended/done status of Claude Code sessions — and Codex CLI sessions and ChatGPT desktop app conversations alongside them. List, search, resume, export, backup, restore sessions via `ast` CLI or TUI. Use when user says "list sessions", "세션 상태", "ast", "session tracker", "codex 세션", "chatgpt 세션", "ChatGPT 앱 대화", or wants to resume/search/export/backup sessions.
-version: 1.2.0
+version: 1.3.0
 ---
 
 # agent-session-tracker
@@ -29,7 +29,7 @@ process is ended/job-state; a live one resolves overlay → registry → `●`):
   in TUI, `ast done <id>`, or the `done!` prompt hook). Persists in
   `~/.ast/state.json`.
 
-Main script: `tracker.py` (stdlib only, Python 3.10+, v1.2.0). Installed as
+Main script: `tracker.py` (stdlib only, Python 3.10+, v1.3.0). Installed as
 `~/.local/bin/ast`. All `~/.claude/...` data paths honor `$CLAUDE_CONFIG_DIR`
 (same convention as Claude Code itself) and `~/.codex/...` honors
 `$CODEX_HOME` (Codex's own convention); ast's own files live under `~/.ast`
@@ -129,10 +129,18 @@ ast backup <id> [<id> ...] [--filter TEXT] [--out PATH] [-y]
                           #   unless one is given. Either form also packs each
                           #   session's subagent transcripts and, for codex /
                           #   chatgpt, its thread title from session_index.jsonl
-ast restore <archive.tar.gz> [--cwd PFX]
+ast restore <archive.tar.gz> [--cwd PFX] [--keep-cwd] [--no-register]
             [--on-conflict skip|overwrite|rename] [--dry-run] [-y]
                           # puts subagents back beside their parent and adds
-                          #   a missing thread title to session_index.jsonl
+                          #   a missing thread title to session_index.jsonl.
+                          #   codex / chatgpt rollouts also get their cwd moved
+                          #   under THIS machine's home / $CODEX_HOME (the
+                          #   manifest's `source` says where they came from;
+                          #   --keep-cwd leaves them) and a row in codex's
+                          #   state DB via `codex archive` + `unarchive`
+                          #   (--no-register skips it) — without that row
+                          #   the ChatGPT app never lists the thread. Quit
+                          #   the ChatGPT app before restoring into ~/.codex.
 ast relocate <id> <new-cwd> [--keep-original] [--force] [--dry-run] [-y]
 ast rm <id> [<id> ...] [--dry-run] [-y] [--force]   # unlink session transcript(s)
                           #   (only removes the transcript; a live bg process keeps
