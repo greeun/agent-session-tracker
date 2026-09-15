@@ -15,7 +15,7 @@ Data sources:
 """
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import argparse
 import json
@@ -337,6 +337,10 @@ def _codex_home() -> Path:
 CODEX_HOME = _codex_home()
 CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
 CODEX_LOCKS_DIR = CODEX_HOME / "thread-writer-locks"
+# Thread titles the ChatGPT desktop app / codex keep beside the rollouts:
+# one {"id", "thread_name", "updated_at"} line per thread. Read by backup so
+# a migrated conversation keeps its title, appended to by restore.
+CODEX_SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
 _CODEX_BUSY_WINDOW_S = 90   # rollout written within this → ● working, else ◦ idle
 _UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 _CODEX_ROLLOUT_RE = re.compile(r"^rollout-.*-(" + _UUID_RE + r")\.jsonl$")
@@ -7183,6 +7187,72 @@ def _human(n: int) -> str:
 # restore) and "codex/…" for codex rollouts. The manifest records the agent
 # and the full member name so a restore never has to guess.
 
+def _codex_index_entries() -> list[dict]:
+    """Every parseable line of codex's session_index.jsonl; [] when absent."""
+    try:
+        with CODEX_SESSION_INDEX.open("r", encoding="utf-8") as f:
+            out = []
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    e = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(e, dict):
+                    out.append(e)
+            return out
+    except OSError:
+        return []
+
+
+def _codex_thread_name(session_id: str) -> str | None:
+    """The title codex / the ChatGPT app recorded for a thread, if any."""
+    for e in _codex_index_entries():
+        if e.get("id") == session_id and e.get("thread_name"):
+            return str(e["thread_name"])
+    return None
+
+
+def _codex_index_append(session_id: str, thread_name: str,
+                        updated_at: str | None) -> bool:
+    """Add a title line for `session_id` unless the index already names it.
+    Returns True when a line was written."""
+    if any(e.get("id") == session_id for e in _codex_index_entries()):
+        return False
+    entry = {"id": session_id, "thread_name": thread_name,
+             "updated_at": updated_at or datetime.now(timezone.utc).isoformat()}
+    CODEX_SESSION_INDEX.parent.mkdir(parents=True, exist_ok=True)
+    with CODEX_SESSION_INDEX.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return True
+
+
+def archive_companions(meta) -> "list[tuple[Path, str]]":
+    """Files that belong with one session in an archive but are not the
+    transcript itself: its subagent transcripts (claude `subagents/*.jsonl`
+    with their `.meta.json`, codex child rollouts), as (path, member name).
+    A companion outside the agent's data root is left out."""
+    spec = agent_of(meta)
+    root = spec.data_root() if spec.data_root else None
+    if root is None or not spec.archive_prefix:
+        return []
+    out: list[tuple[Path, str]] = []
+    for sub_path, _ in list_subagents(meta.path):
+        cands = [sub_path]
+        meta_json = sub_path.with_suffix(".meta.json")
+        if meta_json.exists():
+            cands.append(meta_json)
+        for c in cands:
+            try:
+                rel = str(c.relative_to(root))
+            except ValueError:
+                continue
+            out.append((c, f"{spec.archive_prefix}/{rel}"))
+    return out
+
+
 def archive_member_for(meta) -> "tuple[str, str] | None":
     """(relpath under the agent's data root, member name inside the tarball)
     for one session, or None when its agent has no archive layout or the
@@ -7221,23 +7291,69 @@ def archive_manifest_key(entry: dict) -> str:
 
 
 def cmd_backup(args: argparse.Namespace) -> int:
+    """Two ways to pick what goes into the tarball:
+
+    - by age (the original, housekeeping use): `--days N` / `--older-than N`
+      / `--before DATE` keep sessions whose last activity precedes the cutoff
+      (default 90 days), optionally under `--cwd`.
+    - by name (migration): positional session ids (unique prefixes) and/or
+      `--filter TEXT` (the TUI `/` substring over id+cwd+first message). No
+      age cutoff applies unless one is given explicitly, so a conversation
+      from an hour ago can be carried to another machine as is.
+
+    Either way each session travels with its companions (subagent
+    transcripts) and, for codex, its thread title from session_index.jsonl.
+    """
+    ids: list[str] = list(getattr(args, "ids", None) or [])
+    needle: str | None = getattr(args, "filter", None)
+    days = args.days if args.days is not None else getattr(args, "older_than", None)
+    explicit = bool(ids or needle)
+
+    cutoff: "datetime | None"
     if args.before:
         try:
             cutoff = datetime.strptime(args.before, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except ValueError:
             print(f"--before must be YYYY-MM-DD (got {args.before!r})", file=sys.stderr)
             return 2
+    elif days is not None or not explicit:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days if days is not None else 90)
     else:
-        days = args.days if args.days is not None else 90
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff = None
 
     sessions = load_all_sessions(progress=True)
-    old = [s for s in sessions if s.last_ts and s.last_ts < cutoff]
     if args.cwd:
-        old = [s for s in old if s.cwd.startswith(args.cwd)]
+        sessions = [s for s in sessions if s.cwd.startswith(args.cwd)]
+
+    if explicit:
+        picked: dict[str, SessionMeta] = {}
+        for prefix in ids:
+            hits = [s for s in sessions if s.session_id.startswith(prefix)]
+            if not hits:
+                print(f"No session matches id {prefix!r}", file=sys.stderr)
+                return 1
+            if len(hits) > 1:
+                print(f"Ambiguous id {prefix!r} — {len(hits)} matches: "
+                      + ", ".join(h.session_id[:8] for h in hits[:10]), file=sys.stderr)
+                return 1
+            picked[hits[0].session_id] = hits[0]
+        if needle:
+            q = needle.lower()
+            for s in sessions:
+                if q in f"{s.session_id} {s.cwd} {s.first_user_msg}".lower():
+                    picked[s.session_id] = s
+        old = list(picked.values())
+        if cutoff is not None:
+            old = [s for s in old if s.last_ts and s.last_ts < cutoff]
+    else:
+        assert cutoff is not None
+        old = [s for s in sessions if s.last_ts and s.last_ts < cutoff]
 
     if not old:
-        print(f"(no sessions older than {cutoff.astimezone().strftime('%Y-%m-%d')})")
+        if explicit:
+            print("(no sessions matching the given selection)")
+        else:
+            print(f"(no sessions older than {cutoff.astimezone().strftime('%Y-%m-%d')})")
         return 0
 
     # Sessions whose agent has no archive layout cannot be stored; drop them
@@ -7258,15 +7374,24 @@ def cmd_backup(args: argparse.Namespace) -> int:
             print("(nothing left to archive)")
             return 0
 
+    companions: dict[str, list[tuple[Path, str]]] = {
+        s.session_id: archive_companions(s) for s in old}
     total_bytes = 0
+    n_comp = 0
     for s in old:
-        try:
-            total_bytes += s.path.stat().st_size
-        except OSError:
-            pass
+        for p in [s.path] + [c for c, _ in companions[s.session_id]]:
+            try:
+                total_bytes += p.stat().st_size
+            except OSError:
+                pass
+        n_comp += len(companions[s.session_id])
 
-    cutoff_label = cutoff.astimezone().strftime("%Y-%m-%d")
-    print(f"Sessions older than {cutoff_label}: {len(old)} ({_human(total_bytes)})")
+    comp_note = f", +{n_comp} subagent file(s)" if n_comp else ""
+    if explicit:
+        print(f"Selected sessions: {len(old)} ({_human(total_bytes)}{comp_note})")
+    else:
+        cutoff_label = cutoff.astimezone().strftime("%Y-%m-%d")
+        print(f"Sessions older than {cutoff_label}: {len(old)} ({_human(total_bytes)}{comp_note})")
 
     if args.dry_run:
         for s in old[:20]:
@@ -7293,7 +7418,8 @@ def cmd_backup(args: argparse.Namespace) -> int:
 
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "cutoff": cutoff.isoformat(),
+        "cutoff": cutoff.isoformat() if cutoff is not None else None,
+        "selection": {"ids": ids, "filter": needle} if explicit else None,
         "count": len(old),
         "sessions": [
             {
@@ -7306,6 +7432,10 @@ def cmd_backup(args: argparse.Namespace) -> int:
                 "agent": s.agent or DEFAULT_AGENT,
                 "relpath": stored[s.session_id][0],
                 "arcname": stored[s.session_id][1],
+                "subagents": [arc for _, arc in companions[s.session_id]],
+                "thread_name": (_codex_thread_name(s.session_id)
+                                if agent_of(s).archive_prefix == CODEX_AGENT.archive_prefix
+                                else None),
             }
             for s in old
         ],
@@ -7326,6 +7456,12 @@ def cmd_backup(args: argparse.Namespace) -> int:
                     written += 1
                 except OSError as e:
                     failed.append(f"{s.session_id}: {e}")
+                    continue
+                for c_path, c_arc in companions[s.session_id]:
+                    try:
+                        tar.add(str(c_path), arcname=c_arc)
+                    except OSError as e:
+                        failed.append(f"{s.session_id}: {c_arc}: {e}")
                 if sys.stderr.isatty():
                     sys.stderr.write(f"\rArchiving… {i}/{len(old)}")
                     sys.stderr.flush()
@@ -7391,7 +7527,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
                 continue
-            if m.name.endswith(".jsonl") and archive_spec_for_member(m.name):
+            if m.name.endswith((".jsonl", ".meta.json")) and archive_spec_for_member(m.name):
                 members.append(m)
 
         if not members:
@@ -7403,16 +7539,21 @@ def cmd_restore(args: argparse.Namespace) -> int:
         # "codex/…" entries never collide; archives written before the
         # multi-agent split resolve through archive_manifest_key().
         manifest_by_member: dict[str, dict] = {}
+        # A subagent member is filtered and labelled through its parent's
+        # manifest entry (archives from before companions travelled have none).
+        parent_of_member: dict[str, dict] = {}
         if manifest:
             for entry in manifest.get("sessions", []):
                 key = archive_manifest_key(entry)
                 if key:
                     manifest_by_member[key] = entry
+                for arc in entry.get("subagents") or []:
+                    parent_of_member[str(arc)] = entry
 
         if cwd_filter:
             kept = []
             for m in members:
-                meta = manifest_by_member.get(m.name)
+                meta = manifest_by_member.get(m.name) or parent_of_member.get(m.name)
                 meta_cwd = (meta or {}).get("cwd", "")
                 if meta_cwd.startswith(cwd_filter):
                     kept.append(m)
@@ -7423,7 +7564,16 @@ def cmd_restore(args: argparse.Namespace) -> int:
         print(f"Archive: {shorten_path(str(archive))}")
         if manifest:
             print(f"Created: {manifest.get('created_at', '?')}")
-            print(f"Cutoff:  {manifest.get('cutoff', '?')}")
+            sel = manifest.get("selection")
+            if sel:
+                parts = []
+                if sel.get("ids"):
+                    parts.append("ids=" + ",".join(str(i) for i in sel["ids"]))
+                if sel.get("filter"):
+                    parts.append(f"filter={sel['filter']!r}")
+                print("Picked:  " + (" ".join(parts) or "by name"))
+            else:
+                print(f"Cutoff:  {manifest.get('cutoff', '?')}")
         print(f"Files:   {len(members)} ({_human(total_bytes)})")
 
         # Each member restores under its own agent's data root, so one archive
@@ -7471,8 +7621,11 @@ def cmd_restore(args: argparse.Namespace) -> int:
             counts = {"write": 0, "skip": 0, "overwrite": 0, "rename": 0}
             for m, dest, action in plans[:20]:
                 rel = m.name.split("/", 1)[1] if "/" in m.name else m.name
-                meta = manifest_by_member.get(m.name, {})
-                label = meta.get("first_user_msg") or rel
+                meta = manifest_by_member.get(m.name)
+                if meta is None and m.name in parent_of_member:
+                    label = "  ↳ subagent of " + (parent_of_member[m.name].get("first_user_msg") or rel)
+                else:
+                    label = (meta or {}).get("first_user_msg") or rel
                 print(f"  [{action:<9}] {truncate(label, 80)}")
                 counts[action] = counts.get(action, 0) + 1
             if len(plans) > 20:
@@ -7489,6 +7642,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
         written = 0
         skipped = 0
         errors = 0
+        titled = 0
         touched: "set[Path]" = set()
         for i, (m, dest, action) in enumerate(plans, 1):
             if action == "skip":
@@ -7511,6 +7665,17 @@ def cmd_restore(args: argparse.Namespace) -> int:
                         out.write(chunk)
                 written += 1
                 touched.add(dest)
+                entry = manifest_by_member.get(m.name)
+                if entry and entry.get("thread_name") and \
+                        archive_spec_for_member(m.name) is CODEX_AGENT:
+                    try:
+                        if _codex_index_append(str(entry.get("session_id") or ""),
+                                               str(entry["thread_name"]),
+                                               entry.get("last_ts")):
+                            titled += 1
+                    except OSError as e:
+                        print(f"  Could not record thread name for {m.name}: {e}",
+                              file=sys.stderr)
             except OSError as e:
                 errors += 1
                 print(f"  Failed {m.name}: {e}", file=sys.stderr)
@@ -7527,6 +7692,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
 
         print(f"✓ Restored {written} file(s)" +
               (f", skipped {skipped}" if skipped else "") +
+              (f", {titled} thread name(s) added to session index" if titled else "") +
               (f", {unsafe} unsafe" if unsafe else "") +
               (f", {errors} error(s)" if errors else ""))
         return 1 if (errors or unsafe) else 0
@@ -7735,9 +7901,24 @@ def _build_parser() -> argparse.ArgumentParser:
                              "default: $TERM_PROGRAM, else Terminal.app")
     p_open.set_defaults(func=cmd_open)
 
-    p_backup = sub.add_parser("backup", help="archive old sessions into tar.gz")
-    p_backup.add_argument("--days", type=int, default=None)
-    p_backup.add_argument("--before", type=str, default=None)
+    p_backup = sub.add_parser(
+        "backup",
+        help="archive sessions into tar.gz — old ones by default, or the "
+             "named ones (ids / --filter) to carry to another machine")
+    p_backup.add_argument("ids", nargs="*", metavar="ID",
+                          help="session id prefix(es) to archive regardless "
+                               "of age (subagent transcripts ride along)")
+    p_backup.add_argument("--filter", type=str, default=None, metavar="TEXT",
+                          help="also archive sessions whose id/cwd/first "
+                               "message contains TEXT (case-insensitive)")
+    p_backup.add_argument("--days", type=int, default=None, metavar="N",
+                          help="sessions OLDER than N days (default 90 when "
+                               "no ids/--filter given); same as --older-than")
+    p_backup.add_argument("--older-than", dest="older_than", type=int,
+                          default=None, metavar="N",
+                          help="alias for --days: sessions older than N days")
+    p_backup.add_argument("--before", type=str, default=None, metavar="YYYY-MM-DD",
+                          help="sessions last active before this date")
     p_backup.add_argument("--cwd", type=str, default=None)
     p_backup.add_argument("--out", type=str, default=None)
     p_backup.add_argument("--delete", action="store_true")
