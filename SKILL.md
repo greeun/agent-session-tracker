@@ -1,7 +1,7 @@
 ---
 name: agent-session-tracker
 description: Track live/waiting/ended/done status of Claude Code sessions — and Codex CLI sessions and ChatGPT desktop app conversations alongside them. List, search, resume, export, backup, restore sessions via `ast` CLI or TUI. Use when user says "list sessions", "세션 상태", "ast", "session tracker", "codex 세션", "chatgpt 세션", "ChatGPT 앱 대화", or wants to resume/search/export/backup sessions.
-version: 1.3.0
+version: 1.4.0
 ---
 
 # agent-session-tracker
@@ -29,7 +29,7 @@ process is ended/job-state; a live one resolves overlay → registry → `●`):
   in TUI, `ast done <id>`, or the `done!` prompt hook). Persists in
   `~/.ast/state.json`.
 
-Main script: `tracker.py` (stdlib only, Python 3.10+, v1.3.0). Installed as
+Main script: `tracker.py` (stdlib only, Python 3.10+, v1.4.0). Installed as
 `~/.local/bin/ast`. All `~/.claude/...` data paths honor `$CLAUDE_CONFIG_DIR`
 (same convention as Claude Code itself) and `~/.codex/...` honors
 `$CODEX_HOME` (Codex's own convention); ast's own files live under `~/.ast`
@@ -271,7 +271,9 @@ stale `!` self-heals to `◦` to avoid a stuck state.
   `👤user` / `🤖agent`; persisted in `state.json`, shared with `ast list
   --origin` / `ast search --origin`.
 - **`t` / `T`** — toggle color theme (dark ↔ light), persisted in `state.json`
-- `?` — help modal · `/` — enter search mode · `Esc` — clear/quit
+- `?` — help modal (`/` searches it: literal, case-insensitive; `n`/`N`
+  next/prev match; `Esc` clears the search, then closes) · `/` — enter
+  search mode · `Esc` — clear/quit
 
 **Search mode (`/` prompt)** — fzf-style, all text input lives here:
 
