@@ -35,7 +35,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. 확인
 ast --version
-# agent-session-tracker v1.3.0
+# agent-session-tracker v1.4.0
 
 # 4. (선택) 토큰 0짜리 done!/undone! 프롬프트 훅 + 상태 정밀 레이어 설치
 ast install-hook
@@ -196,7 +196,7 @@ ast list [--limit 30] [--cwd PREFIX] [--days N]
 ```
 
 ```
-agent-session-tracker v1.3.0
+agent-session-tracker v1.4.0
   #  ST  AGENT    LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
   1  ●   claude   2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
   2  !   claude   2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
@@ -526,7 +526,7 @@ fzf 스타일 필터, 상태 글리프, 모달, 액션 키를 갖춘 curses 선�
 | **`F`** | 생성 주체 필터를 역방향으로 순환 (`all → agent → user`). 저장됨. |
 | **`t`** / **`T`** | 색 테마 토글 (dark ↔ light). `state.json`에 저장. |
 | `Del` / `Fn+Delete` | 마크된/현재 세션 삭제 (확인 모달) |
-| `?` | 도움말 모달 |
+| `?` | 도움말 모달 (안에서 `/`로 검색, `n`/`N` 다음/이전 일치 항목) |
 | `/` | 검색 모드 진입 |
 | `Esc` | 필터/검색 있으면 초기화, 없으면 종료 |
 
@@ -551,7 +551,7 @@ fzf 스타일 필터, 상태 글리프, 모달, 액션 키를 갖춘 curses 선�
 ### 헤더
 
 ```
- agent-session-tracker v1.3.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.4.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — 보이는 행 / 전체 세션 수
@@ -573,7 +573,7 @@ fzf 스타일 필터, 상태 글리프, 모달, 액션 키를 갖춘 curses 선�
 
 ### 모달 다이얼로그
 
-- **도움말 (`?`)** — 스크롤 가능한 치트시트
+- **도움말 (`?`)** — 스크롤 가능한 치트시트. `/`를 누르면 입력하는 즉시 검색한다(문자 그대로, 대소문자 무시). 일치하는 부분이 모두 강조되고 현재 항목이 보이도록 스크롤되며, `Enter`는 강조를 유지한 채 입력을 마치고, `n`/`N`은 다음/이전 일치 항목으로 이동한다. `Esc`는 먼저 검색을 지우고, 한 번 더 누르면 모달을 닫는다.
 - **미리보기 (`v`)** — 역할별 색상의 트랜스크립트, 메시지 전문 표시(줄바꿈 처리). 상단 메타 정보(Session / Status / Cwd / Branch / Started)는 구분선 위에 고정되어 스크롤해도 사라지지 않으며, Status 행은 목록의 ST 컬럼과 같은 팔레트로 상태별 색상이 적용된다(● 초록 · ! 빨강 · ◦ 시안 · ○ 흐림 · ✓ 마젠타); `d`/`Ctrl-D`로 done 토글(스크롤 위치와 검색 상태 유지, 변경 직후 Status 행이 한 번의 키 입력 동안 반전되어 변화를 알림). 모달 박스 주위로 보이는 목록도 같은 토글을 즉시 따라가며, 모달을 닫았을 때의 모습을 그대로 보여준다. 해당 행의 ST 글리프, 헤더의 ✓/○ 개수, status 정렬 순서가 갱신되고, `H`(완료 숨김)가 켜져 있으면 그 행 자체가 목록에서 사라진다. 어느 경우든 모달은 열었을 때의 세션을 계속 보여주며, `←`/`→` 이동 범위도 모달을 열던 시점의 목록을 유지한다. `Del`로 그 자리에서 삭제(확인)
 - **자동 재스캔 간격 (`i`)** — Off / 5 / 10 / 30 / 60 / 120초. `1`–`6`로 직접 점프, Enter 적용; `state.json`에 저장
 - **삭제 확인 (`Del`)** — `y` 확정 · `n/Esc/Enter` 취소 · 최대 5개 미리 표시
