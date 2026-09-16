@@ -36,7 +36,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. Verify
 ast --version
-# agent-session-tracker v1.3.0
+# agent-session-tracker v1.4.0
 
 # 4. (optional) wire the 0-token done!/undone! prompt hook + status precision layer
 ast install-hook
@@ -195,7 +195,7 @@ ast list [--limit 30] [--cwd PREFIX] [--days N]
 ```
 
 ```
-agent-session-tracker v1.3.0
+agent-session-tracker v1.4.0
   #  ST  AGENT    LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
   1  ●   claude   2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
   2  !   claude   2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
@@ -532,7 +532,7 @@ A curses picker with fzf-style filter, status glyphs, modals, and action keys. *
 | **`F`** | Cycle the origin filter backwards (`all → agent → user`). Persisted. |
 | **`t`** / **`T`** | Toggle color theme (dark ↔ light). Persisted in `state.json`. |
 | `Del` / `Fn+Delete` | Delete marked/current session(s) (confirmation modal) |
-| `?` | Help modal |
+| `?` | Help modal (`/` searches inside it; `n`/`N` next/prev match) |
 | `/` | Enter search mode |
 | `Esc` | Clear filter/search if any; otherwise quit |
 
@@ -557,7 +557,7 @@ A cursor appears on the prompt line. Live filtering happens as you type.
 ### Header bar
 
 ```
- agent-session-tracker v1.3.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.4.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — visible rows / total sessions
@@ -579,7 +579,7 @@ Reflects the current state:
 
 ### Modal dialogs
 
-- **Help (`?`)** — scrollable cheat-sheet.
+- **Help (`?`)** — scrollable cheat-sheet. `/` searches it incrementally (literal, case-insensitive): every match is highlighted and the focused one scrolled into view, `Enter` keeps the highlights, `n`/`N` jump to the next/previous match, and `Esc` clears the search before a second `Esc` closes the modal.
 - **Preview (`v`)** — transcript with role colors, full message text (wrapped). The metadata header (Session / Status / Cwd / Branch / Started) is pinned above the rule and never scrolls away, and its Status row is colored by state like the list's ST column (● green · ! red · ◦ cyan · ○ dim · ✓ magenta); `d`/`Ctrl-D` toggles done in place, keeping the scroll position and any active search, and inverts the Status row for one keypress so the change is visible. The list still visible around the modal box follows the same toggle right away, and shows exactly what you will see once the modal closes: the row's ST glyph, the header's ✓/○ counts, a status sort's order, and — with `H` (hide ✓) on — the row leaving the list entirely. The modal keeps previewing the session it was opened on either way, and `←`/`→` still walks the sessions that were listed when it opened; `Del` deletes in place (with confirmation).
 - **Auto-rescan interval (`i`)** — Off / 5 / 10 / 30 / 60 / 120s. `1`–`6` jumps directly to an option; Enter applies; saved to `state.json`.
 - **Delete confirmation (`Del`)** — `y` confirm · `n/Esc/Enter` cancel · shows up to 5 victims.

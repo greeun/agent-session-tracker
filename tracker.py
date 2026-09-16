@@ -15,7 +15,7 @@ Data sources:
 """
 from __future__ import annotations
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import argparse
 import json
@@ -4646,7 +4646,7 @@ HELP_LINES = [
     "  t / T                  toggle color theme (dark ↔ light) — saved",
     "  R / r / Ctrl-R         rescan sessions + live-process registry",
     "  Del / Fn+Delete        delete marked/current session(s)",
-    "  ?                      this help",
+    "  ?                      this help (/ search inside it, n/N next/prev match)",
     "",
     "Status glyphs",
     "  ● working  actively producing (hook working / registry busy)",
@@ -4660,6 +4660,7 @@ HELP_LINES = [
     "Note: plain letters do NOT filter in normal mode — press `/` first.",
     "",
     "  ↑↓ scroll · PgUp/PgDn page · g/G top/bottom · q/Esc/Enter close",
+    "  / search this help · n/N next/prev match · Esc clears the search first",
 ]
 
 
@@ -5216,6 +5217,91 @@ def _help_scroll(key: int, offset: int, total: int, view_h: int,
     return max(0, min(offset, maxoff)), False
 
 
+@dataclass
+class HelpSearch:
+    """Scroll position and `/` search state of the help modal. Plain data, so
+    `_help_key` can be unit-tested without curses."""
+    offset: int = 0
+    query: str = ""
+    searching: bool = False                    # True while typing in the `/` prompt
+    matches: list = field(default_factory=list)  # (line_idx, char_start, char_end)
+    cur: int = -1
+
+
+def _help_key(st: HelpSearch, key: int, ch_str, lines: list[str], view_h: int,
+              keys: tuple, backspace: int) -> bool:
+    """Apply one keypress to the help modal's state; True means close.
+
+    Mirrors the preview modal's search. While the `/` prompt is open every
+    printable key extends the query and the matches are recomputed on the spot;
+    Enter leaves the prompt with the highlights kept, Esc drops the search.
+    Outside the prompt `/` re-opens it on the same query, `n`/`N` step through
+    the matches, Esc clears an active search before a second Esc closes, and
+    everything else goes to `_help_scroll`. `keys` is `_help_scroll`'s tuple;
+    `backspace` is `curses.KEY_BACKSPACE`, passed in to keep this curses-free."""
+    total = len(lines)
+    maxoff = max(0, total - view_h)
+
+    def _show_cur():
+        st.offset = _scroll_match_into_view(st.matches[st.cur][0], st.offset,
+                                            view_h, maxoff)
+
+    def _recompute():
+        st.matches = _preview_find_matches([(ln, 0) for ln in lines], st.query)
+        if not st.matches:
+            st.cur = -1
+            return
+        st.cur = next((i for i, (ml, _, _) in enumerate(st.matches)
+                       if ml >= st.offset), 0)
+        _show_cur()
+
+    def _clear():
+        st.query, st.matches, st.cur = "", [], -1
+
+    if st.searching:
+        # Printable text first: `_read_key` reports a char such as U+0107 by
+        # its codepoint, which equals KEY_BACKSPACE (263).
+        if ch_str is not None and ch_str.isprintable():
+            st.query += ch_str
+            _recompute()
+        elif key in (10, 13):                    # Enter — keep highlights
+            st.searching = False
+        elif key == 27:                          # Esc — cancel search
+            st.searching = False
+            _clear()
+        elif key in (backspace, 127, 8):
+            st.query = st.query[:-1]
+            _recompute()
+        elif key == 21:                          # Ctrl-U — wipe query
+            st.query = ""
+            _recompute()
+        return False
+
+    if key == ord('/'):
+        st.searching = True
+        return False
+    if key == 27 and st.query:
+        _clear()
+        return False
+    if key in (ord('n'), ord('N')):
+        if st.matches:
+            st.cur = _match_step(st.cur, len(st.matches), key == ord('n'))
+            _show_cur()
+        return False
+    st.offset, close = _help_scroll(key, st.offset, total, view_h, keys)
+    return close
+
+
+def _help_footer(st: HelpSearch) -> str:
+    """The help modal's bottom inner row: the search prompt, else key hints."""
+    if not (st.searching or st.query):
+        return " / search · ↑↓ scroll · PgUp/PgDn · g/G · q/Esc close "
+    cnt = f"[{(st.cur + 1) if st.matches else 0}/{len(st.matches)}]"
+    if st.searching:
+        return f" /{st.query}▏  {cnt}  Enter find · Esc cancel "
+    return f" /{st.query}  {cnt}  n/N next/prev · / edit · Esc clear "
+
+
 def _show_help_modal(stdscr):
     import curses
     h, w = stdscr.getmaxyx()
@@ -5225,16 +5311,20 @@ def _show_help_modal(stdscr):
         win = _centered_win(stdscr, box_h, box_w)
     except curses.error:
         return
-    view_h = max(1, box_h - 2)
+    view_h = max(1, box_h - 3)   # the last inner row holds the footer
     total = len(HELP_LINES)
-    offset = 0
+    st = HelpSearch()
     keys = (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE,
             curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END)
+    # Same highlight pair as the preview modal: every match in a yellow block,
+    # the focused one in cyan. A_REVERSE keeps both visible without color.
+    hl_attr = curses.color_pair(2) | curses.A_REVERSE
+    cur_attr = curses.color_pair(9) | curses.A_REVERSE | curses.A_BOLD
     try:
         while True:
             win.erase()
             win.box()
-            for i, line in enumerate(HELP_LINES[offset: offset + view_h]):
+            for i, line in enumerate(HELP_LINES[st.offset: st.offset + view_h]):
                 try:
                     attr = curses.A_BOLD if line and not line.startswith(" ") and line[-1] != "…" else curses.A_NORMAL
                     if line == HELP_LINES[0]:
@@ -5242,19 +5332,35 @@ def _show_help_modal(stdscr):
                     win.addnstr(1 + i, 2, line, box_w - 4, attr)
                 except curses.error:
                     pass
+                idx = st.offset + i
+                for mi, (ml, cs, ce) in enumerate(st.matches):
+                    if ml != idx:
+                        continue
+                    col = 2 + display_width(line[:cs])
+                    if col >= box_w - 2:
+                        continue
+                    try:
+                        win.addnstr(1 + i, col, line[cs:ce], box_w - 2 - col,
+                                    cur_attr if mi == st.cur else hl_attr)
+                    except curses.error:
+                        pass
             try:
-                if offset > 0:
+                if st.offset > 0:
                     win.addnstr(0, max(2, box_w - 11), " ▲ more ", 9,
                                 curses.A_DIM)
-                if offset + view_h < total:
+                if st.offset + view_h < total:
                     win.addnstr(box_h - 1, max(2, box_w - 11), " ▼ more ", 9,
                                 curses.A_DIM)
+                win.addnstr(box_h - 2, 2, _help_footer(st), box_w - 4,
+                            curses.A_DIM)
             except curses.error:
                 pass
             win.refresh()
-            offset, close = _help_scroll(win.getch(), offset, total,
-                                         view_h, keys)
-            if close:
+            ch, ch_str = _read_key(win)
+            if ch == -1 and ch_str is None:
+                continue
+            if _help_key(st, ch, ch_str, HELP_LINES, view_h, keys,
+                         curses.KEY_BACKSPACE):
                 break
     finally:
         del win
