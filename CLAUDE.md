@@ -237,16 +237,37 @@ counter. `clock` exists for tests, since `time` is imported per-function here
 and cannot be stubbed on the module.
 
 **One row per sessionId** — `dedupe_sessions()` (~line 2167) runs just before
-that sort, and `cmd_search` applies it to its own hits. `session_id` is
-`path.stem`, so the *same* session existing as a `.jsonl` in two project dirs
-renders twice. That is not hypothetical: renaming a project (or copying
+that sort, and `cmd_search` applies it to its own hits. `session_id` comes
+from the file name, so the *same* session existing as a `.jsonl` in two
+project dirs renders twice. That is not hypothetical: renaming a project (or copying
 `~/.claude/projects` around, e.g. through a synced folder) leaves the old
 `<encoded-cwd>/<sid>.jsonl` behind, byte-identical, and both copies report the
 same transcript `cwd` — so the two rows are indistinguishable on screen.
-`_dup_rank()` keeps the canonical copy (parent dir == `encode_cwd(meta.cwd)`),
-then the richer transcript (`msg_count`), then the fresher `last_ts`; ties keep
-the first, which is deterministic because `all_session_files()` is path-sorted.
-Dedup is display-only — ast never deletes the redundant file.
+`_dup_rank()` keeps the file still named `<sid>.jsonl`, then the canonical copy
+(parent dir == `encode_cwd(meta.cwd)`), then the richer transcript
+(`msg_count`), then the fresher `last_ts`; ties keep the first, which is
+deterministic because `all_session_files()` is path-sorted. Dedup is
+display-only — ast never deletes the redundant file.
+
+The first key exists for the other way a synced `~/.claude/projects` doubles a
+session: two machines write the same transcript, and the sync client keeps the
+losing version beside it under a longer name — Synology Drive
+`<sid>_<host>_<date>_Conflict.jsonl` (seen for real), Syncthing
+`<sid>.sync-conflict-…`, Dropbox `<sid> (… conflicted copy …)`, iCloud `<sid> 2`.
+The claude `session_id_of` (`_claude_session_id_of`) therefore reads the
+leading UUID of the stem rather than the whole stem, falling back to the stem
+when there is none; before that, the copy became a row of its own whose 8-char
+id matched the original's and whose `claude --resume <stem>` nothing answered.
+Such a copy has usually *diverged* — the real one held two more days of
+conversation than the original — and may even be the richer file, but the row
+still goes to `<sid>.jsonl`, because every id-addressed action (resume, done,
+relocate) and `claude --resume <sid>` itself land on that file. `find_session()`
+follows the same rule: several files under one session id resolve through
+`dedupe_sessions()` instead of being reported as an ambiguous prefix, so
+`ast show <sid>` answers with the file the list shows. Codex needs none of
+this: `_codex_session_files()` only accepts names matching
+`_CODEX_ROLLOUT_RE`, which a conflict copy's suffix breaks, so such a copy is
+never listed at all.
 
 ### Data files read/written
 
@@ -434,7 +455,7 @@ after the write loop, for every written codex `.jsonl` (`codex_written`):
 - The TUI itself requires a real TTY — `_pick_ui` can't run from non-interactive Bash calls or agent tool calls (verify its curses layout headlessly via `pty.fork` + `getyx`)
 - CJK/Unicode display width is handled manually via `east_asian_width`; search mode assembles UTF-8 byte-by-byte to work around Python curses bugs on some terminals
 - `ESCDELAY` is set to 25ms for responsive Esc handling
-- `_CACHE_SCHEMA` version (currently 6) must be bumped when `SessionMeta` fields or extraction logic change, to invalidate stale cache entries. The one exception is the listed agent: `_meta_from_cache` re-derives it through `listed_agent()`, so a `listed_as` rule change needs no bump (and must not get one — a bump forces a full cold re-index)
+- `_CACHE_SCHEMA` version (currently 6) must be bumped when `SessionMeta` fields or extraction logic change, to invalidate stale cache entries. The exceptions are what `_meta_from_cache` re-derives instead of reading back: the listed agent (through `listed_agent()`, so a `listed_as` rule change needs no bump) and the session id (through the spec's `session_id_of(path)`, so an id-extraction change needs none either). Neither must get one — a bump forces a full cold re-index
 - `encode_cwd()` NFC-normalizes paths before encoding — important for Korean filesystem paths on macOS
 - Version string is in `__version__` at the top of `tracker.py` — and a release
   has to carry it into four other places: `SKILL.md`'s frontmatter `version:`,

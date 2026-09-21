@@ -116,5 +116,103 @@ class TestLoadAllSessionsDedupes(unittest.TestCase):
         self.assertEqual(rows[0].path, keep)
 
 
+# Synology Drive's name for the copy it keeps when two machines wrote the
+# same transcript — the case that put `9b378c65` in the TUI twice.
+_CONFLICT_SUFFIX = "_uni4loveui-MacBookPro.local_Sep-15-010058-2026_Conflict"
+
+
+class TestSyncConflictCopy(unittest.TestCase):
+    """A sync client's conflict copy keeps the session id at the front of
+    its name. It is the same session, so it must not become a second row
+    whose `claude --resume <stem>` no session answers to."""
+
+    def test_conflict_copy_names_resolve_to_the_session_id(self):
+        sid_of = tk.CLAUDE_AGENT.session_id_of
+        for name in (f"{_SID}.jsonl",
+                     f"{_SID}{_CONFLICT_SUFFIX}.jsonl",           # Synology Drive
+                     f"{_SID}.sync-conflict-20260915-010058-ABCDEFG.jsonl",  # Syncthing
+                     f"{_SID} (host's conflicted copy 2026-09-15).jsonl",    # Dropbox
+                     f"{_SID} 2.jsonl"):                          # iCloud
+            with self.subTest(name=name):
+                self.assertEqual(sid_of(Path("/p/d") / name), _SID)
+
+    def test_names_without_a_leading_uuid_keep_their_stem(self):
+        sid_of = tk.CLAUDE_AGENT.session_id_of
+        self.assertEqual(sid_of(Path("/p/d/sess-a.jsonl")), "sess-a")
+        # Hex running on past the last group means this was never a uuid.
+        self.assertEqual(sid_of(Path(f"/p/d/{_SID}0.jsonl")), f"{_SID}0")
+
+    def test_original_name_beats_a_richer_conflict_copy(self):
+        # Both sit in the canonical dir; the copy holds more messages, but
+        # `claude --resume <sid>` opens `<sid>.jsonl`, so that file is the row.
+        cwd = "/Users/u/proj/tavlet"
+        d = Path("/p") / tk.encode_cwd(cwd)
+        orig = tk.SessionMeta(session_id=_SID, path=d / f"{_SID}.jsonl",
+                              cwd=cwd, msg_count=246, last_ts=_T0)
+        copy = tk.SessionMeta(session_id=_SID,
+                              path=d / f"{_SID}{_CONFLICT_SUFFIX}.jsonl",
+                              cwd=cwd, msg_count=461,
+                              last_ts=_T0 + timedelta(days=2))
+        self.assertEqual(tk.dedupe_sessions([orig, copy]), [orig])
+        self.assertEqual(tk.dedupe_sessions([copy, orig]), [orig])
+
+
+class TestSyncConflictCopyEndToEnd(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self._orig = (tk.PROJECTS_DIR, tk.CODEX_SESSIONS_DIR, tk.CODEX_LOCKS_DIR,
+                      tk.CACHE_DIR, tk.CACHE_PATH, tk.STATE_PATH)
+        tk.PROJECTS_DIR = root / "projects"
+        tk.CODEX_SESSIONS_DIR = root / "codex_sessions"
+        tk.CODEX_LOCKS_DIR = root / "codex_locks"
+        tk.CACHE_DIR = root / "cache"
+        tk.CACHE_PATH = tk.CACHE_DIR / "index.json"
+        tk.STATE_PATH = tk.CACHE_DIR / "state.json"
+        self.cwd = "/Users/u/proj/tavlet"
+        d = tk.PROJECTS_DIR / tk.encode_cwd(self.cwd)
+        d.mkdir(parents=True)
+        self.orig = self._write(d / f"{_SID}.jsonl", ["hi"])
+        self.copy = self._write(d / f"{_SID}{_CONFLICT_SUFFIX}.jsonl",
+                                ["hi", "and more", "after the fork"])
+
+    def tearDown(self):
+        (tk.PROJECTS_DIR, tk.CODEX_SESSIONS_DIR, tk.CODEX_LOCKS_DIR,
+         tk.CACHE_DIR, tk.CACHE_PATH, tk.STATE_PATH) = self._orig
+        self._tmp.cleanup()
+
+    def _write(self, path, prompts):
+        path.write_text("".join(
+            json.dumps({"type": "user", "cwd": self.cwd, "sessionId": _SID,
+                        "timestamp": f"2026-08-0{i + 1}T00:00:00Z",
+                        "message": {"content": text}}) + "\n"
+            for i, text in enumerate(prompts)), encoding="utf-8")
+        return path
+
+    def test_list_shows_one_row_for_the_original_file(self):
+        rows = tk.load_all_sessions(fast=True)
+        self.assertEqual([(m.session_id, m.path) for m in rows],
+                         [(_SID, self.orig)])
+
+    def test_index_written_before_the_fix_still_folds_the_copy(self):
+        # An index built by an older ast stores the copy under its stem, and
+        # the copy's mtime/size have not changed since — so the id must be
+        # re-derived from the path rather than read back from the entry.
+        tk.load_all_sessions(fast=True)
+        cache = json.loads(tk.CACHE_PATH.read_text(encoding="utf-8"))
+        cache["entries"][str(self.copy)]["session_id"] = self.copy.stem
+        tk.CACHE_PATH.write_text(json.dumps(cache), encoding="utf-8")
+        rows = tk.load_all_sessions(fast=True)
+        self.assertEqual([(m.session_id, m.path) for m in rows],
+                         [(_SID, self.orig)])
+
+    def test_id_lookup_picks_the_original_instead_of_calling_it_ambiguous(self):
+        for prefix in (_SID[:8], _SID):
+            with self.subTest(prefix=prefix):
+                meta = tk.find_session(prefix)
+                self.assertIsNotNone(meta)
+                self.assertEqual(meta.path, self.orig)
+
+
 if __name__ == "__main__":
     unittest.main()
