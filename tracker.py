@@ -15,7 +15,7 @@ Data sources:
 """
 from __future__ import annotations
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 import argparse
 import json
@@ -282,6 +282,22 @@ def _path_under(path: Path, root: Path) -> bool:
         return False
 
 
+_UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+# Claude Code names a transcript `<sessionId>.jsonl`. A sync client that loses
+# a write race keeps the other version by renaming it — Synology Drive
+# `<sid>_<host>_<date>_Conflict`, Syncthing `<sid>.sync-conflict-…`, Dropbox
+# `<sid> (… conflicted copy …)`, iCloud `<sid> 2` — and every one of them
+# leaves the id in front. Reading the id from there keeps such a copy the same
+# session, so dedupe_sessions() folds it into the original's row instead of
+# listing a second one that `claude --resume <stem>` cannot find.
+_CLAUDE_SID_RE = re.compile(r"^(" + _UUID_RE + r")(?![0-9a-fA-F])")
+
+
+def _claude_session_id_of(path: Path) -> str:
+    m = _CLAUDE_SID_RE.match(path.stem)
+    return m.group(1) if m else path.stem
+
+
 def _claude_resume_argv(bin_: str, session_id: str, skip_perm: bool) -> list[str]:
     argv = [bin_, "--resume", session_id]
     if skip_perm:
@@ -304,7 +320,7 @@ CLAUDE_AGENT = AgentSpec(
     name="claude", bin="claude", resume_label="claude --resume",
     owns=lambda p: _path_under(p, PROJECTS_DIR),
     session_files=lambda inc: _claude_session_files(inc),
-    session_id_of=lambda p: p.stem,
+    session_id_of=_claude_session_id_of,
     iter_turns=lambda p, line_sink=None: _claude_iter_turns(p, line_sink),
     resume_argv=_claude_resume_argv,
     caps=frozenset({"resume", "attach", "jobs", "hooks", "subagents",
@@ -342,7 +358,6 @@ CODEX_LOCKS_DIR = CODEX_HOME / "thread-writer-locks"
 # a migrated conversation keeps its title, appended to by restore.
 CODEX_SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
 _CODEX_BUSY_WINDOW_S = 90   # rollout written within this → ● working, else ◦ idle
-_UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 _CODEX_ROLLOUT_RE = re.compile(r"^rollout-.*-(" + _UUID_RE + r")\.jsonl$")
 _CODEX_LOCK_RE = re.compile(r"^(" + _UUID_RE + r")\.lock$")
 # Codex injects these as `user` messages; none of them is the user's prompt.
@@ -2987,11 +3002,14 @@ def _meta_from_cache(d: dict, path: Path) -> SessionMeta:
     # The listed agent is re-derived rather than trusted: for a shared store it
     # is a function of the cached cwd, so an index written before that rule
     # existed (or changed) needs no _CACHE_SCHEMA bump and no cold re-index.
+    # The session id likewise: it is a function of the path, and an index
+    # written before sync conflict copies were recognised holds such a copy
+    # under its whole stem, with nothing about the file changed to evict it.
     cwd = d.get("cwd", "")
     agent = d.get("agent") or DEFAULT_AGENT
     spec = AGENTS.get(agent)
     return SessionMeta(
-        session_id=d["session_id"],
+        session_id=spec.session_id_of(path) if spec else d["session_id"],
         path=path,
         cwd=cwd,
         first_ts=parse_ts(d.get("first_ts")),
@@ -3138,14 +3156,22 @@ _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 def _dup_rank(m: SessionMeta) -> tuple:
     """Ranking for two files that claim the same sessionId — bigger wins.
 
-    The canonical copy is the one sitting in the project dir that encodes its
-    own transcript `cwd`; a leftover copy in a renamed project's old dir loses
-    even if it looks fatter. Then richer transcript, then fresher activity."""
+    A file still named `<sid>.jsonl` beats a sync client's conflict copy
+    (`<sid>_…_Conflict.jsonl`) however much more that copy holds: resume, done
+    and relocate all address the session by id, and `claude --resume <sid>`
+    opens the former. Next, the canonical copy is the one sitting in the
+    project dir that encodes its own transcript `cwd`; a leftover copy in a
+    renamed project's old dir loses even if it looks fatter. Then richer
+    transcript, then fresher activity."""
+    # A codex rollout's stem is `rollout-<ts>-<id>`, never the bare id, and
+    # its conflict copies never reach this point (_codex_session_files skips
+    # them), so this only ever separates claude files.
+    original = m.path.stem == m.session_id
     # The encoded-cwd project dir is a Claude Code convention; other agents
     # (codex: one dated rollout per session) have no such duplicate layout.
     canonical = (m.agent == "claude" and bool(m.cwd)
                  and m.path.parent.name == encode_cwd(m.cwd))
-    return (canonical, m.msg_count, m.last_ts or _EPOCH)
+    return (original, canonical, m.msg_count, m.last_ts or _EPOCH)
 
 
 def dedupe_sessions(metas: list[SessionMeta]) -> list[SessionMeta]:
@@ -3153,7 +3179,9 @@ def dedupe_sessions(metas: list[SessionMeta]) -> list[SessionMeta]:
 
     Renaming or copying a project leaves Claude Code's old
     `~/.claude/projects/<encoded-cwd>/<sid>.jsonl` behind, so the same session
-    exists as two (usually byte-identical) files. One SessionMeta per *file*
+    exists as two (usually byte-identical) files. A synced `~/.claude/projects`
+    adds a second way: the conflict copy a sync client keeps beside the
+    original, which may have diverged from it. One SessionMeta per *file*
     would render the session twice in `ast list`, `--json` and the TUI. Ties
     keep the first copy — callers feed the path-sorted `all_session_files()`,
     so the pick is deterministic."""
@@ -8006,16 +8034,22 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 def find_session(prefix: str) -> SessionMeta | None:
     matches: list[Path] = []
+    sids: set[str] = set()
     for p in all_session_files():
-        if agent_for_path(p).session_id_of(p).startswith(prefix):
+        sid = agent_for_path(p).session_id_of(p)
+        if sid.startswith(prefix):
             matches.append(p)
+            sids.add(sid)
     if not matches:
         for p in all_subagent_files():
             if p.stem.startswith(prefix):
                 matches.append(p)
     if not matches:
         return None
-    if len(matches) > 1:
+    # Several files under ONE session id are copies of that session (a sync
+    # client's conflict copy, a renamed project's leftover), which the list
+    # shows as a single row — so they are not ambiguous; resolve them below.
+    if len(matches) > 1 and len(sids) != 1:
         print(f"Ambiguous id {prefix!r} — {len(matches)} matches:", file=sys.stderr)
         for m in matches[:10]:
             print(f"  {m.stem}", file=sys.stderr)
@@ -8030,10 +8064,18 @@ def find_session(prefix: str) -> SessionMeta | None:
     # single `ast show`/`resume`/… lookup skip the full transcript parse.
     cache = _load_cache()
     entries = cache.setdefault("entries", {})
-    meta, fresh = _meta_for_path(match, entries)
-    if fresh and meta:
+    metas: list[SessionMeta] = []
+    parsed = False
+    for p in matches:
+        meta, fresh = _meta_for_path(p, entries)
+        if meta:
+            metas.append(meta)
+            parsed = parsed or fresh
+    if parsed:
         _save_cache(cache)
-    return meta
+    # Same pick as the list, so an id resolves to the file its row shows.
+    kept = dedupe_sessions(metas)
+    return kept[0] if kept else None
 
 
 def require_session(prefix: str) -> "SessionMeta | None":
