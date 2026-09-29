@@ -4406,11 +4406,15 @@ def merge_conflict_group(original: Path, copies: list[Path],
         dest.parent.mkdir(parents=True, exist_ok=True)
         return dest
 
+    # The list's LAST ACTIVITY is the file mtime (fast indexing), so the merge
+    # keeps the newest mtime among its sources instead of jumping to "now".
+    mtime = max(p.stat().st_mtime for p in (original, *copies) if p.exists())
     if original.exists():
         shutil.copy2(str(original), str(_backup_path(original)))
     tmp = original.with_name(f".{original.name}.{os.getpid()}.merge")
     with tmp.open("w", encoding="utf-8") as f:
         f.writelines(line + "\n" for line in lines)
+    os.utime(tmp, (mtime, mtime))
     tmp.replace(original)
     for c in copies:
         shutil.move(str(c), str(_backup_path(c)))

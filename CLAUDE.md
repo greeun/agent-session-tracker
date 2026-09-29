@@ -283,7 +283,8 @@ records) by exact text, the original wins a duplicate, and a `heapq.merge` on
 timestamps (an untimed line inherits its predecessor's) interleaves the
 sources without ever reordering lines within one — a union of two diverged
 claude versions is still a valid `parentUuid` tree holding both branches. The
-result is written beside the original and swapped in; an original that is
+result is written beside the original with the newest source mtime (the
+list's LAST ACTIVITY is the mtime) and swapped in; an original that is
 gone is rebuilt from its copies. The pre-merge original is copied and the
 copies are moved to
 `~/.ast/backups/conflicts/<stamp>/<store>/<relpath>`, the touched paths are

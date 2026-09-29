@@ -141,6 +141,16 @@ class TestMergeCommand(_FsBase):
         self.assertEqual(len(kept), 1)
         self.assertEqual(self._uuids(kept[0]), ["1"])       # 병합 전 원본
 
+    def test_merged_file_keeps_newest_source_mtime(self):
+        import os
+        self._write(self.orig, [ev("1", "2026-01-01T00:00:01Z")])
+        self._write(self.copy, [ev("2", "2026-01-01T00:00:02Z")])
+        os.utime(self.orig, (1_000_000, 1_000_000))
+        os.utime(self.copy, (2_000_000, 2_000_000))
+        rc, _ = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.orig.stat().st_mtime, 2_000_000)
+
     def test_missing_original_is_rebuilt_from_copy(self):
         self._write(self.copy, [ev("1", "2026-01-01T00:00:01Z")])
         rc, _ = self._run()
