@@ -683,7 +683,8 @@ Equivalent manual entry (one event shown):
 | `$CODEX_HOME/sessions/**/rollout-*.jsonl` | Codex CLI transcripts, plus the ChatGPT desktop app's conversations (default `~/.codex`; read-only) | Leave alone |
 | `$CODEX_HOME/thread-writer-locks/<uuid>.lock` | Codex's per-thread writer lock — ast probes the flock for liveness (read-only) | Leave alone |
 | `~/.ast/index.json` | mtime/size-invalidated session-metadata cache (schema 6, entries carry `agent`) | Yes — regenerates on next run |
-| `~/.ast/state.json` | done flags + hook status overlay + user prefs (auto-rescan, theme, sort, origin, agent view) | Yes — clears all `✓` marks, overlay, and prefs |
+| `~/.ast/state.json` | done flags (+ `undone` tombstones) + user prefs (auto-rescan, theme, sort, origin, agent view). Sync conflict copies (`state_*_Conflict.json`, `state.sync-conflict-*.json`, …) are merged back in and deleted automatically | Yes — clears all `✓` marks and prefs |
+| `~/.ast/status.<host>.json` | hook status overlay, one file per machine so a synced home never has two writers | Yes — status falls back to the process registry until the next hook |
 
 All `~/.claude/...` paths above honor **`$CLAUDE_CONFIG_DIR`** (same convention
 as Claude Code itself): when set, ast reads `projects/`, `sessions/`, `jobs/`,

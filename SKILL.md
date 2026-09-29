@@ -201,7 +201,7 @@ Claude Code 2.x — no setup. The registry also gives `●` working / `◦` idle
 a dead PID is `○`.
 
 `ast install-hook` (optional) wires `ast status-hook` across 5 lifecycle events
-as a **precision layer** that writes to `state.json["status"]` — faster/finer
+as a **precision layer** that writes to `status.<host>.json` — faster/finer
 transitions, cleaner finished signal. **Not required for `!`.** Inside cmux:
 cmux injects its own Claude hooks via `--settings`; Claude Code merges them
 additively, so ast's hooks still fire — no conflict. *With hooks installed*,
