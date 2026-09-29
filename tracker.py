@@ -11,6 +11,7 @@ Data sources:
   ~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl        — codex transcripts
   ~/.codex/thread-writer-locks/<uuid>.lock             — codex liveness (flock)
   ~/.ast/state.json                                    — done-state overlay
+  ~/.ast/status.<host>.json                            — hook status overlay
   ~/.ast/index.json                                    — indexing cache
 """
 from __future__ import annotations
@@ -2088,15 +2089,91 @@ def get_live_session_info(session_id: str) -> dict | None:
 
 # ---------- done-state overlay ----------
 
+# A home kept in a sync folder (Synology Drive, Syncthing, Dropbox) is shared
+# by several machines, and flock serializes writers on ONE machine only. When
+# two machines save state.json close together the sync client keeps one and
+# sets the other aside as a conflict copy — Synology
+# `state_<host>_<date>_Conflict.json`, Syncthing `state.sync-conflict-….json`,
+# Dropbox `state (… conflicted copy …).json`. ast never read those, so a done
+# flag set on the losing machine silently vanished. load_state() now folds
+# every such copy's done/undone entries back in and save_state() deletes the
+# copies it folded, so a lost race costs nothing.
+_STATE_CONFLICT_RE = re.compile(r"^state(?!\.json$).*conflict.*\.json$",
+                                re.IGNORECASE)
+# Transient load_state() key: conflict copies folded into this dict, which the
+# save that persists the merge may delete. Never written to disk.
+_ABSORBED_KEY = "__absorbed__"
+
+
+def _done_stamp(val) -> str:
+    """Timestamp of a done/undone entry. ast writes an ISO string; tolerate
+    the `{"at": iso}` shape older data and tests carry."""
+    if isinstance(val, dict):
+        val = val.get("at")
+    return val if isinstance(val, str) else ""
+
+
+def _merge_done(dst: dict, src: dict) -> None:
+    """Fold src's done/undone into dst, last writer wins per session.
+
+    `undone` is the tombstone of an unmark: without it a copy that still held
+    the old done flag would resurrect a session the user deliberately
+    reopened. A copy written before tombstones existed has none, so its done
+    entries win unless dst carries a later undone for the same session."""
+    done = dst.setdefault("done", {})
+    undone = dst.setdefault("undone", {})
+    for bucket, is_done in (("done", True), ("undone", False)):
+        for sid, val in (src.get(bucket) or {}).items():
+            cur = max(_done_stamp(done.get(sid)), _done_stamp(undone.get(sid)))
+            if sid in done or sid in undone:
+                if _done_stamp(val) <= cur:
+                    continue
+            if is_done:
+                done[sid] = val
+                undone.pop(sid, None)
+            else:
+                undone[sid] = val
+                done.pop(sid, None)
+    if not undone:
+        dst.pop("undone")
+
+
+def _state_conflict_copies() -> list[Path]:
+    try:
+        return sorted(p for p in STATE_PATH.parent.iterdir()
+                      if _STATE_CONFLICT_RE.match(p.name) and p.is_file())
+    except OSError:
+        return []
+
+
 def load_state() -> dict:
     try:
         with STATE_PATH.open("r", encoding="utf-8") as f:
-            return json.load(f)
+            state = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return {}
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    absorbed = []
+    for path in _state_conflict_copies():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                other = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue                 # unreadable copy: leave it for the user
+        if isinstance(other, dict):
+            _merge_done(state, other)
+        absorbed.append(str(path))
+    if absorbed:
+        state[_ABSORBED_KEY] = absorbed
+    return state
 
 
 def save_state(state: dict) -> None:
+    absorbed = state.pop(_ABSORBED_KEY, None) or []
+    # The hook status overlay moved to a per-machine file (see _status_path);
+    # drop the bucket older builds left here so it stops churning the sync.
+    state.pop("status", None)
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = STATE_PATH.with_suffix(f".{os.getpid()}.tmp")
@@ -2104,20 +2181,24 @@ def save_state(state: dict) -> None:
             json.dump(state, f, ensure_ascii=False, indent=2)
         tmp.replace(STATE_PATH)
     except OSError:
-        pass
+        return
+    for p in absorbed:
+        try:
+            Path(p).unlink()
+        except OSError:
+            pass
 
 
 @contextmanager
-def _state_lock():
-    """Serialize the read-modify-write of state.json across concurrently
-    running hook processes (many sessions can fire status hooks at once).
-    Advisory and best-effort: if fcntl is unavailable or the lock can't be
-    acquired, proceed unlocked rather than block a status update."""
+def _file_lock(lock_path: Path):
+    """Advisory and best-effort exclusive flock on `lock_path`: if fcntl is
+    unavailable or the lock can't be acquired, proceed unlocked rather than
+    block a status update."""
     f = None
     if fcntl is not None:
         try:
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            f = open(STATE_PATH.with_suffix(".lock"), "w")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            f = open(lock_path, "w")
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         except OSError:
             if f is not None:
@@ -2133,33 +2214,51 @@ def _state_lock():
                 f.close()
 
 
+@contextmanager
+def _state_lock():
+    """Serialize the read-modify-write of state.json across concurrently
+    running ast processes on this machine (see _file_lock)."""
+    with _file_lock(STATE_PATH.with_suffix(".lock")):
+        yield
+
+
 def done_ids() -> set[str]:
     state = load_state()
     return set((state.get("done") or {}).keys())
+
+
+def _apply_done(state: dict, session_id: str, value: bool) -> None:
+    """Set or clear one done flag, stamping an `undone` tombstone on clear so
+    a sync conflict copy still holding the flag can't bring it back."""
+    now = datetime.now(timezone.utc).isoformat()
+    done = state.setdefault("done", {})
+    undone = state.get("undone") or {}
+    if value:
+        done[session_id] = now
+        undone.pop(session_id, None)
+    else:
+        done.pop(session_id, None)
+        undone[session_id] = now
+    if undone:
+        state["undone"] = undone
+    else:
+        state.pop("undone", None)
 
 
 def mark_done(session_id: str) -> bool:
     """Toggle done state; return True if now marked done, False if unmarked."""
     with _state_lock():
         state = load_state()
-        done = state.setdefault("done", {})
-        if session_id in done:
-            del done[session_id]
-            save_state(state)
-            return False
-        done[session_id] = datetime.now(timezone.utc).isoformat()
+        now_done = session_id not in (state.get("done") or {})
+        _apply_done(state, session_id, now_done)
         save_state(state)
-        return True
+        return now_done
 
 
 def set_done(session_id: str, value: bool) -> None:
     with _state_lock():
         state = load_state()
-        done = state.setdefault("done", {})
-        if value:
-            done[session_id] = datetime.now(timezone.utc).isoformat()
-        else:
-            done.pop(session_id, None)
+        _apply_done(state, session_id, value)
         save_state(state)
 
 
@@ -2196,29 +2295,55 @@ def rm_guard_blocks(status: str, force: bool = False) -> bool:
     return (not force) and status in (STATUS_WORKING, STATUS_WAITING)
 
 
-def status_overlay() -> dict:
-    """state.json hook-driven status overlay: sid -> {state,event,ts}."""
-    val = load_state().get("status")
+def _status_path() -> Path:
+    """Per-machine file for the hook status overlay, beside state.json.
+
+    Status hooks fire on every turn of every session, so keeping the overlay
+    in the shared state.json rewrote that file constantly and was what made
+    the machines of a synced home collide (see _STATE_CONFLICT_RE). The
+    overlay only matters for sessions alive on this machine — classify_status
+    ignores it otherwise — so each machine keeps its own file, which a sync
+    client can copy around but never has two writers for."""
+    host = re.sub(r"[^A-Za-z0-9_-]", "_", os.uname().nodename.split(".")[0])
+    return STATE_PATH.with_name(f"status.{host or 'local'}.json")
+
+
+def _load_status() -> dict:
+    try:
+        with _status_path().open("r", encoding="utf-8") as f:
+            val = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
     return val if isinstance(val, dict) else {}
+
+
+def status_overlay() -> dict:
+    """Hook-driven status overlay: sid -> {state,event,ts}."""
+    return _load_status()
 
 
 def set_status(session_id: str, state: str | None, event: str) -> None:
     """Record (or clear, when state is None) a session's hook status."""
-    with _state_lock():
-        st = load_state()
-        bucket = st.get("status")
-        if not isinstance(bucket, dict):
-            bucket = {}
-            st["status"] = bucket
+    path = _status_path()
+    with _file_lock(path.with_suffix(".lock")):
+        bucket = _load_status()
         if state is None:
-            bucket.pop(session_id, None)
+            if bucket.pop(session_id, None) is None:
+                return
         else:
             bucket[session_id] = {
                 "state": state,
                 "event": event,
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
-        save_state(st)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(bucket, f, ensure_ascii=False, indent=2)
+            tmp.replace(path)
+        except OSError:
+            pass
 
 
 def resolve_status(session_id: str, live: set[str], done: set[str],
@@ -2298,7 +2423,7 @@ def classify_status(*, done: bool, alive: bool,
                        job: dict | None = None) -> str:
     """Pure status decision. See spec 'Resolution priority'.
 
-    overlay: state.json status entry for this session, e.g.
+    overlay: status.<host>.json entry for this session, e.g.
              {"state": "waiting", "event": "Notification", "ts": "<iso>"} or None
     reg:     registry record for this session, e.g.
              {"status": "idle", "updatedAt": <ms>} or None
@@ -4398,7 +4523,7 @@ def cmd_prompt_hook(args: argparse.Namespace) -> int:
 #
 # `ast status-hook` is wired into ~/.claude/settings.json by `ast install-hook`
 # under several Claude Code lifecycle events. It reads the hook JSON on stdin,
-# maps hook_event_name -> a status, and records it into state.json["status"].
+# maps hook_event_name -> a status, and records it into status.<host>.json.
 # No stdout (non-blocking; 0 tokens). See the waiting-status design spec.
 
 _HOOK_STATE = {
@@ -8363,7 +8488,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_shook = sub.add_parser(
         "status-hook",
-        help="lifecycle hook: record working/waiting/idle into state.json")
+        help="lifecycle hook: record working/waiting/idle into status.<host>.json")
     p_shook.add_argument("event", nargs="?", default=None,
                          help="event name (fallback when stdin has no "
                               "hook_event_name)")

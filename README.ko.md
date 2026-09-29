@@ -677,7 +677,8 @@ TUI에서 `Enter`를 누르면 **현재 쓰는 터미널 앱과 동일한 앱의
 | `$CODEX_HOME/sessions/**/rollout-*.jsonl` | Codex CLI 트랜스크립트와 ChatGPT 데스크톱 앱 대화 (기본 `~/.codex`; 읽기 전용) | 건드리지 말 것 |
 | `$CODEX_HOME/thread-writer-locks/<uuid>.lock` | codex의 스레드별 writer 잠금 — cst는 flock 탐지로 실행 여부만 확인 (읽기 전용) | 건드리지 말 것 |
 | `~/.ast/index.json` | mtime/size 무효화 세션 메타 캐시 (스키마 6, 항목마다 `agent` 보유) | 예 (다음 실행 시 재생성) |
-| `~/.ast/state.json` | done 플래그 + 훅 상태 오버레이 + 사용자 설정(자동 재스캔·테마·정렬·생성 주체·에이전트 뷰) | 예 (모든 `✓` 마크·오버레이·설정 초기화) |
+| `~/.ast/state.json` | done 플래그(+ `undone` 해제 기록) + 사용자 설정(자동 재스캔·테마·정렬·생성 주체·에이전트 뷰). 동기화 충돌본(`state_*_Conflict.json`, `state.sync-conflict-*.json` 등)은 자동으로 병합한 뒤 삭제 | 예 (모든 `✓` 마크·설정 초기화) |
+| `~/.ast/status.<host>.json` | 훅 상태 오버레이. 기기마다 파일을 따로 두어 동기화 홈에서도 쓰는 주체가 하나뿐 | 예 (다음 훅 전까지 프로세스 레지스트리로 상태 판정) |
 
 위 표의 `~/.claude/...` 경로는 모두 **`$CLAUDE_CONFIG_DIR`**를 따릅니다
 (Claude Code 자체와 같은 규약): 설정돼 있으면 `projects/`, `sessions/`,

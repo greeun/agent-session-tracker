@@ -121,20 +121,19 @@ class TestStatusHookCmd(unittest.TestCase):
         """Apply each payload through cmd_status_hook against ONE temp
         state file; return (last_rc, final_state)."""
         old_stdin, old_state = sys.stdin, tracker.STATE_PATH
-        tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-        tmp.close()
-        tracker.STATE_PATH = pathlib.Path(tmp.name)
+        tmp = tempfile.TemporaryDirectory()
+        tracker.STATE_PATH = pathlib.Path(tmp.name) / "state.json"
         rc = None
         try:
             for p in payloads:
                 sys.stdin = io.StringIO(
                     p if isinstance(p, str) else _json.dumps(p))
                 rc = tracker.cmd_status_hook(tracker.argparse.Namespace())
-            return rc, tracker.load_state()
+            return rc, {"status": tracker.status_overlay()}
         finally:
             sys.stdin = old_stdin
             tracker.STATE_PATH = old_state
-            pathlib.Path(tmp.name).unlink(missing_ok=True)
+            tmp.cleanup()
 
     def test_notification_sets_waiting(self):
         rc, st = self._run_seq([{"hook_event_name": "Notification",

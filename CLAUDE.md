@@ -279,7 +279,8 @@ never listed at all.
 | `$CODEX_HOME/sessions/**/rollout-*.jsonl` | Read | Codex CLI transcripts and ChatGPT desktop app conversations (`CODEX_AGENT` owns both; `CHATGPT_AGENT` labels the latter; default `~/.codex`) |
 | `$CODEX_HOME/thread-writer-locks/<uuid>.lock` | Read (flock probe) | Codex's per-thread writer lock — held ⇒ live (`codex_live_probe`); never written |
 | `~/.ast/index.json` (or `$AST_INDEX_DIR/index.json`) | R/W | Session metadata cache (safe to delete, but deleting it forces a full cold re-index — see `invalidate_cache_entries`) |
-| `~/.ast/state.json` | R/W | Done-flag overlay + status overlay + user prefs: auto-rescan, TUI theme, column sort, origin filter, agent view (safe to delete) |
+| `~/.ast/state.json` | R/W | Done-flag overlay (`done` + `undone` tombstones, last writer wins per sid) + user prefs: auto-rescan, TUI theme, column sort, origin filter, agent view (safe to delete). `load_state()` folds sync conflict copies (`_STATE_CONFLICT_RE`) back in; the next `save_state()` deletes them |
+| `~/.ast/status.<host>.json` | R/W | Hook status overlay (`_status_path()`), per machine so a synced home has one writer per file; `save_state()` drops the legacy `status` key from state.json |
 | `~/.claude/jobs/pins.json` | Read | Agent-view pin set (`read_pins()`) — never written |
 | `~/.cst/state.json` | Read once | claude-session-tracker's overlay, copied into `~/.ast/state.json` on a first run (`seed_from_cst_home()`) — never written |
 
