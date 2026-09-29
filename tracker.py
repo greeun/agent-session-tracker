@@ -299,6 +299,29 @@ def _claude_session_id_of(path: Path) -> str:
     return m.group(1) if m else path.stem
 
 
+# The name a sync client gives the losing version of a file, keyed on the
+# stem so the original's name is the captured `base` + the same suffix.
+# Synology's host is taken as one `_`-free token so a base that itself holds
+# underscores still resolves; iCloud's bare ` 2` is only trusted after a
+# session UUID, where no real file name ends that way.
+_CONFLICT_NAME_RES = (
+    re.compile(r"^(?P<base>.+)_[^_]+_[A-Z][a-z]{2}-\d{2}-\d{6}-\d{4}_Conflict$"),
+    re.compile(r"^(?P<base>.+)\.sync-conflict-\d{8}-\d{6}(?:-[A-Z0-9]+)?$"),
+    re.compile(r"^(?P<base>.+?) \([^()]*conflicted copy[^()]*\)$", re.IGNORECASE),
+    re.compile(r"^(?P<base>" + _UUID_RE + r") \d+$"),
+)
+
+
+def conflict_original(path: Path) -> Path | None:
+    """The file a sync conflict copy was split from, or None when `path` is
+    not named like one. The original may or may not still exist."""
+    for rx in _CONFLICT_NAME_RES:
+        m = rx.match(path.stem)
+        if m:
+            return path.with_name(m.group("base") + path.suffix)
+    return None
+
+
 def _claude_resume_argv(bin_: str, session_id: str, skip_perm: bool) -> list[str]:
     argv = [bin_, "--resume", session_id]
     if skip_perm:
@@ -2781,6 +2804,9 @@ class SessionMeta:
     prs: list = field(default_factory=list)  # [{host,repo,number,url}] from transcript
     entrypoint: str = ""  # transcript `entrypoint`: cli | sdk-py | sdk-cli | sdk-ts
     agent: str = DEFAULT_AGENT  # AGENTS key of the CLI that wrote the transcript
+    # Sync conflict copies folded into this row by dedupe_sessions(); never
+    # cached — it describes sibling files, not this transcript.
+    conflicts: int = 0
 
 
 @dataclass
@@ -3311,10 +3337,15 @@ def dedupe_sessions(metas: list[SessionMeta]) -> list[SessionMeta]:
     keep the first copy — callers feed the path-sorted `all_session_files()`,
     so the pick is deterministic."""
     best: dict[str, SessionMeta] = {}
+    copies: dict[str, int] = {}
     for m in metas:
+        if conflict_original(m.path) is not None:
+            copies[m.session_id] = copies.get(m.session_id, 0) + 1
         cur = best.get(m.session_id)
         if cur is None or _dup_rank(m) > _dup_rank(cur):
             best[m.session_id] = m
+    for sid, n in copies.items():
+        best[sid].conflicts = n
     return [m for m in metas if best[m.session_id] is m]
 
 
@@ -3573,7 +3604,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         job = ctx.jobs.get(s.session_id)
         tags = " ".join(t for t in (
             pin_marker((job or {}).get("short"), ctx.pins),
-            job_badge(job), pr_badge(s.prs)) if t)
+            job_badge(job), pr_badge(s.prs), conflict_badge(s.conflicts)) if t)
         proj = shorten_path(s.cwd) + (f"  {tags}" if tags else "")
         print(
             f"{idx:>{num_w}} "
@@ -4265,6 +4296,185 @@ def _rm_one(prefix: str, args: argparse.Namespace, ctx) -> int:
         return 1
     print(f"✓ removed {id8}  {shorten_path(target.cwd)}")
     return 0
+
+
+# ---------- merge sync conflict copies of transcripts ----------
+#
+# A synced ~/.claude/projects (or $CODEX_HOME/sessions) is written by several
+# machines, and when two of them touch one transcript the sync client keeps
+# the loser beside it (see _CONFLICT_NAME_RES). dedupe_sessions() shows only
+# the file still named `<sid>.jsonl`, so whatever exists solely in the copy —
+# often days of conversation — is invisible to the list and to `--resume`.
+# `ast merge-conflicts` folds each copy back into its original.
+
+def find_transcript_conflicts() -> dict[Path, list[Path]]:
+    """original path -> its conflict copies, across every agent's store.
+
+    Walks the stores directly rather than all_session_files(): codex never
+    lists a copy (its name breaks _CODEX_ROLLOUT_RE) and subagent transcripts
+    conflict just the same."""
+    groups: dict[Path, list[Path]] = {}
+    for root in (PROJECTS_DIR, CODEX_SESSIONS_DIR):
+        if not root.exists():
+            continue
+        for p in sorted(root.rglob("*.jsonl")):
+            orig = conflict_original(p)
+            if orig is not None:
+                groups.setdefault(orig, []).append(p)
+    return groups
+
+
+def _event_key_ts(line: str) -> tuple[tuple, str]:
+    """(dedupe key, timestamp) of one transcript line. Claude events carry a
+    unique `uuid`; anything without one (codex rollout lines, claude summary
+    and snapshot records) is identified by its exact text."""
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return ("raw", line), ""
+    if not isinstance(obj, dict):
+        return ("raw", line), ""
+    uid = obj.get("uuid")
+    ts = obj.get("timestamp")
+    key = ("uuid", uid) if isinstance(uid, str) and uid else ("raw", line)
+    return key, ts if isinstance(ts, str) else ""
+
+
+def merge_transcript_lines(sources: list[list[str]]) -> tuple[list[str], int]:
+    """Union of several versions of one transcript, in timestamp order.
+
+    The first source wins a duplicate, and each source's own line order is
+    never changed: a line without a timestamp inherits its predecessor's and
+    the sources are k-way merged (heapq.merge keeps every input's order and
+    breaks ties by input position). Claude links events by `parentUuid`, so a
+    union of two diverged versions is a valid tree holding both branches.
+    Returns (merged lines, how many came from sources after the first)."""
+    import heapq
+    seen: set[tuple] = set()
+    seqs: list[list[tuple[str, int, str]]] = []
+    added = 0
+    for idx, lines in enumerate(sources):
+        seq, prev = [], ""
+        for raw in lines:
+            line = raw.rstrip("\n")
+            if not line.strip():
+                continue
+            key, ts = _event_key_ts(line)
+            prev = ts or prev
+            if key in seen:
+                continue
+            seen.add(key)
+            seq.append((prev, idx, line))
+            if idx:
+                added += 1
+        seqs.append(seq)
+    merged = heapq.merge(*seqs, key=lambda t: (t[0], t[1]))
+    return [line for _, _, line in merged], added
+
+
+def _read_lines(path: Path) -> list[str]:
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        return f.readlines()
+
+
+def _conflict_backup_dir() -> Path:
+    return CACHE_DIR / "backups" / "conflicts" / datetime.now().strftime(
+        "%Y%m%d-%H%M%S")
+
+
+def merge_conflict_group(original: Path, copies: list[Path],
+                         backup_dir: Path) -> int:
+    """Fold `copies` into `original`; the pre-merge original is copied and the
+    copies are moved into `backup_dir`, so the merge can always be undone.
+
+    An original that no longer exists is replaced by the merge of its copies.
+    The merge is written to a temp file beside the original and swapped in, so
+    a crash leaves either version whole. Returns the lines added."""
+    sources = ([_read_lines(original)] if original.exists() else [])
+    sources += [_read_lines(c) for c in copies]
+    lines, added = merge_transcript_lines(sources)
+    if not original.exists():
+        added = len(lines)
+    base = PROJECTS_DIR if _path_under(original, PROJECTS_DIR) else CODEX_SESSIONS_DIR
+
+    def _backup_path(p: Path) -> Path:
+        try:
+            rel = p.relative_to(base)
+        except ValueError:
+            rel = Path(p.name)
+        dest = backup_dir / base.name / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        return dest
+
+    if original.exists():
+        shutil.copy2(str(original), str(_backup_path(original)))
+    tmp = original.with_name(f".{original.name}.{os.getpid()}.merge")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.writelines(line + "\n" for line in lines)
+    tmp.replace(original)
+    for c in copies:
+        shutil.move(str(c), str(_backup_path(c)))
+    return added
+
+
+def cmd_merge_conflicts(args: argparse.Namespace) -> int:
+    """`ast merge-conflicts` — fold sync conflict copies back into their
+    transcripts. Live sessions are skipped unless --force (their process keeps
+    appending to the original and would race the swap)."""
+    groups = find_transcript_conflicts()
+    if not groups:
+        print("(no sync conflict copies)")
+        return 0
+    live = StatusContext.capture().live
+    force = getattr(args, "force", False)
+    todo, skipped = [], []
+    for orig, copies in sorted(groups.items()):
+        sid = agent_for_path(orig).session_id_of(orig)
+        (skipped if sid in live and not force else todo).append((orig, copies, sid))
+    for orig, copies, sid in todo:
+        state = "" if orig.exists() else "  (original missing — copy becomes it)"
+        print(f"  {sid[:8]}  {shorten_path(str(orig.parent))}  "
+              f"+{len(copies)} cop{'y' if len(copies) == 1 else 'ies'}{state}")
+    if skipped:
+        ids8 = ", ".join(sid[:8] for _, _, sid in skipped)
+        print(f"({len(skipped)} skipped — live: {ids8}; pass --force to include)",
+              file=sys.stderr)
+    if not todo:
+        return 1
+    if getattr(args, "dry_run", False):
+        print(f"(dry run — {len(todo)} session(s), nothing merged)")
+        return 0
+    if not getattr(args, "yes", False):
+        if not sys.stdin.isatty():
+            print("Refusing to merge without confirmation — pass -y/--yes "
+                  "(non-interactive).", file=sys.stderr)
+            return 1
+        try:
+            reply = input(f"Merge {len(todo)} session(s)? [y/N] ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+    backup_dir = _conflict_backup_dir()
+    touched, errors, total = [], 0, 0
+    for orig, copies, sid in todo:
+        try:
+            total += merge_conflict_group(orig, copies, backup_dir)
+            touched += [orig, *copies]
+        except OSError as exc:
+            errors += 1
+            print(f"✗ {sid[:8]}: {exc}", file=sys.stderr)
+    invalidate_cache_entries(touched)
+    done_n = len(todo) - errors
+    print(f"{'✗' if errors else '✓'} merged {done_n} session(s), "
+          f"+{total} line(s); copies moved to {shorten_path(str(backup_dir))}")
+    return 1 if errors else 0
+
+
+def conflict_badge(n: int) -> str:
+    """Row tag for a session with unmerged sync conflict copies."""
+    return f"[conflict{'' if n <= 1 else f':{n}'}]" if n > 0 else ""
 
 
 def cmd_rm(args: argparse.Namespace) -> int:
@@ -6184,7 +6394,8 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
             proj_full = f"{proj_full}  ⎇{s.git_branch}"
         _job = ctx.jobs.get(s.session_id)
         for _tag in (pin_marker((_job or {}).get("short"), ctx.pins),
-                     job_badge(_job), pr_badge(s.prs)):
+                     job_badge(_job), pr_badge(s.prs),
+                     conflict_badge(s.conflicts)):
             if _tag:
                 proj_full = f"{proj_full}  {_tag}"
         proj_cell = truncate_display_tail(proj_full, proj_w)
@@ -8436,6 +8647,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_undone = sub.add_parser("undone", help="clear done flag")
     p_undone.add_argument("session_id")
     p_undone.set_defaults(func=cmd_undone)
+
+    p_mc = sub.add_parser("merge-conflicts",
+                          help="fold sync conflict copies of transcripts "
+                               "back into their originals")
+    p_mc.add_argument("--dry-run", dest="dry_run", action="store_true",
+                      help="list what would be merged without writing")
+    p_mc.add_argument("-y", "--yes", action="store_true",
+                      help="skip confirmation (required when non-interactive)")
+    p_mc.add_argument("--force", action="store_true",
+                      help="include live sessions (their process may still "
+                           "append to the original)")
+    p_mc.set_defaults(func=cmd_merge_conflicts)
 
     p_rm = sub.add_parser("rm",
                           help="remove (unlink) session transcript(s) "

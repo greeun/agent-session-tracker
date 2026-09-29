@@ -142,6 +142,10 @@ ast restore <archive.tar.gz> [--cwd PFX] [--keep-cwd] [--no-register]
                           #   the ChatGPT app never lists the thread. Quit
                           #   the ChatGPT app before restoring into ~/.codex.
 ast relocate <id> <new-cwd> [--keep-original] [--force] [--dry-run] [-y]
+ast merge-conflicts [--dry-run] [-y] [--force]   # fold sync conflict copies
+                          #   (`<sid>_<host>_<date>_Conflict.jsonl` etc., rows tagged
+                          #   [conflict]) back into their transcripts; copies move to
+                          #   ~/.ast/backups/conflicts/, live sessions skipped
 ast rm <id> [<id> ...] [--dry-run] [-y] [--force]   # unlink session transcript(s)
                           #   (only removes the transcript; a live bg process keeps
                           #   running; --force implies -y here, single-id only)
