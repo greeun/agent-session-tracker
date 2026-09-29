@@ -401,6 +401,17 @@ Rewrites `cwd` on every event in the JSONL and moves the file into the new proje
 | `--dry-run` | Show the rewrite plan; no changes |
 | `-y` / `--yes` | Skip confirmation |
 
+### `ast merge-conflicts` — fold sync conflict copies back in
+
+When `~/.claude/projects` (or `~/.codex/sessions`) lives in a synced folder and two machines write the same session, the sync client keeps the losing version beside it (`<sid>_<host>_<date>_Conflict.jsonl`, `.sync-conflict-…`, `(… conflicted copy …)`). The list shows only `<sid>.jsonl` and tags the row `[conflict]`, so anything that exists only in the copy is hidden from the list and from resume until you merge it:
+
+```bash
+ast merge-conflicts --dry-run   # list sessions with conflict copies
+ast merge-conflicts -y          # merge without prompting
+```
+
+Events are unioned (Claude events by `uuid`, other lines by exact text) and interleaved by timestamp without reordering either file; the pre-merge original is copied and the copies are moved to `~/.ast/backups/conflicts/<timestamp>/`. Live sessions are skipped unless `--force`.
+
 ### `ast rm <id> [<id> ...]` — unlink session transcript(s)
 
 ```bash

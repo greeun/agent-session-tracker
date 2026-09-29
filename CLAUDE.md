@@ -31,7 +31,7 @@ ast --version
 4. **Live-process detection** (`scan_live_sessions`, ~line 1103) — scans `~/.claude/sessions/<pid>.json` + `kill -0` to determine active vs ended
 5. **State persistence & prefs** (`load_state`/`save_state`, ~line 1276) — `state.json` holds 작업종료 (done) flags + the status overlay + user prefs (auto-rescan ~line 1504, TUI theme ~line 1545, column sort ~line 1604); `index.json` is the mtime-invalidated session cache
 6. **Session loading** (`SessionMeta` dataclass, ~line 2100; `load_all_sessions`, ~line 2400) — `load_session_meta`, `iter_messages`, `cmd_search`, the TUI full-text search and the preview modal all fold the owning spec's `iter_turns()` stream, so a transcript format lives in exactly one place; `SessionMeta.agent` names the spec and rides the index cache (`_CACHE_SCHEMA` 6); `all_session_files()` concatenates every spec's files in registry order; also `scan_pr_refs`/`pr_badge`
-7. **CLI subcommands** (~line 2082) — `cmd_list`, `cmd_search`, `cmd_show`, `cmd_export`, `cmd_resume`, `cmd_open` (TUI `o` as a subcommand — folder in a new terminal, for cst.app), `cmd_done`, `cmd_undone`, `cmd_live`, `cmd_stop`, `cmd_logs`, `cmd_bg`, `cmd_jobs`, `cmd_relocate`, `cmd_rm`, `cmd_backup`, `cmd_restore`, `cmd_stats`, `cmd_subagents`, plus the hook commands `cmd_prompt_hook`/`cmd_status_hook`/`cmd_install_hook`/`cmd_uninstall_hook`
+7. **CLI subcommands** (~line 2082) — `cmd_list`, `cmd_search`, `cmd_show`, `cmd_export`, `cmd_resume`, `cmd_open` (TUI `o` as a subcommand — folder in a new terminal, for cst.app), `cmd_done`, `cmd_undone`, `cmd_live`, `cmd_stop`, `cmd_logs`, `cmd_bg`, `cmd_jobs`, `cmd_relocate`, `cmd_merge_conflicts`, `cmd_rm`, `cmd_backup`, `cmd_restore`, `cmd_stats`, `cmd_subagents`, plus the hook commands `cmd_prompt_hook`/`cmd_status_hook`/`cmd_install_hook`/`cmd_uninstall_hook`
 
 ### bg-aware actions (attach / stop / logs)
 
@@ -268,6 +268,27 @@ follows the same rule: several files under one session id resolve through
 this: `_codex_session_files()` only accepts names matching
 `_CODEX_ROLLOUT_RE`, which a conflict copy's suffix breaks, so such a copy is
 never listed at all.
+
+Hiding a copy loses whatever only it holds, so the kept row carries
+`SessionMeta.conflicts` (set by `dedupe_sessions()`, never cached) and shows
+`conflict_badge()` — `[conflict]` / `[conflict:N]` — in `ast list` and the TUI.
+**`ast merge-conflicts`** (`cmd_merge_conflicts`) folds the copies back in.
+`find_transcript_conflicts()` walks `PROJECTS_DIR` and `CODEX_SESSIONS_DIR`
+directly (codex copies are never listed; subagent files conflict too) and
+groups every file `conflict_original()` recognises — Synology, Syncthing,
+Dropbox, and iCloud ` N` only after a session UUID — under the name it was
+split from. `merge_transcript_lines()` unions the versions: claude events
+dedupe by `uuid`, anything without one (codex lines, claude summary/snapshot
+records) by exact text, the original wins a duplicate, and a `heapq.merge` on
+timestamps (an untimed line inherits its predecessor's) interleaves the
+sources without ever reordering lines within one — a union of two diverged
+claude versions is still a valid `parentUuid` tree holding both branches. The
+result is written beside the original and swapped in; an original that is
+gone is rebuilt from its copies. The pre-merge original is copied and the
+copies are moved to
+`~/.ast/backups/conflicts/<stamp>/<store>/<relpath>`, the touched paths are
+dropped from the index, live sessions are skipped unless `--force`, and
+`--dry-run` / `-y` / the non-tty refusal mirror `ast rm`.
 
 ### Data files read/written
 

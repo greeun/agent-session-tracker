@@ -45,6 +45,7 @@ EXPECTED = {
     "stop": (["sid"], "cmd_stop"),
     "logs": (["sid"], "cmd_logs"),
     "undone": (["sid"], "cmd_undone"),
+    "merge-conflicts": ([], "cmd_merge_conflicts"),
     "rm": (["sid"], "cmd_rm"),
     "live": ([], "cmd_live"),
     "prompt-hook": ([], "cmd_prompt_hook"),

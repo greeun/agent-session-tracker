@@ -398,6 +398,17 @@ JSONL의 모든 이벤트의 `cwd` 필드를 재작성하고 파일을 새 프�
 | `--dry-run` | 재작성 계획 표시 (변경 없음) |
 | `-y` / `--yes` | 확인 건너뛰기 |
 
+### `ast merge-conflicts` — 동기화 충돌 사본 병합
+
+`~/.claude/projects`(또는 `~/.codex/sessions`)를 동기화 폴더에 두고 두 기기가 같은 세션에 기록하면, 동기화 클라이언트는 진 쪽 버전을 옆에 따로 보관합니다(`<sid>_<host>_<date>_Conflict.jsonl`, `.sync-conflict-…`, `(… conflicted copy …)`). 목록은 `<sid>.jsonl`만 보여 주고 해당 행에 `[conflict]` 배지를 붙입니다. 그래서 사본에만 있는 대화는 병합하기 전까지 목록과 resume에서 보이지 않습니다.
+
+```bash
+ast merge-conflicts --dry-run   # 충돌 사본이 있는 세션 목록
+ast merge-conflicts -y          # 확인 없이 병합
+```
+
+이벤트는 합집합으로 병합합니다(Claude 이벤트는 `uuid`, 그 밖의 줄은 내용 기준). 두 파일 각각의 줄 순서를 유지하면서 시각 순서로 합치며, 병합 전 원본은 `~/.ast/backups/conflicts/<시각>/`에 복사하고, 병합한 사본은 같은 곳으로 옮깁니다. 실행 중인 세션은 `--force`를 지정하지 않으면 건너뜁니다.
+
 ### `ast rm <id> [<id> ...]` — 세션 트랜스크립트 삭제
 
 ```bash
