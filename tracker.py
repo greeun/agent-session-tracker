@@ -1153,6 +1153,62 @@ def _open_in_cmux(cmux_mode, cwd, safe_cwd, core_cmd, session_id,
         return False, "cmux command timed out"
 
 
+def _build_raise_spawned_script(pid: int) -> str:
+    """AppleScript: raise the first window of process `pid` and make it
+    frontmost. Prints FOCUSED on a hit, PENDING while it has no window yet.
+
+    The `whose` filter is repeated on purpose: a process stored in a variable
+    resolves to `process "wezterm-gui"` by NAME, which with several instances
+    is the first one, not this pid."""
+    target = f"(first process whose unix id is {pid})"
+    return (
+        'tell application "System Events"\n'
+        f'  if (count of (every process whose unix id is {pid})) is 0 then '
+        'return "PENDING"\n'
+        f'  if (count of windows of {target}) is 0 then return "PENDING"\n'
+        f'  perform action "AXRaise" of window 1 of {target}\n'
+        f'  set frontmost of {target} to true\n'
+        'end tell\n'
+        'return "FOCUSED"'
+    )
+
+
+def _raise_spawned_window(proc, timeout: float = 4.0) -> bool:
+    """Wait for the window of a terminal we just spawned, then bring it to the
+    macOS foreground. True when it was raised.
+
+    `wezterm start` runs as a separate wezterm-gui process, so a `tell
+    application "WezTerm"` activate leaves the new window behind the current
+    one; only the spawned pid identifies it. Measured with `lsappinfo front`:
+    System Events `frontmost` brings that process forward, NSRunningApplication
+    activate does not. (Reading the front process back through System Events is
+    unreliable with several instances.)
+
+    False sends the caller to its app-level activate: the process exited without
+    a window (the CLI handed off to a running GUI), the script failed (no
+    Accessibility permission), or the deadline passed."""
+    import subprocess
+    import time
+    script = _build_raise_spawned_script(proc.pid)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if r.returncode != 0:
+            return False
+        if "FOCUSED" in r.stdout:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def _open_macos(term_program, shell_cmd, cwd):
     """macOS branch of open_in_new_terminal: AppleScript / per-terminal CLI."""
     import shutil
@@ -1179,14 +1235,14 @@ def _open_macos(term_program, shell_cmd, cwd):
     def _run_cli(argv: list[str], label: str,
                  activate_name: str | None = None) -> tuple[bool, str]:
         try:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True,
                 close_fds=True,
             )
-            if activate_name:
+            if activate_name and not _raise_spawned_window(proc):
                 _activate_macos_app(activate_name)
             return True, f"opened in {label}"
         except OSError as e:
