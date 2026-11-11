@@ -98,7 +98,7 @@ INDEX_DIR = _ast_index_home()
 CACHE_PATH = INDEX_DIR / "index.json"
 # Bumped whenever the cached SessionMeta shape or extraction logic changes,
 # so stale entries are re-indexed instead of serving wrong snippets.
-_CACHE_SCHEMA = 6
+_CACHE_SCHEMA = 7
 STATE_PATH = CACHE_DIR / "state.json"
 
 # claude-session-tracker's home. ast forked from it, so a first run seeds its
@@ -3245,6 +3245,8 @@ CONFIDENCE_MARGIN = 2
 # "real" user message.
 _SYSTEM_WRAPPER_PREFIXES = (
     "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
     "<command-name>",
     "<command-message>",
     "<command-args>",

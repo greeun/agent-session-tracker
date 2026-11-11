@@ -85,6 +85,12 @@ class TestIsSystemWrapper(unittest.TestCase):
     def test_plain_message_is_not_wrapper(self):
         self.assertFalse(tk._is_system_wrapper_msg("please fix the bug"))
 
+    def test_local_command_output_is_wrapper(self):
+        # `/model` and other local slash commands record their output as a
+        # user event; it must not become the session's first prompt.
+        for tag in ("local-command-stdout", "local-command-stderr"):
+            self.assertTrue(tk._is_system_wrapper_msg(f"<{tag}>Set model</{tag}>"), tag)
+
 
 class TestTruncate(unittest.TestCase):
     def test_over_length_cut_with_ellipsis(self):
