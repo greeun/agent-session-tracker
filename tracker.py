@@ -16,7 +16,7 @@ Data sources:
 """
 from __future__ import annotations
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 import argparse
 import json
@@ -2531,11 +2531,33 @@ def sync_device_record() -> bool:
         return False
 
 
+def load_device_primary() -> str | None:
+    val = load_state().get("device_primary")
+    return val if isinstance(val, str) and val else None
+
+
+def save_device_primary(host: str | None) -> None:
+    st = load_state()
+    if host:
+        st["device_primary"] = host
+    else:
+        st.pop("device_primary", None)
+    save_state(st)
+
+
 def load_device_map(sync: bool = True) -> dict:
     """sid -> host over every machine's device record. A session continued
-    on another Mac sits in two records; the later prompt names its host."""
+    on another Mac sits in two records; the later prompt names its host.
+
+    Equal timestamps mean a copied line: a new Mac set up with a copy of an
+    old Mac's history.jsonl holds every old prompt verbatim, and the records
+    alone cannot tell the original apart. The tie goes to the primary host
+    (`ast devices --primary`), else to the lowest host name, so every Mac
+    resolves it the same way whatever order the directory lists files in."""
     if sync:
         sync_device_record()
+    primary = load_device_primary()
+    rank = lambda h: (h != primary, h)
     best: dict = {}
     try:
         entries = list(STATE_PATH.parent.iterdir())
@@ -2557,7 +2579,9 @@ def load_device_map(sync: bool = True) -> dict:
         for sid, ts in sessions.items():
             if not isinstance(ts, (int, float)):
                 continue
-            if sid not in best or ts > best[sid][0]:
+            cur = best.get(sid)
+            if (cur is None or ts > cur[0]
+                    or (ts == cur[0] and rank(host) < rank(cur[1]))):
                 best[sid] = (ts, host)
     return {sid: host for sid, (_, host) in best.items()}
 
@@ -8803,12 +8827,21 @@ def cmd_devices(args: argparse.Namespace) -> int:
         save_device_alias(host.strip(), name.strip())
         print(f"alias {host.strip()} → {name.strip()}")
         return 0
+    if getattr(args, "primary", None):
+        save_device_primary(args.primary.strip())
+        print(f"primary device: {args.primary.strip()}")
+        return 0
+    if getattr(args, "no_primary", False):
+        save_device_primary(None)
+        print("primary device cleared")
+        return 0
     if getattr(args, "unalias", None):
         save_device_alias(args.unalias.strip(), None)
         print(f"alias removed: {args.unalias.strip()}")
         return 0
     devices = load_device_map()
     aliases = load_device_aliases()
+    primary = load_device_primary()
     counts: dict = {}
     for host in devices.values():
         counts[host] = counts.get(host, 0) + 1
@@ -8817,7 +8850,8 @@ def cmd_devices(args: argparse.Namespace) -> int:
     print(f" {'HOST':<20} {'ALIAS':<8} {'SESSIONS':>8}")
     for host in sorted(counts):
         mark = "*" if host == here else " "
-        print(f"{mark}{host:<20} {aliases.get(host, '-'):<8} {counts[host]:>8}")
+        tag = "  primary" if host == primary else ""
+        print(f"{mark}{host:<20} {aliases.get(host, '-'):<8} {counts[host]:>8}{tag}")
     return 0
 
 
@@ -9090,6 +9124,11 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="show HOST as NAME in the DEVICE column")
     g_dev.add_argument("--unalias", metavar="HOST", default=None,
                        help="drop HOST's alias")
+    g_dev.add_argument("--primary", metavar="HOST", default=None,
+                       help="HOST wins sessions whose prompts appear with the same "
+                            "timestamp on several Macs (a copied history.jsonl)")
+    g_dev.add_argument("--no-primary", action="store_true",
+                       help="clear the primary device")
     p_dev.set_defaults(func=cmd_devices)
 
     p_stats = sub.add_parser("stats", help="summary stats")

@@ -35,7 +35,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. 확인
 ast --version
-# agent-session-tracker v1.5.0
+# agent-session-tracker v1.5.1
 
 # 4. (선택) 토큰 0짜리 done!/undone! 프롬프트 훅 + 상태 정밀 레이어 설치
 ast install-hook
@@ -197,7 +197,7 @@ ast list [--limit 30] [--cwd PREFIX] [--days N]
 ```
 
 ```
-agent-session-tracker v1.5.0
+agent-session-tracker v1.5.1
   #  ST  AGENT    DEVICE  LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
   1  ●   claude   work    2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
   2  !   claude   mbp     2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
@@ -241,6 +241,10 @@ agent-session-tracker v1.5.0
   저장한 뷰를 사용한다. `ast search`와 `ast pick`도 같은 플래그를 지원한다.
   `ast devices --alias MBP-M4P-24-H=mbp`로 별칭을 지정하며(`state.json`으로 공유),
   `ast devices`는 알려진 호스트와 별칭, 세션 수를 보여 주고 이 맥에 `*`를 붙인다.
+  다른 맥의 `history.jsonl`을 복사해서 시작한 맥에는 복사된 프롬프트가 같은
+  타임스탬프로 들어 있다. 이런 동점은 `ast devices --primary HOST`로 지정한 기준
+  맥(복사 원본)으로 판정하고, 기준 맥이 없으면 호스트 이름이 앞서는 쪽으로 판정해
+  모든 맥에서 같은 결과가 나온다.
   다른 맥에서 진행한 세션을 `ast resume`하면 안내 한 줄을 출력하고, TUI Enter는
   이 맥에서 재개할지 먼저 묻는다.
 - **`--json`** — 테이블 대신 기계가 읽는 JSON으로 출력
@@ -580,7 +584,7 @@ fzf 스타일 필터, 상태 글리프, 모달, 액션 키를 갖춘 curses 선�
 ### 헤더
 
 ```
- agent-session-tracker v1.5.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.5.1  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — 보이는 행 / 전체 세션 수

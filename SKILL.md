@@ -1,7 +1,7 @@
 ---
 name: agent-session-tracker
 description: Track live/waiting/ended/done status of Claude Code sessions — and Codex CLI sessions and ChatGPT desktop app conversations alongside them. List, search, resume, export, backup, restore sessions via `ast` CLI or TUI. Use when user says "list sessions", "세션 상태", "ast", "session tracker", "codex 세션", "chatgpt 세션", "ChatGPT 앱 대화", or wants to resume/search/export/backup sessions.
-version: 1.5.0
+version: 1.5.1
 ---
 
 # agent-session-tracker
@@ -29,7 +29,7 @@ process is ended/job-state; a live one resolves overlay → registry → `●`):
   in TUI, `ast done <id>`, or the `done!` prompt hook). Persists in
   `~/.ast/state.json`.
 
-Main script: `tracker.py` (stdlib only, Python 3.10+, v1.5.0). Installed as
+Main script: `tracker.py` (stdlib only, Python 3.10+, v1.5.1). Installed as
 `~/.local/bin/ast`. All `~/.claude/...` data paths honor `$CLAUDE_CONFIG_DIR`
 (same convention as Claude Code itself) and `~/.codex/...` honors
 `$CODEX_HOME` (Codex's own convention); ast's own files live under `~/.ast`
@@ -102,6 +102,8 @@ ast list --device mbp     # sessions last worked on one Mac: a host, its alias, 
                           #   a host/local view drops "?" rows: [device:mbp, ?:3 hidden]
 ast devices               # known hosts, aliases, session counts (* = this Mac)
 ast devices --alias MBP-M4P-24-H=mbp   # name a host in the DEVICE column (--unalias HOST)
+ast devices --primary MBP-M4P-24-H     # same-timestamp ties (a copied history.jsonl) go to
+                                       #   this host, else the lowest host name (--no-primary)
 ast list --json           # machine-readable JSON instead of the table (cst.app contract;
                           #   each session carries "agent": "claude"|"codex"|"chatgpt")
 ast search "<query>"      # full-text transcript search (OR via `|`, -i = ignore case)

@@ -143,7 +143,11 @@ inside `StatusContext.capture()`, so `cmd_search` and `cmd_resume` (which skip
 `load_all_sessions`) still sync. The sync is a no-op when tests stubbed the ast
 home but not `CLAUDE_HISTORY_PATH` (`_device_sync_stubbed`), so no fixture
 reads the real history. Aliases live in `state.json` `device_alias` and ride
-`StatusContext.aliases`; `device_label()` cuts an unaliased host to
+`StatusContext.aliases`. Equal timestamps in two records are a copied
+`history.jsonl` (a Mac set up from another's copy repeats every old line
+verbatim, which the records cannot tell apart): `load_device_map()` gives the
+tie to `device_primary` (`ast devices --primary`), else the lowest host name,
+so the result never depends on `iterdir()` order. `device_label()` cuts an unaliased host to
 `DEVICE_WIDTH` (6). `filter_device(rows, view, ctx)` returns `(kept, hidden)`:
 a host or `local` view drops `?` rows and reports how many (`device_note` →
 `[device:mbp, ?:3 hidden]`, TUI `_device_hint` → `⌂mbp ?3`), unlike the

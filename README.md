@@ -36,7 +36,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. Verify
 ast --version
-# agent-session-tracker v1.5.0
+# agent-session-tracker v1.5.1
 
 # 4. (optional) wire the 0-token done!/undone! prompt hook + status precision layer
 ast install-hook
@@ -196,7 +196,7 @@ ast list [--limit 30] [--cwd PREFIX] [--days N]
 ```
 
 ```
-agent-session-tracker v1.5.0
+agent-session-tracker v1.5.1
   #  ST  AGENT    DEVICE  LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
   1  ●   claude   work    2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
   2  !   claude   mbp     2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
@@ -242,7 +242,10 @@ agent-session-tracker v1.5.0
   saved is used. Same flag on `ast search` and `ast pick`. Name the hosts with
   `ast devices --alias MBP-M4P-24-H=mbp` (shared through `state.json`);
   `ast devices` lists every known host, its alias and session count, `*`
-  marking this Mac. `ast resume` prints a note when the session was last
+  marking this Mac. A Mac set up with a copy of another Mac's
+  `history.jsonl` repeats every copied prompt with the same timestamp; such a
+  tie goes to `ast devices --primary HOST` (the Mac the copy came from), else
+  to the lowest host name, so all Macs agree. `ast resume` prints a note when the session was last
   worked on another Mac, and TUI Enter asks before resuming it here.
 - **`--json`** emits the list as machine-readable JSON instead of the table
   (the contract consumed by the cst.app macOS companion). Each session carries
@@ -586,7 +589,7 @@ A cursor appears on the prompt line. Live filtering happens as you type.
 ### Header bar
 
 ```
- agent-session-tracker v1.5.0  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.5.1  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — visible rows / total sessions
