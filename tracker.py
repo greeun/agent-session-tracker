@@ -2584,6 +2584,7 @@ class StatusContext:
     jobs: dict
     pins: set = field(default_factory=set)  # agent-view pinned daemonShorts
     devices: dict = field(default_factory=dict)  # sid -> host (load_device_map)
+    aliases: dict = field(default_factory=dict)  # host -> label (device_alias pref)
 
     @classmethod
     def capture(cls) -> "StatusContext":
@@ -2606,7 +2607,8 @@ class StatusContext:
         return cls(live=live, done=done_ids(),
                    registry=registry, overlay=status_overlay(),
                    jobs=scan_jobs(), pins=read_pins(),
-                   devices=load_device_map())
+                   devices=load_device_map(),
+                   aliases=load_device_aliases())
 
     def resolve(self, session_id: str) -> str:
         return resolve_status(session_id, self.live, self.done,
@@ -3055,6 +3057,32 @@ def save_device_view(view: str) -> None:
     st = load_state()
     st["device"] = view or DEVICE_VIEW_ALL
     save_state(st)
+
+
+def device_view_for(arg: str | None, ctx) -> str | None:
+    """Effective device view: an explicit `--device` (one-off) resolved
+    against aliases and known hosts, else the saved TUI view. None means the
+    explicit value matched nothing; the caller reports it and exits 2."""
+    if not arg:
+        return load_device_view()
+    known = set(ctx.devices.values()) | {_host_id()}
+    view = resolve_device_view(arg, ctx.aliases, known)
+    if view is None:
+        print(f"unknown device {arg!r} (see `ast devices`)", file=sys.stderr)
+    return view
+
+
+def device_cell(session_id: str, ctx) -> str:
+    return pad_display(device_label(device_of(session_id, ctx), ctx.aliases), DEVICE_WIDTH)
+
+
+def device_resume_warning(session_id: str, ctx) -> str | None:
+    """One-line notice when a session was last worked on another Mac."""
+    host = device_of(session_id, ctx)
+    if host is None or host == _host_id():
+        return None
+    return (f"note: {session_id[:8]} was last worked on "
+            f"{device_label(host, ctx.aliases)}; resuming it on this Mac")
 
 
 def _detect_terminal_is_light(env: dict | None = None) -> bool | None:
@@ -3841,6 +3869,8 @@ def session_to_dict(s: "SessionMeta", ctx: "StatusContext") -> dict:
         "entrypoint": s.entrypoint or "",
         "origin": session_origin(s),
         "agent": s.agent or DEFAULT_AGENT,
+        "device": device_of(s.session_id, ctx),
+        "device_label": device_label(device_of(s.session_id, ctx), ctx.aliases),
         "job": _job_json(job),
         "prs": list(s.prs or []),
         "pinned": bool(short and short in ctx.pins),
@@ -3875,6 +3905,10 @@ def cmd_list(args: argparse.Namespace) -> int:
     # the TUI `a` key last saved.
     agent_view = getattr(args, "agent", None) or load_agent_view()
     sessions = filter_agent(sessions, agent_view)
+    device_view = device_view_for(getattr(args, "device", None), ctx)
+    if device_view is None:
+        return 2
+    sessions, dev_hidden = filter_device(sessions, device_view, ctx)
     # Column sort: an explicit --sort is a one-off override (natural direction,
     # flipped by --reverse); no flag uses the saved TUI preference. Sort runs
     # BEFORE --limit so the slice keeps the top-N of the chosen order. getattr
@@ -3906,6 +3940,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         f"{'#':>{num_w}} "
         f"{pad_display('ST', STATUS_WIDTH)} "
         f"{'AGENT':<{AGENT_VIEW_WIDTH}}  "
+        f"{'DEVICE':<{DEVICE_WIDTH}}  "
         f"{'LAST ACTIVITY':<16}  "
         f"{'SESSION':<10} "
         f"{'MSGS':>4}  "
@@ -3928,6 +3963,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             f"{idx:>{num_w}} "
             f"{pad_display(st, STATUS_WIDTH)} "
             f"{s.agent:<{AGENT_VIEW_WIDTH}}  "
+            f"{device_cell(s.session_id, ctx)}  "
             f"{ts:<16}  "
             f"{sid:<10} "
             f"{s.msg_count:>4}  "
@@ -3938,7 +3974,8 @@ def cmd_list(args: argparse.Namespace) -> int:
     summary = "  ".join(f"{status_label(g)}:{counts[g]}"
                         for g in STATUS_ALL if counts[g])
     print(f"\n{len(sessions)} session(s)  [{summary}]"
-          f"{origin_note(origin)}{agent_note(agent_view)}")
+          f"{origin_note(origin)}{agent_note(agent_view)}"
+          f"{device_note(device_view, ctx.aliases, dev_hidden)}")
     return 0
 
 
@@ -3990,17 +4027,25 @@ def cmd_search(args: argparse.Namespace) -> int:
     agent_view = getattr(args, "agent", None) or load_agent_view()
     if agent_view in AGENTS:
         hits = [h for h in hits if h[0].agent == agent_view]
+    ctx = StatusContext.capture()
+    device_view = device_view_for(getattr(args, "device", None), ctx)
+    if device_view is None:
+        return 2
+    kept_meta, dev_hidden = filter_device([h[0] for h in hits], device_view, ctx)
+    kept_ids = {id(m) for m in kept_meta}
+    hits = [h for h in hits if id(h[0]) in kept_ids]
     hits.sort(key=lambda h: h[0].last_ts or _EPOCH, reverse=True)
     if args.limit:
         hits = hits[: args.limit]
-    notes = f"{origin_note(origin)}{agent_note(agent_view)}"
+    notes = (f"{origin_note(origin)}{agent_note(agent_view)}"
+             f"{device_note(device_view, ctx.aliases, dev_hidden)}")
     if not hits:
         print(f"(no matches for {args.query!r}{notes})")
         return 0
-    ctx = StatusContext.capture()
     for meta, matches in hits:
         st = ctx.resolve(meta.session_id)
         print(f"\n{status_label(st)}  {meta.agent:<{AGENT_VIEW_WIDTH}}  "
+              f"{device_cell(meta.session_id, ctx)}  "
               f"{meta.session_id[:8]}  {fmt_ts(meta.last_ts)}  "
               f"{shorten_path(meta.cwd)}  ({len(matches)} hit(s))")
         for ts, role, snippet in matches[:3]:
@@ -4244,6 +4289,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
     target = require_session(args.session_id)
     if target is None:
         return 1
+    note = device_resume_warning(target.session_id, StatusContext.capture())
+    if note:
+        # stderr, and never a prompt: GUI and scripted callers must not block.
+        print(note, file=sys.stderr)
     cwd = target.cwd or "."
     short = job_short_for(target.session_id)
     if getattr(args, "spawn", False):
@@ -6755,7 +6804,8 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
 def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
              days: int | None, skip_perm_default: bool = False,
              hide_done_default: bool = False, theme: str = "dark",
-             agent_view_override: str | None = None):
+             agent_view_override: str | None = None,
+             device_view_override: str | None = None):
     import curses
     import time
     curses.curs_set(0)
@@ -7480,6 +7530,16 @@ def cmd_pick(args: argparse.Namespace) -> int:
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error:
         pass
+    device_view = None
+    if getattr(args, "device", None):
+        # Resolve before curses starts so a bad value is a plain error, not a
+        # TUI that silently falls back to the saved view.
+        dev_ctx = StatusContext(live=set(), done=set(), registry={}, overlay={},
+                                jobs={}, devices=load_device_map(),
+                                aliases=load_device_aliases())
+        device_view = device_view_for(args.device, dev_ctx)
+        if device_view is None:
+            return 2
     print("Loading sessions…", file=sys.stderr, end="", flush=True)
     sessions = load_all_sessions(
         cwd_filter=args.cwd,
@@ -7507,7 +7567,8 @@ def cmd_pick(args: argparse.Namespace) -> int:
               f"using xterm-256color)            ", file=sys.stderr)
     try:
         curses.wrapper(_pick_ui, sessions, args.cwd, args.days, skip_perm,
-                       hide_done, theme, getattr(args, "agent", None))
+                       hide_done, theme, getattr(args, "agent", None),
+                       device_view)
     except KeyboardInterrupt:
         pass
     # The TUI handles Enter by spawning a new terminal window, so we don't
@@ -8816,6 +8877,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pick.add_argument("--theme", choices=THEME_CHOICES,
                         default=argparse.SUPPRESS,
                         help="TUI color theme (toggle in-TUI with t)")
+    p_pick.add_argument("--device", default=None, metavar="NAME",
+                        help="only sessions last worked on NAME: a host, its alias, local, ? or all")
     p_pick.add_argument("--agent", choices=agent_choices(), default=None,
                         help="start in one agent CLI's view (default: the "
                              "last view saved by the `a` key)")
@@ -8839,6 +8902,8 @@ def _build_parser() -> argparse.ArgumentParser:
                              "(agent = SDK-spawned; default: saved TUI preference)")
     p_list.add_argument("--json", action="store_true",
                         help="emit machine-readable JSON (for cst.app) instead of the table")
+    p_list.add_argument("--device", default=None, metavar="NAME",
+                        help="only sessions last worked on NAME: a host, its alias, local, ? or all")
     p_list.add_argument("--agent", choices=agent_choices(), default=None,
                         help="show one agent CLI's sessions (default: the "
                              "view saved by the TUI `a` key, else all)")
@@ -8852,6 +8917,8 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="who started the session: all|user|agent "
                                "(default: saved TUI preference)")
     p_search.add_argument("-i", "--ignore-case", action="store_true")
+    p_search.add_argument("--device", default=None, metavar="NAME",
+                        help="only sessions last worked on NAME: a host, its alias, local, ? or all")
     p_search.add_argument("--agent", choices=agent_choices(), default=None,
                           help="restrict to one agent CLI's sessions "
                                "(default: the saved TUI view, else all)")
