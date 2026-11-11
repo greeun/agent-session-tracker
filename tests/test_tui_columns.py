@@ -4,7 +4,7 @@
 터미널 폭을 넘으면 curses가 화면 밖 addstr에서 예외를 던져 TUI가 통째로 죽는다.
 좁은 터미널(40칸)과 문서화된 80칸 경계가 이 함수의 위험 구간이다.
 
-반환은 7-튜플: (num, status, ts, sid, msgs, msg, proj).
+반환은 9-튜플: (num, status, agent, device, ts, sid, msgs, msg, proj).
 """
 import importlib.util
 import sys
@@ -22,11 +22,12 @@ _spec.loader.exec_module(tk)
 def _total(cols) -> int:
     """구현이 fixed에 쓰는 것과 같은 구분자 폭을 더한 실제 소비 칼럼 수.
 
-    fixed = (1+num+1) + (st+1) + (ag+2) + (ts+2) + (sid+1) + (msgs+2) + 2
+    fixed = (1+num+1) + (st+1) + (ag+2) + (dev+2) + (ts+2) + (sid+1) + (msgs+2) + 2
     여기에 msg 와 proj 를 더한 값이 화면에 실제로 그려지는 총 폭이다.
     """
-    num, st, ag, ts, sid, msgs, msg, proj = cols
-    fixed = (1 + num + 1) + (st + 1) + (ag + 2) + (ts + 2) + (sid + 1) + (msgs + 2) + 2
+    num, st, ag, dev, ts, sid, msgs, msg, proj = cols
+    fixed = ((1 + num + 1) + (st + 1) + (ag + 2) + (dev + 2) + (ts + 2)
+             + (sid + 1) + (msgs + 2) + 2)
     return fixed + msg + proj
 
 
@@ -35,14 +36,14 @@ class TestTuiColumns(unittest.TestCase):
         for w in (40, 60, 80, 100, 120, 200):
             with self.subTest(w=w):
                 cols = tk._tui_columns(10, 10, w)
-                self.assertEqual(len(cols), 8)
+                self.assertEqual(len(cols), 9)
                 for i, c in enumerate(cols):
                     self.assertGreater(c, 0, f"col[{i}] <= 0 at w={w}")
 
     def test_narrow_terminal_keeps_documented_minimums(self):
         # TC-UNIT-131 — proj >= 20, msg >= 20 은 구현이 명시한 하한
         cols = tk._tui_columns(10, 10, 40)
-        _, _, _, _, _, _, msg_w, proj_w = cols
+        *_, msg_w, proj_w = cols
         self.assertGreaterEqual(proj_w, 20)
         self.assertGreaterEqual(msg_w, 20)
 
@@ -56,7 +57,7 @@ class TestTuiColumns(unittest.TestCase):
         # 바인딩돼 있다"이며, 그쪽이 회귀(넓은 화면에서의 분배 오류)를 잡는다.
         for w in range(40, 400, 2):
             cols = tk._tui_columns(10, 10, w)
-            _, _, _, _, _, _, msg_w, proj_w = cols
+            *_, msg_w, proj_w = cols
             with self.subTest(w=w):
                 if _total(cols) > w:
                     self.assertTrue(
@@ -67,7 +68,7 @@ class TestTuiColumns(unittest.TestCase):
         """가변 컬럼이 최소폭에서 풀린 뒤로는 총 소비가 폭을 넘지 않아야 한다."""
         for w in range(40, 400, 2):
             cols = tk._tui_columns(10, 10, w)
-            _, _, _, _, _, _, msg_w, proj_w = cols
+            *_, msg_w, proj_w = cols
             if msg_w > 20 and proj_w > 20:
                 with self.subTest(w=w):
                     self.assertLessEqual(_total(cols), w)
@@ -96,7 +97,7 @@ class TestTuiColumns(unittest.TestCase):
         """폭이 늘면 가변 컬럼(msg/proj)은 단조 증가하거나 유지된다."""
         prev_msg = prev_proj = 0
         for w in range(40, 260, 10):
-            _, _, _, _, _, _, msg_w, proj_w = tk._tui_columns(10, 10, w)
+            *_, msg_w, proj_w = tk._tui_columns(10, 10, w)
             with self.subTest(w=w):
                 self.assertGreaterEqual(msg_w, prev_msg)
                 self.assertGreaterEqual(proj_w, prev_proj)

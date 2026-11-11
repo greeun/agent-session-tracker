@@ -16,7 +16,7 @@ Data sources:
 """
 from __future__ import annotations
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 import argparse
 import json
@@ -48,6 +48,12 @@ def _claude_config_dir() -> Path:
 CONFIG_DIR = _claude_config_dir()
 PROJECTS_DIR = CONFIG_DIR / "projects"
 SESSIONS_REGISTRY_DIR = CONFIG_DIR / "sessions"
+# Claude Code's prompt history. It lives beside the synced projects dir but is
+# a plain local file, one per machine, and every line since 2025 carries the
+# sessionId the prompt was typed into, which is what tells ast on which Mac a
+# session was worked (see sync_device_record). Tests re-point it.
+CLAUDE_HISTORY_PATH = CONFIG_DIR / "history.jsonl"
+_DEFAULT_CLAUDE_HISTORY_PATH = CLAUDE_HISTORY_PATH
 # Agent-view background sessions: <config-dir>/jobs/<short>/state.json.
 # Hosted by the supervisor, not the pid registry above, so once an idle bg
 # process is stopped they leave no registry entry — the jobs scanner reads
@@ -2383,8 +2389,14 @@ def _status_path() -> Path:
     overlay only matters for sessions alive on this machine — classify_status
     ignores it otherwise — so each machine keeps its own file, which a sync
     client can copy around but never has two writers for."""
+    return STATE_PATH.with_name(f"status.{_host_id()}.json")
+
+
+def _host_id() -> str:
+    """This machine's name as it appears in per-machine file names:
+    the first label of the node name, filename-safe, `local` if empty."""
     host = re.sub(r"[^A-Za-z0-9_-]", "_", os.uname().nodename.split(".")[0])
-    return STATE_PATH.with_name(f"status.{host or 'local'}.json")
+    return host or "local"
 
 
 def _load_status() -> dict:
@@ -2425,6 +2437,131 @@ def set_status(session_id: str, state: str | None, event: str) -> None:
             pass
 
 
+# ── Device record ────────────────────────────────────────────────────────────
+# Transcripts carry no host, and the synced projects dir mixes every Mac's
+# sessions. Each machine's local history.jsonl does know which sessions were
+# typed into on it, so every ast exports that set into the synced home as
+# devices.<host>.json — one writer per file, like status.<host>.json — and
+# load_device_map() merges them. Nothing of this goes into the index cache.
+
+_DEVICES_FILE_RE = re.compile(r"^devices\.([A-Za-z0-9_-]+)\.json$")
+_DEVICE_RECORD_VERSION = 1
+
+
+def _devices_path(host: str | None = None) -> Path:
+    return STATE_PATH.with_name(f"devices.{host or _host_id()}.json")
+
+
+def _read_json_dict(path: Path) -> dict:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            val = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return val if isinstance(val, dict) else {}
+
+
+def _device_sync_stubbed() -> bool:
+    """True when tests have moved ast's home but left the real history in
+    place: exporting it would read the user's 8MB file into a fixture."""
+    home = _ast_home()
+    stubbed = CACHE_DIR != home or STATE_PATH != home / "state.json"
+    return stubbed and CLAUDE_HISTORY_PATH == _DEFAULT_CLAUDE_HISTORY_PATH
+
+
+def sync_device_record() -> bool:
+    """Fold new lines of the local history into this machine's device record.
+
+    Reads from the recorded offset when the file only grew, from the start
+    when it is new, replaced or shrank. A last line still missing its newline
+    is left for the next call. Returns True when the record was rewritten;
+    every failure reads as False so the TUI never prints over curses."""
+    if _device_sync_stubbed():
+        return False
+    src = CLAUDE_HISTORY_PATH
+    try:
+        st = src.stat()
+    except OSError:
+        return False
+    path = _devices_path()
+    try:
+        with _file_lock(path.with_suffix(".lock")):
+            rec = _read_json_dict(path)
+            source = rec.get("source") if isinstance(rec.get("source"), dict) else {}
+            sessions = rec.get("sessions") if isinstance(rec.get("sessions"), dict) else {}
+            same_src = source.get("path") == str(src)
+            if (same_src and source.get("size") == st.st_size
+                    and source.get("mtime") == st.st_mtime):
+                return False
+            offset = source.get("offset") if same_src else None
+            if (not isinstance(offset, int) or offset < 0 or offset > st.st_size
+                    or st.st_size < (source.get("size") or 0)
+                    or source.get("ino", st.st_ino) != st.st_ino):
+                # Trimmed or replaced: read it all again, but keep what the
+                # record already knows — those prompts were still typed here.
+                offset = 0
+            with src.open("rb") as f:
+                f.seek(offset)
+                chunk = f.read()
+            end = chunk.rfind(b"\n") + 1
+            for raw in chunk[:end].splitlines():
+                try:
+                    evt = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(evt, dict):
+                    continue
+                sid, ts = evt.get("sessionId"), evt.get("timestamp")
+                if not isinstance(sid, str) or not sid or not isinstance(ts, (int, float)):
+                    continue
+                if ts > sessions.get(sid, -1):
+                    sessions[sid] = int(ts)
+            out = {"version": _DEVICE_RECORD_VERSION, "host": _host_id(),
+                   "source": {"path": str(src), "size": st.st_size,
+                              "mtime": st.st_mtime, "ino": st.st_ino,
+                              "offset": offset + end},
+                   "sessions": sessions}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
+            tmp.replace(path)
+            return True
+    except OSError:
+        return False
+
+
+def load_device_map(sync: bool = True) -> dict:
+    """sid -> host over every machine's device record. A session continued
+    on another Mac sits in two records; the later prompt names its host."""
+    if sync:
+        sync_device_record()
+    best: dict = {}
+    try:
+        entries = list(STATE_PATH.parent.iterdir())
+    except OSError:
+        return {}
+    for p in entries:
+        m = _DEVICES_FILE_RE.match(p.name)
+        if not m:
+            continue
+        rec = _read_json_dict(p)
+        host = m.group(1)
+        # A Synology conflict copy (`devices.<host>_<peer>_…_Conflict.json`)
+        # still fits the name pattern but carries the original's host.
+        if rec.get("host") != host:
+            continue
+        sessions = rec.get("sessions")
+        if not isinstance(sessions, dict):
+            continue
+        for sid, ts in sessions.items():
+            if not isinstance(ts, (int, float)):
+                continue
+            if sid not in best or ts > best[sid][0]:
+                best[sid] = (ts, host)
+    return {sid: host for sid, (_, host) in best.items()}
+
+
 def resolve_status(session_id: str, live: set[str], done: set[str],
                    registry: dict | None = None,
                    overlay: dict | None = None,
@@ -2450,6 +2587,8 @@ class StatusContext:
     overlay: dict
     jobs: dict
     pins: set = field(default_factory=set)  # agent-view pinned daemonShorts
+    devices: dict = field(default_factory=dict)  # sid -> host (load_device_map)
+    aliases: dict = field(default_factory=dict)  # host -> label (device_alias pref)
 
     @classmethod
     def capture(cls) -> "StatusContext":
@@ -2471,7 +2610,9 @@ class StatusContext:
                                  "updatedAt": rec.get("updatedAt")}
         return cls(live=live, done=done_ids(),
                    registry=registry, overlay=status_overlay(),
-                   jobs=scan_jobs(), pins=read_pins())
+                   jobs=scan_jobs(), pins=read_pins(),
+                   devices=load_device_map(),
+                   aliases=load_device_aliases())
 
     def resolve(self, session_id: str) -> str:
         return resolve_status(session_id, self.live, self.done,
@@ -2793,6 +2934,159 @@ def save_agent_view(view: str) -> None:
     st = load_state()
     st["agent"] = view
     save_state(st)
+
+
+# Device view: which Mac's sessions are shown. "all", "local" (this machine),
+# "?" (no device record) or a host id from load_device_map(). `m`/`M` cycle it
+# in the TUI and `--device` accepts a host or its alias. A host or "local"
+# view drops the "?" rows — every codex session is "?" and would otherwise sit
+# in every machine's view — and reports how many it dropped, so the filter
+# never shrinks a listing silently.
+
+DEVICE_WIDTH = 6
+DEVICE_UNKNOWN = "?"
+DEVICE_VIEW_ALL = "all"
+DEVICE_VIEW_LOCAL = "local"
+
+
+def device_of(session_id: str, ctx) -> str | None:
+    """Host the session was last worked on. A session alive on this machine
+    is this machine's: the pid registry and codex locks are local-only."""
+    if session_id in ctx.live:
+        return _host_id()
+    return ctx.devices.get(session_id)
+
+
+def load_device_aliases() -> dict:
+    val = load_state().get("device_alias")
+    if not isinstance(val, dict):
+        return {}
+    return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, str) and v}
+
+
+def save_device_alias(host: str, name: str | None) -> None:
+    st = load_state()
+    aliases = st.get("device_alias") if isinstance(st.get("device_alias"), dict) else {}
+    if name:
+        aliases[host] = name
+    else:
+        aliases.pop(host, None)
+    st["device_alias"] = aliases
+    save_state(st)
+
+
+def device_label(host: str | None, aliases: dict) -> str:
+    """Column text: the alias, else the host cut to DEVICE_WIDTH (a plain cut
+    — `MBP-M4`/`MM-M6-` stay distinguishable, an ellipsis would eat one more)."""
+    if not host:
+        return DEVICE_UNKNOWN
+    name = aliases.get(host) or host
+    out, used = "", 0
+    for ch in unicodedata.normalize("NFC", name):
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + cw > DEVICE_WIDTH:
+            break
+        out += ch
+        used += cw
+    return out
+
+
+def resolve_device_view(value: str, aliases: dict, known: set) -> str | None:
+    """`--device` value -> "all" / "local" / "?" / a host id; None if unknown."""
+    v = (value or "").strip().lower()
+    if v in (DEVICE_VIEW_ALL, DEVICE_VIEW_LOCAL, DEVICE_UNKNOWN):
+        return v
+    for host, alias in aliases.items():
+        if alias.lower() == v:
+            return host
+    for host in known:
+        if host.lower() == v:
+            return host
+    return None
+
+
+def filter_device(sessions, view: str, ctx) -> tuple:
+    """(kept rows, "?" rows dropped). "all" and unknown views keep everything."""
+    rows = list(sessions)
+    if view == DEVICE_UNKNOWN:
+        return [s for s in rows if device_of(s.session_id, ctx) is None], 0
+    if view == DEVICE_VIEW_LOCAL:
+        view = _host_id()
+    elif view == DEVICE_VIEW_ALL or not view:
+        return rows, 0
+    kept, hidden = [], 0
+    for s in rows:
+        host = device_of(s.session_id, ctx)
+        if host is None:
+            hidden += 1
+        elif host == view:
+            kept.append(s)
+    return kept, hidden
+
+
+def device_choices(ctx) -> tuple:
+    """The `m` cycle: all, local, then every other known host."""
+    others = sorted(set(ctx.devices.values()) - {_host_id()})
+    return (DEVICE_VIEW_ALL, DEVICE_VIEW_LOCAL, *others)
+
+
+def cycle_device(view: str, choices: tuple, step: int = 1) -> str:
+    try:
+        i = choices.index(view)
+    except ValueError:
+        i = 0
+    return choices[(i + step) % len(choices)]
+
+
+def _device_view_label(view: str, aliases: dict) -> str:
+    if view in (DEVICE_VIEW_LOCAL, DEVICE_UNKNOWN):
+        return view
+    return device_label(view, aliases)
+
+
+def device_note(view: str, aliases: dict, hidden: int) -> str:
+    """Trailing `  [device:mbp, ?:12 hidden]` tag for CLI summaries."""
+    if not view or view == DEVICE_VIEW_ALL:
+        return ""
+    extra = f", ?:{hidden} hidden" if hidden else ""
+    return f"  [device:{_device_view_label(view, aliases)}{extra}]"
+
+
+def load_device_view() -> str:
+    val = load_state().get("device")
+    return val if isinstance(val, str) and val else DEVICE_VIEW_ALL
+
+
+def save_device_view(view: str) -> None:
+    st = load_state()
+    st["device"] = view or DEVICE_VIEW_ALL
+    save_state(st)
+
+
+def device_view_for(arg: str | None, ctx) -> str | None:
+    """Effective device view: an explicit `--device` (one-off) resolved
+    against aliases and known hosts, else the saved TUI view. None means the
+    explicit value matched nothing; the caller reports it and exits 2."""
+    if not arg:
+        return load_device_view()
+    known = set(ctx.devices.values()) | {_host_id()}
+    view = resolve_device_view(arg, ctx.aliases, known)
+    if view is None:
+        print(f"unknown device {arg!r} (see `ast devices`)", file=sys.stderr)
+    return view
+
+
+def device_cell(session_id: str, ctx) -> str:
+    return pad_display(device_label(device_of(session_id, ctx), ctx.aliases), DEVICE_WIDTH)
+
+
+def device_resume_warning(session_id: str, ctx) -> str | None:
+    """One-line notice when a session was last worked on another Mac."""
+    host = device_of(session_id, ctx)
+    if host is None or host == _host_id():
+        return None
+    return (f"note: {session_id[:8]} was last worked on "
+            f"{device_label(host, ctx.aliases)}; resuming it on this Mac")
 
 
 def _detect_terminal_is_light(env: dict | None = None) -> bool | None:
@@ -3579,6 +3873,8 @@ def session_to_dict(s: "SessionMeta", ctx: "StatusContext") -> dict:
         "entrypoint": s.entrypoint or "",
         "origin": session_origin(s),
         "agent": s.agent or DEFAULT_AGENT,
+        "device": device_of(s.session_id, ctx),
+        "device_label": device_label(device_of(s.session_id, ctx), ctx.aliases),
         "job": _job_json(job),
         "prs": list(s.prs or []),
         "pinned": bool(short and short in ctx.pins),
@@ -3613,6 +3909,10 @@ def cmd_list(args: argparse.Namespace) -> int:
     # the TUI `a` key last saved.
     agent_view = getattr(args, "agent", None) or load_agent_view()
     sessions = filter_agent(sessions, agent_view)
+    device_view = device_view_for(getattr(args, "device", None), ctx)
+    if device_view is None:
+        return 2
+    sessions, dev_hidden = filter_device(sessions, device_view, ctx)
     # Column sort: an explicit --sort is a one-off override (natural direction,
     # flipped by --reverse); no flag uses the saved TUI preference. Sort runs
     # BEFORE --limit so the slice keeps the top-N of the chosen order. getattr
@@ -3644,6 +3944,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         f"{'#':>{num_w}} "
         f"{pad_display('ST', STATUS_WIDTH)} "
         f"{'AGENT':<{AGENT_VIEW_WIDTH}}  "
+        f"{'DEVICE':<{DEVICE_WIDTH}}  "
         f"{'LAST ACTIVITY':<16}  "
         f"{'SESSION':<10} "
         f"{'MSGS':>4}  "
@@ -3666,6 +3967,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             f"{idx:>{num_w}} "
             f"{pad_display(st, STATUS_WIDTH)} "
             f"{s.agent:<{AGENT_VIEW_WIDTH}}  "
+            f"{device_cell(s.session_id, ctx)}  "
             f"{ts:<16}  "
             f"{sid:<10} "
             f"{s.msg_count:>4}  "
@@ -3676,7 +3978,8 @@ def cmd_list(args: argparse.Namespace) -> int:
     summary = "  ".join(f"{status_label(g)}:{counts[g]}"
                         for g in STATUS_ALL if counts[g])
     print(f"\n{len(sessions)} session(s)  [{summary}]"
-          f"{origin_note(origin)}{agent_note(agent_view)}")
+          f"{origin_note(origin)}{agent_note(agent_view)}"
+          f"{device_note(device_view, ctx.aliases, dev_hidden)}")
     return 0
 
 
@@ -3728,17 +4031,25 @@ def cmd_search(args: argparse.Namespace) -> int:
     agent_view = getattr(args, "agent", None) or load_agent_view()
     if agent_view in AGENTS:
         hits = [h for h in hits if h[0].agent == agent_view]
+    ctx = StatusContext.capture()
+    device_view = device_view_for(getattr(args, "device", None), ctx)
+    if device_view is None:
+        return 2
+    kept_meta, dev_hidden = filter_device([h[0] for h in hits], device_view, ctx)
+    kept_ids = {id(m) for m in kept_meta}
+    hits = [h for h in hits if id(h[0]) in kept_ids]
     hits.sort(key=lambda h: h[0].last_ts or _EPOCH, reverse=True)
     if args.limit:
         hits = hits[: args.limit]
-    notes = f"{origin_note(origin)}{agent_note(agent_view)}"
+    notes = (f"{origin_note(origin)}{agent_note(agent_view)}"
+             f"{device_note(device_view, ctx.aliases, dev_hidden)}")
     if not hits:
         print(f"(no matches for {args.query!r}{notes})")
         return 0
-    ctx = StatusContext.capture()
     for meta, matches in hits:
         st = ctx.resolve(meta.session_id)
         print(f"\n{status_label(st)}  {meta.agent:<{AGENT_VIEW_WIDTH}}  "
+              f"{device_cell(meta.session_id, ctx)}  "
               f"{meta.session_id[:8]}  {fmt_ts(meta.last_ts)}  "
               f"{shorten_path(meta.cwd)}  ({len(matches)} hit(s))")
         for ts, role, snippet in matches[:3]:
@@ -3982,6 +4293,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
     target = require_session(args.session_id)
     if target is None:
         return 1
+    note = device_resume_warning(target.session_id, StatusContext.capture())
+    if note:
+        # stderr, and never a prompt: GUI and scripted callers must not block.
+        print(note, file=sys.stderr)
     cwd = target.cwd or "."
     short = job_short_for(target.session_id)
     if getattr(args, "spawn", False):
@@ -5041,6 +5356,7 @@ HELP_LINES = [
     "",
     "Session actions (normal mode)",
     "  a / A                  cycle agent view (all→claude→codex; A backwards) — saved",
+    "  m / M                  cycle device view (all→local→other Macs; M backwards) — saved",
     "  i / I                  auto-rescan interval popup (Off/5/10/30/60/120s)",
     "  v / V                  preview the focused session (scroll/search modal)",
     "                         ↑↓ scroll · PgUp/PgDn page · g/G top/bottom · q/Esc/v close",
@@ -6305,6 +6621,38 @@ def _delete_sessions(targets: list[SessionMeta], sessions: list[SessionMeta],
     return deleted, errors
 
 
+def _device_hint(view: str, aliases: dict, hidden: int) -> str:
+    """Header hint for the device view: `  ⌂mbp`, `  ⌂mbp ?2` when "?" rows
+    were dropped; empty for "all". Kept as short as the agent hint beside it."""
+    if not view or view == DEVICE_VIEW_ALL:
+        return ""
+    extra = f" ?{hidden}" if hidden else ""
+    return f"  ⌂{_device_view_label(view, aliases)}{extra}"
+
+
+def _confirm_other_device_modal(stdscr, target: SessionMeta, label: str) -> bool:
+    """Ask before resuming a session last worked on another Mac. y → True."""
+    import curses
+    _, w2 = stdscr.getmaxyx()
+    box_w = min(72, max(48, w2 - 6))
+    box_h = 8
+    win = _centered_win(stdscr, box_h, box_w)
+    try:
+        win.box()
+        title = " other device "
+        win.addnstr(0, max(2, (box_w - len(title)) // 2), title,
+                    box_w - 4, curses.color_pair(5) | curses.A_BOLD)
+        info = truncate(f"{target.session_id[:8]}  {shorten_path(target.cwd)}", box_w - 6)
+        win.addnstr(2, 3, info, box_w - 6)
+        win.addnstr(3, 3, f"This session was last worked on {label}.", box_w - 6)
+        win.addnstr(5, 3, "Resume it on this Mac? (y/N)", box_w - 6, curses.A_BOLD)
+        win.refresh()
+    except curses.error:
+        pass
+    ch = stdscr.getch()
+    return ch in (ord('y'), ord('Y'))
+
+
 def _confirm_skip_perm_modal(stdscr, target: SessionMeta) -> bool | None:
     """Ask whether to apply --dangerously-skip-permissions for this resume.
 
@@ -6405,11 +6753,12 @@ def _tui_footer_info(row) -> str:
 
 
 def _tui_columns(n_items, n_sessions, w):
-    """List-view column widths: (num, status, agent, ts, sid, msgs, msg, proj).
+    """List-view column widths: (num, status, agent, device, ts, sid, msgs, msg, proj).
 
     Pure layout math shared by the header row and `_tui_draw_rows`."""
     num_w = max(3, len(str(n_items or n_sessions)))
     agent_w = AGENT_VIEW_WIDTH
+    device_w = DEVICE_WIDTH
     ts_w = 16
     sid_w = 8
     msgs_w = 4
@@ -6417,13 +6766,14 @@ def _tui_columns(n_items, n_sessions, w):
     # Fixed width up through MSGS column. Tight 1-space separators around
     # ST (#→ST, ST→AGENT) and between SESSION→MSGS; the rest use 2-space
     # separators.
-    fixed = ((1 + num_w + 1) + (status_w + 1) + (agent_w + 2) + (ts_w + 2)
+    fixed = ((1 + num_w + 1) + (status_w + 1) + (agent_w + 2) + (device_w + 2)
+             + (ts_w + 2)
              + (sid_w + 1) + (msgs_w + 2) + 2)
     remaining = max(30, w - fixed - 1)
     # split remaining: ~50% message, ~50% project (project at least 20)
     proj_w = max(20, remaining // 2)
     msg_w = max(20, remaining - proj_w - 2)
-    return num_w, status_w, agent_w, ts_w, sid_w, msgs_w, msg_w, proj_w
+    return num_w, status_w, agent_w, device_w, ts_w, sid_w, msgs_w, msg_w, proj_w
 
 
 def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
@@ -6432,7 +6782,7 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
 
     Pure render — reads state, writes only to the screen (no state mutation)."""
     import curses
-    num_w, status_w, agent_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
+    num_w, status_w, agent_w, device_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
     for i in range(list_h):
         idx = top + i
         if idx >= len(items):
@@ -6461,8 +6811,10 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
         proj_cell = truncate_display_tail(proj_full, proj_w)
 
         line_before_status = f"{mark}{idx + 1:>{num_w}} "
+        dev_host = device_of(s.session_id, ctx)
+        dev_cell = pad_display(device_label(dev_host, ctx.aliases), device_w)
         line_after_status = (
-            f" {(s.agent or DEFAULT_AGENT):<{agent_w}}  "
+            f" {(s.agent or DEFAULT_AGENT):<{agent_w}}  {dev_cell}  "
             f"{ts:<{ts_w}}  {sid:<{sid_w}} "
             f"{s.msg_count:>{msgs_w}}  {msg_cell}  {proj_cell}"
         )
@@ -6486,6 +6838,12 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
                 col = pre_dw + status_w
                 stdscr.addnstr(list_top + i, col, line_after_status, max(0, w - col),
                                pre_attr)
+                if dev_host is not None and dev_host != _host_id():
+                    # Another Mac's session: the cell the user scans for.
+                    dx = col + 1 + agent_w + 2
+                    if dx < w:
+                        stdscr.addnstr(list_top + i, dx, dev_cell, max(0, w - dx),
+                                       curses.color_pair(5) | curses.A_BOLD)
             except curses.error:
                 pass
 
@@ -6493,7 +6851,8 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
 def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
              days: int | None, skip_perm_default: bool = False,
              hide_done_default: bool = False, theme: str = "dark",
-             agent_view_override: str | None = None):
+             agent_view_override: str | None = None,
+             device_view_override: str | None = None):
     import curses
     import time
     curses.curs_set(0)
@@ -6529,6 +6888,9 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
     origin: str = load_origin()  # f cycles all→user→agent, F walks backwards
     # a cycles all→claude→codex…, A backwards; `ast pick --agent` overrides
     # the saved view for this launch only.
+    # m cycles all→local→other hosts, M backwards; `ast pick --device` overrides
+    device_view: str = device_view_override or load_device_view()
+    dev_hidden = [0]   # "?" rows the device view dropped; the header reports it
     agent_view: str = (agent_view_override if agent_view_override in agent_choices()
                        else load_agent_view())
     hide_done: bool = hide_done_default  # H toggle: hide 작업종료 from the view
@@ -6549,6 +6911,7 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
             pool = filter_origin(pool, origin)
         if agent_view != AGENT_VIEW_ALL:
             pool = filter_agent(pool, agent_view)
+        pool, dev_hidden[0] = filter_device(pool, device_view, ctx)
         if cwd_only and launch_cwd:
             pool = [s for s in pool
                     if unicodedata.normalize("NFC", s.cwd or "").startswith(launch_cwd)]
@@ -6625,8 +6988,9 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
                 f"{STATUS_ENDED}{scounts[STATUS_ENDED]} "
                 f"{STATUS_DONE}{scounts[STATUS_DONE]}"
                 f"{auto_hint}{sort_hint}{origin_hint}{agent_hint}"
+                f"{_device_hint(device_view, ctx.aliases, dev_hidden[0])}"
                 f"{mark_hint}{search_hint}{hide_hint}{cwd_hint}"
-                "   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit "
+                "   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit "
             )
 
         header = _header_line(items)
@@ -6646,12 +7010,13 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
         # The mark column (1 char) lives in `line_before_status`, so header
         # starts with a leading space to match row alignment.
         cols = _tui_columns(len(items), len(sessions), w)
-        num_w, status_w, agent_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
+        num_w, status_w, agent_w, device_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
 
         col_header = (
             f" {'#':>{num_w}} "
             f"{pad_display('ST', status_w)} "
             f"{'AGENT':<{agent_w}}  "
+            f"{'DEVICE':<{device_w}}  "
             f"{'LAST ACTIVITY':<{ts_w}}  "
             f"{'SESSION':<{sid_w}} "
             f"{'MSGS':>{msgs_w}}  "
@@ -6668,7 +7033,7 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
             # pure ASCII, so character index == display column; the (x, width)
             # of each sortable column is derived from the same field widths the
             # f-string above used, so no width drift.
-            _ts_x = num_w + 2 + status_w + 1 + agent_w + 2
+            _ts_x = num_w + 2 + status_w + 1 + agent_w + 2 + device_w + 2
             _sort_x = {
                 "status":  (num_w + 2, status_w),
                 "time":    (_ts_x, ts_w),
@@ -6922,6 +7287,12 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
                     toast = (f"→ attach {sid8}  {info}" if ok
                              else f"Attach failed: {info}  ({sid8})")
                     continue
+                _dev = device_of(target.session_id, ctx)
+                if (_dev is not None and _dev != _host_id()
+                        and not _confirm_other_device_modal(
+                            stdscr, target, device_label(_dev, ctx.aliases))):
+                    toast = "Resume cancelled"
+                    continue
                 open_cwd = target.cwd
                 _spec = agent_of(target)
                 if (target.cwd and not os.path.isdir(target.cwd)
@@ -7099,6 +7470,14 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
             top = 0
             toast = ("Agent: all" if agent_view == AGENT_VIEW_ALL
                      else f"Agent: {agent_view} only")
+        elif ch in (ord('m'), ord('M')):  # cycle device view (M = backwards)
+            device_view = cycle_device(device_view, device_choices(ctx),
+                                       -1 if ch == ord('M') else 1)
+            save_device_view(device_view)
+            sel = 0
+            top = 0
+            toast = ("Device: all" if device_view == DEVICE_VIEW_ALL
+                     else f"Device: {_device_view_label(device_view, ctx.aliases)} only")
         elif ch in (ord('i'), ord('I')):  # auto-rescan interval popup
             _res = _auto_rescan_modal(stdscr, auto_enabled, auto_interval)
             if _res is not None:
@@ -7218,6 +7597,16 @@ def cmd_pick(args: argparse.Namespace) -> int:
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error:
         pass
+    device_view = None
+    if getattr(args, "device", None):
+        # Resolve before curses starts so a bad value is a plain error, not a
+        # TUI that silently falls back to the saved view.
+        dev_ctx = StatusContext(live=set(), done=set(), registry={}, overlay={},
+                                jobs={}, devices=load_device_map(),
+                                aliases=load_device_aliases())
+        device_view = device_view_for(args.device, dev_ctx)
+        if device_view is None:
+            return 2
     print("Loading sessions…", file=sys.stderr, end="", flush=True)
     sessions = load_all_sessions(
         cwd_filter=args.cwd,
@@ -7245,7 +7634,8 @@ def cmd_pick(args: argparse.Namespace) -> int:
               f"using xterm-256color)            ", file=sys.stderr)
     try:
         curses.wrapper(_pick_ui, sessions, args.cwd, args.days, skip_perm,
-                       hide_done, theme, getattr(args, "agent", None))
+                       hide_done, theme, getattr(args, "agent", None),
+                       device_view)
     except KeyboardInterrupt:
         pass
     # The TUI handles Enter by spawning a new terminal window, so we don't
@@ -8403,6 +8793,34 @@ def cmd_restore(args: argparse.Namespace) -> int:
         tar.close()
 
 
+def cmd_devices(args: argparse.Namespace) -> int:
+    """List the machines that have a device record, or set/clear an alias."""
+    if getattr(args, "alias", None):
+        host, sep, name = args.alias.partition("=")
+        if not sep or not host.strip() or not name.strip():
+            print("--alias expects HOST=NAME", file=sys.stderr)
+            return 2
+        save_device_alias(host.strip(), name.strip())
+        print(f"alias {host.strip()} → {name.strip()}")
+        return 0
+    if getattr(args, "unalias", None):
+        save_device_alias(args.unalias.strip(), None)
+        print(f"alias removed: {args.unalias.strip()}")
+        return 0
+    devices = load_device_map()
+    aliases = load_device_aliases()
+    counts: dict = {}
+    for host in devices.values():
+        counts[host] = counts.get(host, 0) + 1
+    here = _host_id()
+    counts.setdefault(here, 0)
+    print(f" {'HOST':<20} {'ALIAS':<8} {'SESSIONS':>8}")
+    for host in sorted(counts):
+        mark = "*" if host == here else " "
+        print(f"{mark}{host:<20} {aliases.get(host, '-'):<8} {counts[host]:>8}")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     sessions = load_all_sessions()
     ctx = StatusContext.capture()
@@ -8526,6 +8944,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pick.add_argument("--theme", choices=THEME_CHOICES,
                         default=argparse.SUPPRESS,
                         help="TUI color theme (toggle in-TUI with t)")
+    p_pick.add_argument("--device", default=None, metavar="NAME",
+                        help="only sessions last worked on NAME: a host, its alias, local, ? or all")
     p_pick.add_argument("--agent", choices=agent_choices(), default=None,
                         help="start in one agent CLI's view (default: the "
                              "last view saved by the `a` key)")
@@ -8549,6 +8969,8 @@ def _build_parser() -> argparse.ArgumentParser:
                              "(agent = SDK-spawned; default: saved TUI preference)")
     p_list.add_argument("--json", action="store_true",
                         help="emit machine-readable JSON (for cst.app) instead of the table")
+    p_list.add_argument("--device", default=None, metavar="NAME",
+                        help="only sessions last worked on NAME: a host, its alias, local, ? or all")
     p_list.add_argument("--agent", choices=agent_choices(), default=None,
                         help="show one agent CLI's sessions (default: the "
                              "view saved by the TUI `a` key, else all)")
@@ -8562,6 +8984,8 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="who started the session: all|user|agent "
                                "(default: saved TUI preference)")
     p_search.add_argument("-i", "--ignore-case", action="store_true")
+    p_search.add_argument("--device", default=None, metavar="NAME",
+                        help="only sessions last worked on NAME: a host, its alias, local, ? or all")
     p_search.add_argument("--agent", choices=agent_choices(), default=None,
                           help="restrict to one agent CLI's sessions "
                                "(default: the saved TUI view, else all)")
@@ -8659,6 +9083,14 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="do not run `codex archive`/`unarchive` to add "
                                 "restored threads to codex's state DB")
     p_restore.set_defaults(func=cmd_restore)
+
+    p_dev = sub.add_parser("devices", help="machines with a device record; set aliases")
+    g_dev = p_dev.add_mutually_exclusive_group()
+    g_dev.add_argument("--alias", metavar="HOST=NAME", default=None,
+                       help="show HOST as NAME in the DEVICE column")
+    g_dev.add_argument("--unalias", metavar="HOST", default=None,
+                       help="drop HOST's alias")
+    p_dev.set_defaults(func=cmd_devices)
 
     p_stats = sub.add_parser("stats", help="summary stats")
     p_stats.add_argument("--top", type=int, default=15)

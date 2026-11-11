@@ -133,6 +133,30 @@ immediately and reset the cursor. The header hint (`👤user` / `🤖agent`) sit
 right after `sort:<col>` — anything longer, or placed after the transient
 mark/search/hide/cwd hints, truncates at 80 columns.
 
+### Device view (`ast list --device` / TUI `m`,`M`)
+
+Which Mac a session was last worked on. `device_of(sid, ctx)` returns
+`_host_id()` for a session live on this machine (the pid registry and codex
+locks are local), else `ctx.devices[sid]` from `load_device_map()`, else None
+(`?`). `load_device_map()` calls `sync_device_record()` first, and it runs
+inside `StatusContext.capture()`, so `cmd_search` and `cmd_resume` (which skip
+`load_all_sessions`) still sync. The sync is a no-op when tests stubbed the ast
+home but not `CLAUDE_HISTORY_PATH` (`_device_sync_stubbed`), so no fixture
+reads the real history. Aliases live in `state.json` `device_alias` and ride
+`StatusContext.aliases`; `device_label()` cuts an unaliased host to
+`DEVICE_WIDTH` (6). `filter_device(rows, view, ctx)` returns `(kept, hidden)`:
+a host or `local` view drops `?` rows and reports how many (`device_note` →
+`[device:mbp, ?:3 hidden]`, TUI `_device_hint` → `⌂mbp ?3`), unlike the
+origin filter, because every codex session is `?` and would sit in every
+machine's view. The view persists as `{"device": ...}`; `device_view_for()`
+resolves an explicit `--device` (rc 2 when nothing matches). The DEVICE column
+follows AGENT in `ast list`, `ast search` and the TUI (`_tui_columns` is a
+9-tuple: `num, status, agent, device, ts, sid, msgs, msg, proj`); TUI Enter on
+another Mac's session goes through `_confirm_other_device_modal` before the
+orphan/skip-perm flow, and `cmd_resume` prints `device_resume_warning()` to
+stderr without blocking. Device data never enters `SessionMeta` or the index,
+so no `_CACHE_SCHEMA` bump.
+
 ### Agent view (`ast list --agent` / TUI `a`,`A`)
 
 Which agent CLI's sessions are shown: `"all"` or an `AGENTS` key
@@ -146,8 +170,8 @@ via the `agent_view_override` kwarg of `_pick_ui`), else the saved view. In
 the TUI `a` cycles forward and `A` backwards, both save immediately and reset
 the cursor; the header hint is `⚙<agent>` right after the origin hint. The
 **AGENT** column (`AGENT_VIEW_WIDTH` = the longest `AGENTS` key, 7 for `chatgpt`) sits between ST and LAST ACTIVITY in
-`ast list`, `ast search` rows and the TUI (`_tui_columns` returns an 8-tuple:
-`num, status, agent, ts, sid, msgs, msg, proj`); `session_to_dict` exposes
+`ast list`, `ast search` rows and the TUI (`_tui_columns` returns a 9-tuple:
+`num, status, agent, device, ts, sid, msgs, msg, proj`); `session_to_dict` exposes
 `agent` for `--json`. Moving the auto-rescan popup off `a` to `i` made room
 for this key.
 8. **TUI** (`_pick_ui`, ~line 4179) — curses-based picker with two modes (normal + search), rendering loop, modal dialogs (help, preview, delete confirm, cmux chooser). The preview modal (`_preview_modal`) pins its metadata header: `_build_lines()` returns `(lines, head_n)`, `_preview_sticky_head(head_n, view_h)` caps how many of those rows stay on screen (leaving `_PREVIEW_MIN_BODY_ROWS` for the transcript, and letting the overflow scroll normally since the body starts at the pinned count), and `top` is an absolute index into `lines` clamped to `[head_h, max_top]`. `d`/`Ctrl-D` therefore rewrites only `lines[_PREVIEW_STATUS_ROW]` in place instead of rebuilding every line, so the scroll offset and the active search survive a done toggle. That row is built by `_preview_status_row(status, inner_w, flash)`, which borrows `_status_attr()` — the list's ST palette — so the state reads by color, and ORs in `A_REVERSE|A_BOLD` when `flash` is set; a successful `d` sets `status_flash`, and the next keypress repaints the row unflashed alongside the `notice` reset. The same `d` also fires the `on_status_change` callback the caller passes in, because the modal box never covers the whole screen and the list around it was painted before the modal opened — without it the row behind the box keeps showing ○ while the modal's own Status row reads ✓. `_pick_ui` supplies `_repaint_list_bg`, a closure over that frame's `top`/`sel`/`cols` that re-runs `filtered()` and re-renders the header line (`_header_line(rows)`, extracted so both the row count and the ✓/○ counts recount from `ctx`), the rows, and the footer (`_tui_footer_info(row)`, extracted for the same reason), staging them with `noutrefresh` only; the modal then sets `win.clearok(True)` so its next `refresh()` flushes list and box in one update with no blink. Re-running `filtered()` — not reusing the frozen `items` — is what makes the background match what the list will look like after the modal closes: with `H` on, the row the toggle just marked ✓ vanishes, and a status sort re-orders. The modal keeps indexing into its own `items`, so its `‹`/`›` walk is unaffected. Two details the shrinking row set forces: the strip is blanked before `_tui_draw_rows` (rows carry no trailing padding, so a vanished or longer previous row would bleed through), and `bsel`/`btop` are re-clamped by the main loop's own rules so the row highlighted behind the box is the one that stays focused afterwards. `cols` is reused rather than recomputed, keeping the rows aligned with the untouched column header on row 2. The modal never rescans, so a status change originating *outside* it (a process ending while the modal is open) shows up only on re-entry or a `‹`/`›` session switch. Normal-mode action keys include `s`/`S` (sort), `f`/`F` (origin filter), `a`/`A` (agent view), `i`/`I` (auto-rescan popup), `t`/`T` (theme), and `o`/`O` (open the focused session's folder in a new terminal — plain shell via `open_folder_in_new_terminal()`, no claude command) alongside `D`/`H`/`C`/`R`/`e`/`v`. Enter resumes through `open_in_new_terminal(..., agent=spec.name)`, and the skip-permissions modal titles itself with the spec's `skip_perm_flag`. The help modal (`?`, `_show_help_modal`) carries the preview modal's `/` search too: its scroll offset, query and matches live in the `HelpSearch` dataclass, every keypress goes through the pure `_help_key()` (search keys first, anything else falls through to `_help_scroll`), and `_help_footer()` renders the prompt on the last inner row, which is why `view_h` is `box_h - 3`. Matching, stepping and scrolling reuse `_preview_find_matches` / `_match_step` / `_scroll_match_into_view`, and printable text is tested before the edit keys because `_read_key` reports a char like U+0107 by a codepoint equal to `KEY_BACKSPACE`. **Color theme**: dark/light palettes via `tui_init_colors()` — pair NUMBERS carry fixed meaning (1–9), only (fg,bg) swap per theme, so the whole UI re-themes without touching call sites; pair 7 doubles as the full-screen `bkgd` fill so each theme renders identically across terminals. `resolve_theme()` picks the effective theme (CLI `--theme` → saved pref → `COLORFGBG` auto-detect → dark); `t`/`T` toggles live and persists via `save_theme()` into `state.json`.
@@ -302,6 +326,8 @@ dropped from the index, live sessions are skipped unless `--force`, and
 | `$CODEX_HOME/thread-writer-locks/<uuid>.lock` | Read (flock probe) | Codex's per-thread writer lock — held ⇒ live (`codex_live_probe`); never written |
 | `~/.ast/index.json` (or `$AST_INDEX_DIR/index.json`) | R/W | Session metadata cache (safe to delete, but deleting it forces a full cold re-index — see `invalidate_cache_entries`) |
 | `~/.ast/state.json` | R/W | Done-flag overlay (`done` + `undone` tombstones, last writer wins per sid) + user prefs: auto-rescan, TUI theme, column sort, origin filter, agent view (safe to delete). `load_state()` folds sync conflict copies (`_STATE_CONFLICT_RE`) back in; the next `save_state()` deletes them |
+| `~/.claude/history.jsonl` | Read | Local (unsynced) prompt history; its `sessionId`s tell which sessions were worked on this Mac (`CLAUDE_HISTORY_PATH`, re-pointed by tests) |
+| `~/.ast/devices.<host>.json` | R/W | This Mac's device record `{version, host, source{path,size,mtime,offset}, sessions{sid: last prompt ms}}`, folded incrementally from history by `sync_device_record()`; one writer per file. `load_device_map()` merges every host's file (later prompt wins, a file whose `host` field differs from its name — a sync conflict copy — is skipped) into `StatusContext.devices` |
 | `~/.ast/status.<host>.json` | R/W | Hook status overlay (`_status_path()`), per machine so a synced home has one writer per file; `save_state()` drops the legacy `status` key from state.json |
 | `~/.claude/jobs/pins.json` | Read | Agent-view pin set (`read_pins()`) — never written |
 | `~/.cst/state.json` | Read once | claude-session-tracker's overlay, copied into `~/.ast/state.json` on a first run (`seed_from_cst_home()`) — never written |

@@ -19,6 +19,8 @@
       "entrypoint": "sdk-py",
       "origin": "agent",
       "agent": "claude",
+      "device": null,
+      "device_label": "?",
       "job": null,
       "prs": [],
       "pinned": false
@@ -40,6 +42,8 @@
       "entrypoint": "cli",
       "origin": "user",
       "agent": "claude",
+      "device": null,
+      "device_label": "?",
       "job": null,
       "prs": [
         {
@@ -68,6 +72,8 @@
       "entrypoint": "",
       "origin": "user",
       "agent": "claude",
+      "device": null,
+      "device_label": "?",
       "job": null,
       "prs": [],
       "pinned": false

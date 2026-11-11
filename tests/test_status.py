@@ -352,7 +352,7 @@ class TestVersionString(unittest.TestCase):
     """Lock the version so accidental bumps require an explicit test edit."""
 
     def test_version_is_locked(self):
-        self.assertEqual(tracker.__version__, "1.4.1")
+        self.assertEqual(tracker.__version__, "1.5.0")
 
 
 class TestTopLevelFlags(unittest.TestCase):
@@ -381,6 +381,7 @@ class TestTopLevelFlags(unittest.TestCase):
             "pick", "list", "search", "show", "subagents", "relocate",
             "export", "resume", "open", "backup", "restore", "stats",
             "done", "undone", "rm", "live", "stop", "logs", "bg", "jobs",
+            "merge-conflicts", "devices",
             "prompt-hook", "status-hook", "install-hook", "uninstall-hook",
         }
         self.assertEqual(set(subs), expected)
