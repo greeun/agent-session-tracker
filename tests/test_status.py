@@ -381,6 +381,7 @@ class TestTopLevelFlags(unittest.TestCase):
             "pick", "list", "search", "show", "subagents", "relocate",
             "export", "resume", "open", "backup", "restore", "stats",
             "done", "undone", "rm", "live", "stop", "logs", "bg", "jobs",
+            "merge-conflicts", "devices",
             "prompt-hook", "status-hook", "install-hook", "uninstall-hook",
         }
         self.assertEqual(set(subs), expected)

@@ -2930,6 +2930,133 @@ def save_agent_view(view: str) -> None:
     save_state(st)
 
 
+# Device view: which Mac's sessions are shown. "all", "local" (this machine),
+# "?" (no device record) or a host id from load_device_map(). `m`/`M` cycle it
+# in the TUI and `--device` accepts a host or its alias. A host or "local"
+# view drops the "?" rows — every codex session is "?" and would otherwise sit
+# in every machine's view — and reports how many it dropped, so the filter
+# never shrinks a listing silently.
+
+DEVICE_WIDTH = 6
+DEVICE_UNKNOWN = "?"
+DEVICE_VIEW_ALL = "all"
+DEVICE_VIEW_LOCAL = "local"
+
+
+def device_of(session_id: str, ctx) -> str | None:
+    """Host the session was last worked on. A session alive on this machine
+    is this machine's: the pid registry and codex locks are local-only."""
+    if session_id in ctx.live:
+        return _host_id()
+    return ctx.devices.get(session_id)
+
+
+def load_device_aliases() -> dict:
+    val = load_state().get("device_alias")
+    if not isinstance(val, dict):
+        return {}
+    return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, str) and v}
+
+
+def save_device_alias(host: str, name: str | None) -> None:
+    st = load_state()
+    aliases = st.get("device_alias") if isinstance(st.get("device_alias"), dict) else {}
+    if name:
+        aliases[host] = name
+    else:
+        aliases.pop(host, None)
+    st["device_alias"] = aliases
+    save_state(st)
+
+
+def device_label(host: str | None, aliases: dict) -> str:
+    """Column text: the alias, else the host cut to DEVICE_WIDTH (a plain cut
+    — `MBP-M4`/`MM-M6-` stay distinguishable, an ellipsis would eat one more)."""
+    if not host:
+        return DEVICE_UNKNOWN
+    name = aliases.get(host) or host
+    out, used = "", 0
+    for ch in unicodedata.normalize("NFC", name):
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + cw > DEVICE_WIDTH:
+            break
+        out += ch
+        used += cw
+    return out
+
+
+def resolve_device_view(value: str, aliases: dict, known: set) -> str | None:
+    """`--device` value -> "all" / "local" / "?" / a host id; None if unknown."""
+    v = (value or "").strip().lower()
+    if v in (DEVICE_VIEW_ALL, DEVICE_VIEW_LOCAL, DEVICE_UNKNOWN):
+        return v
+    for host, alias in aliases.items():
+        if alias.lower() == v:
+            return host
+    for host in known:
+        if host.lower() == v:
+            return host
+    return None
+
+
+def filter_device(sessions, view: str, ctx) -> tuple:
+    """(kept rows, "?" rows dropped). "all" and unknown views keep everything."""
+    rows = list(sessions)
+    if view == DEVICE_UNKNOWN:
+        return [s for s in rows if device_of(s.session_id, ctx) is None], 0
+    if view == DEVICE_VIEW_LOCAL:
+        view = _host_id()
+    elif view == DEVICE_VIEW_ALL or not view:
+        return rows, 0
+    kept, hidden = [], 0
+    for s in rows:
+        host = device_of(s.session_id, ctx)
+        if host is None:
+            hidden += 1
+        elif host == view:
+            kept.append(s)
+    return kept, hidden
+
+
+def device_choices(ctx) -> tuple:
+    """The `m` cycle: all, local, then every other known host."""
+    others = sorted(set(ctx.devices.values()) - {_host_id()})
+    return (DEVICE_VIEW_ALL, DEVICE_VIEW_LOCAL, *others)
+
+
+def cycle_device(view: str, choices: tuple, step: int = 1) -> str:
+    try:
+        i = choices.index(view)
+    except ValueError:
+        i = 0
+    return choices[(i + step) % len(choices)]
+
+
+def _device_view_label(view: str, aliases: dict) -> str:
+    if view in (DEVICE_VIEW_LOCAL, DEVICE_UNKNOWN):
+        return view
+    return device_label(view, aliases)
+
+
+def device_note(view: str, aliases: dict, hidden: int) -> str:
+    """Trailing `  [device:mbp, ?:12 hidden]` tag for CLI summaries."""
+    if not view or view == DEVICE_VIEW_ALL:
+        return ""
+    extra = f", ?:{hidden} hidden" if hidden else ""
+    return f"  [device:{_device_view_label(view, aliases)}{extra}]"
+
+
+def load_device_view() -> str:
+    val = load_state().get("device")
+    return val if isinstance(val, str) and val else DEVICE_VIEW_ALL
+
+
+def save_device_view(view: str) -> None:
+    st = load_state()
+    st["device"] = view or DEVICE_VIEW_ALL
+    save_state(st)
+
+
 def _detect_terminal_is_light(env: dict | None = None) -> bool | None:
     """Best-effort terminal-background detection via ``COLORFGBG``.
 
@@ -8538,6 +8665,34 @@ def cmd_restore(args: argparse.Namespace) -> int:
         tar.close()
 
 
+def cmd_devices(args: argparse.Namespace) -> int:
+    """List the machines that have a device record, or set/clear an alias."""
+    if getattr(args, "alias", None):
+        host, sep, name = args.alias.partition("=")
+        if not sep or not host.strip() or not name.strip():
+            print("--alias expects HOST=NAME", file=sys.stderr)
+            return 2
+        save_device_alias(host.strip(), name.strip())
+        print(f"alias {host.strip()} → {name.strip()}")
+        return 0
+    if getattr(args, "unalias", None):
+        save_device_alias(args.unalias.strip(), None)
+        print(f"alias removed: {args.unalias.strip()}")
+        return 0
+    devices = load_device_map()
+    aliases = load_device_aliases()
+    counts: dict = {}
+    for host in devices.values():
+        counts[host] = counts.get(host, 0) + 1
+    here = _host_id()
+    counts.setdefault(here, 0)
+    print(f" {'HOST':<20} {'ALIAS':<8} {'SESSIONS':>8}")
+    for host in sorted(counts):
+        mark = "*" if host == here else " "
+        print(f"{mark}{host:<20} {aliases.get(host, '-'):<8} {counts[host]:>8}")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     sessions = load_all_sessions()
     ctx = StatusContext.capture()
@@ -8794,6 +8949,14 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="do not run `codex archive`/`unarchive` to add "
                                 "restored threads to codex's state DB")
     p_restore.set_defaults(func=cmd_restore)
+
+    p_dev = sub.add_parser("devices", help="machines with a device record; set aliases")
+    g_dev = p_dev.add_mutually_exclusive_group()
+    g_dev.add_argument("--alias", metavar="HOST=NAME", default=None,
+                       help="show HOST as NAME in the DEVICE column")
+    g_dev.add_argument("--unalias", metavar="HOST", default=None,
+                       help="drop HOST's alias")
+    p_dev.set_defaults(func=cmd_devices)
 
     p_stats = sub.add_parser("stats", help="summary stats")
     p_stats.add_argument("--top", type=int, default=15)
