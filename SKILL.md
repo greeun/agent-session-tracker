@@ -1,7 +1,7 @@
 ---
 name: agent-session-tracker
 description: Track live/waiting/ended/done status of Claude Code sessions — and Codex CLI sessions and ChatGPT desktop app conversations alongside them. List, search, resume, export, backup, restore sessions via `ast` CLI or TUI. Use when user says "list sessions", "세션 상태", "ast", "session tracker", "codex 세션", "chatgpt 세션", "ChatGPT 앱 대화", or wants to resume/search/export/backup sessions.
-version: 1.4.1
+version: 1.5.3
 ---
 
 # agent-session-tracker
@@ -29,7 +29,7 @@ process is ended/job-state; a live one resolves overlay → registry → `●`):
   in TUI, `ast done <id>`, or the `done!` prompt hook). Persists in
   `~/.ast/state.json`.
 
-Main script: `tracker.py` (stdlib only, Python 3.10+, v1.4.1). Installed as
+Main script: `tracker.py` (stdlib only, Python 3.10+, v1.5.3). Installed as
 `~/.local/bin/ast`. All `~/.claude/...` data paths honor `$CLAUDE_CONFIG_DIR`
 (same convention as Claude Code itself) and `~/.codex/...` honors
 `$CODEX_HOME` (Codex's own convention); ast's own files live under `~/.ast`
@@ -96,6 +96,15 @@ ast list --agent codex    # one agent's sessions: all(default)|claude|codex|chat
                           #   chatgpt = ChatGPT desktop app conversations (see Multi-agent)
                           #   no --agent uses the view the TUI `a` key last saved;
                           #   same flag on `search` and `pick`; summary shows [agent:codex]
+ast list --device mbp     # sessions last worked on one Mac: a host, its alias, local, ? or all
+                          #   (zsh: quote it, --device '?')
+                          #   from each Mac's local ~/.claude/history.jsonl, exported to
+                          #   ~/.ast/devices.<host>.json; run ast once per Mac to backfill;
+                          #   a host/local view drops "?" rows: [device:mbp, ?:3 hidden]
+ast devices               # known hosts, aliases, session counts (* = this Mac)
+ast devices --alias MBP-M4P-24-H=mbp   # name a host in the DEVICE column (--unalias HOST)
+ast devices --primary MBP-M4P-24-H     # same-timestamp ties (a copied history.jsonl) go to
+                                       #   this host, else the lowest host name (--no-primary)
 ast list --json           # machine-readable JSON instead of the table (cst.app contract;
                           #   each session carries "agent": "claude"|"codex"|"chatgpt")
 ast search "<query>"      # full-text transcript search (OR via `|`, -i = ignore case)
@@ -142,6 +151,10 @@ ast restore <archive.tar.gz> [--cwd PFX] [--keep-cwd] [--no-register]
                           #   the ChatGPT app never lists the thread. Quit
                           #   the ChatGPT app before restoring into ~/.codex.
 ast relocate <id> <new-cwd> [--keep-original] [--force] [--dry-run] [-y]
+ast merge-conflicts [--dry-run] [-y] [--force]   # fold sync conflict copies
+                          #   (`<sid>_<host>_<date>_Conflict.jsonl` etc., rows tagged
+                          #   [conflict]) back into their transcripts; copies move to
+                          #   ~/.ast/backups/conflicts/, live sessions skipped
 ast rm <id> [<id> ...] [--dry-run] [-y] [--force]   # unlink session transcript(s)
                           #   (only removes the transcript; a live bg process keeps
                           #   running; --force implies -y here, single-id only)
@@ -201,7 +214,7 @@ Claude Code 2.x — no setup. The registry also gives `●` working / `◦` idle
 a dead PID is `○`.
 
 `ast install-hook` (optional) wires `ast status-hook` across 5 lifecycle events
-as a **precision layer** that writes to `state.json["status"]` — faster/finer
+as a **precision layer** that writes to `status.<host>.json` — faster/finer
 transitions, cleaner finished signal. **Not required for `!`.** Inside cmux:
 cmux injects its own Claude hooks via `--settings`; Claude Code merges them
 additively, so ast's hooks still fire — no conflict. *With hooks installed*,
@@ -256,6 +269,9 @@ stale `!` self-heals to `◦` to avoid a stuck state.
 - **`a`** — cycle the agent view (all→claude→codex→chatgpt) · **`A`** — cycle
   backwards. Header shows `⚙codex` when not `all`; the last view is saved in
   `state.json` and reused by `ast list` / `ast search` without `--agent`.
+- **`m`** — cycle the device view (all→local→other Macs) · **`M`** — backwards.
+  Header shows `⌂mbp` (`?N` = unknown rows hidden). Enter on another Mac's
+  session asks before resuming it here.
 - **`i` / `I`** — auto-rescan interval popup (Off / 5 / 10 / 30 / 60 / 120s;
   default ON 10s; persisted in `state.json`; `curses.beep()` + a sticky TUI
   toast when a session **newly** enters `!` waiting — no macOS desktop
@@ -355,7 +371,7 @@ are not listed. To find a ChatGPT chat: `ast search "<text>" --agent chatgpt`.
   ✓ done sessions hidden
 - TUI: `D`/`d`/`Ctrl-D` toggle-done, `H`/`h` hide-done, `C`/`c` cwd-only,
   `R`/`r`/`Ctrl-R` rescan, `e`/`E` export, `o`/`O` open-folder,
-  `a`/`A` agent view, `i`/`I` auto-rescan, `s`/`S` column sort, `t`/`T` theme,
+  `a`/`A` agent view, `m`/`M` device view, `i`/`I` auto-rescan, `s`/`S` column sort, `t`/`T` theme,
   `Ctrl-A` mark-all, `?` help, `v`/`V` preview
 - fzf-style `/` — type + ↑↓ at once, Enter commits (doesn't auto-open),
   Ctrl-D marks while filtering, Tab escalates to full-text

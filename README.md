@@ -36,7 +36,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. Verify
 ast --version
-# agent-session-tracker v1.4.1
+# agent-session-tracker v1.5.3
 
 # 4. (optional) wire the 0-token done!/undone! prompt hook + status precision layer
 ast install-hook
@@ -191,17 +191,18 @@ chatgpt.com (web or mobile) have no rollout on disk and are not listed.
 ast list [--limit 30] [--cwd PREFIX] [--days N]
          [--status working|waiting|idle|ended|done|active]
          [--sort time|status|msgs|message|project] [--reverse]
-         [--origin all|user|agent] [--agent all|claude|codex|chatgpt] [--json]
+         [--origin all|user|agent] [--agent all|claude|codex|chatgpt]
+         [--device NAME|local|?|all] [--json]
 ```
 
 ```
-agent-session-tracker v1.4.1
-  #  ST  AGENT    LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
-  1  ●   claude   2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
-  2  !   claude   2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
-  3  ◦   codex    2026-05-24 01:15  019cb053    12  실패건을 해결하라.        ~/project/url-shortener
-  4  ✓   chatgpt  2026-05-24 01:15  01a07c61     4  서비스기획의 역할은?      ~/Documents/Codex/2026-05-24/new-chat
-  5  ○   claude   2026-05-23 21:24  afbd9e28   241  pnpm 적용 되어 있는가?    ~/project/url-shortener
+agent-session-tracker v1.5.3
+  #  ST  AGENT    DEVICE  LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
+  1  ●   claude   work    2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
+  2  !   claude   mbp     2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
+  3  ◦   codex    ?       2026-05-24 01:15  019cb053    12  실패건을 해결하라.        ~/project/url-shortener
+  4  ✓   chatgpt  ?       2026-05-24 01:15  01a07c61     4  서비스기획의 역할은?      ~/Documents/Codex/2026-05-24/new-chat
+  5  ○   claude   mini    2026-05-23 21:24  afbd9e28   241  pnpm 적용 되어 있는가?    ~/project/url-shortener
 ```
 
 - Row numbers start at 1; column auto-expands for 1000+ sessions.
@@ -227,9 +228,29 @@ agent-session-tracker v1.4.1
   agent's sessions (`chatgpt` = ChatGPT desktop app conversations, see above). An explicit `--agent` is a one-off; with no flag the view the TUI
   `a` key last saved is used, announced as `[agent:codex]` in the summary
   line. Same flag on `ast search` and `ast pick`.
+- **Device:** the **DEVICE** column names the Mac a session was last worked
+  on, so a synced `~/.claude/projects` shared by several Macs stays readable.
+  Transcripts carry no host, so each Mac's ast exports the sessions in its own
+  local `~/.claude/history.jsonl` (one line per typed prompt) to
+  `~/.ast/devices.<host>.json`, and every listing merges those files; a session
+  continued on another Mac goes to the one with the later prompt, and a session
+  alive on this Mac is this Mac's. Run the new ast once on each Mac to backfill
+  its history. Sessions with no record (codex/chatgpt, `claude -p`, bg jobs)
+  show `?`. `--device NAME` takes a host, its alias, `local`, `?` or `all`
+  (quote it as `--device '?'` in zsh, which otherwise globs the `?`);
+  a host or `local` view drops the `?` rows and says so in the summary
+  (`[device:mbp, ?:12 hidden]`). With no flag the view the TUI `m` key last
+  saved is used. Same flag on `ast search` and `ast pick`. Name the hosts with
+  `ast devices --alias MBP-M4P-24-H=mbp` (shared through `state.json`);
+  `ast devices` lists every known host, its alias and session count, `*`
+  marking this Mac. A Mac set up with a copy of another Mac's
+  `history.jsonl` repeats every copied prompt with the same timestamp; such a
+  tie goes to `ast devices --primary HOST` (the Mac the copy came from), else
+  to the lowest host name, so all Macs agree. `ast resume` prints a note when the session was last
+  worked on another Mac, and TUI Enter asks before resuming it here.
 - **`--json`** emits the list as machine-readable JSON instead of the table
   (the contract consumed by the cst.app macOS companion). Each session carries
-  `entrypoint`, `origin` and `agent`.
+  `entrypoint`, `origin`, `agent`, `device` (host or null) and `device_label`.
 
 ### `ast pick` / `--tui` — interactive TUI
 
@@ -401,6 +422,17 @@ Rewrites `cwd` on every event in the JSONL and moves the file into the new proje
 | `--dry-run` | Show the rewrite plan; no changes |
 | `-y` / `--yes` | Skip confirmation |
 
+### `ast merge-conflicts` — fold sync conflict copies back in
+
+When `~/.claude/projects` (or `~/.codex/sessions`) lives in a synced folder and two machines write the same session, the sync client keeps the losing version beside it (`<sid>_<host>_<date>_Conflict.jsonl`, `.sync-conflict-…`, `(… conflicted copy …)`). The list shows only `<sid>.jsonl` and tags the row `[conflict]`, so anything that exists only in the copy is hidden from the list and from resume until you merge it:
+
+```bash
+ast merge-conflicts --dry-run   # list sessions with conflict copies
+ast merge-conflicts -y          # merge without prompting
+```
+
+Events are unioned (Claude events by `uuid`, other lines by exact text) and interleaved by timestamp without reordering either file; the pre-merge original is copied and the copies are moved to `~/.ast/backups/conflicts/<timestamp>/`. Live sessions are skipped unless `--force`.
+
 ### `ast rm <id> [<id> ...]` — unlink session transcript(s)
 
 ```bash
@@ -525,6 +557,7 @@ A curses picker with fzf-style filter, status glyphs, modals, and action keys. *
 | **`C`** / **`c`** | Toggle cwd-only — show only sessions under the TUI's launch cwd (NFC-normalized prefix match) |
 | **`R`** / **`r`** / **`Ctrl-R`** | Rescan sessions + live-process registry. The footer counts the scan while it runs — `Rescanning… 42% (994/2370)`. An auto-rescan tick shows the same counter once it has run past ~0.35s (a warm, fully-cached scan finishes before that and stays silent). |
 | **`a`** / **`A`** | Cycle the agent view: `all → claude → codex → chatgpt` (`A` backwards). Header shows `⚙codex` when not `all`. Persisted, shared with `ast list --agent`. |
+| **`m`** / **`M`** | Cycle the device view: `all → local → other Macs` (`M` backwards). Header shows `⌂mbp` (plus `?N` for hidden unknown rows) when not `all`. Persisted, shared with `ast list --device`. Another Mac's DEVICE cell is highlighted. |
 | **`i`** / **`I`** | Auto-rescan interval popup (Off / 5 / 10 / 30 / 60 / 120s; default ON 10s, persisted in `state.json`; `curses.beep()` + a sticky TUI toast when a session newly enters `!` waiting — no macOS desktop notification). Was `a` before 1.18. |
 | **`s`** | Cycle sort column in on-screen column order: `status → time → msgs → message → project` (resets to the column's natural direction). Header shows `sort:<col>▼/▲` and highlights the active column. Persisted. |
 | **`S`** | Reverse the current sort direction. Persisted. |
@@ -557,7 +590,7 @@ A cursor appears on the prompt line. Live filtering happens as you type.
 ### Header bar
 
 ```
- agent-session-tracker v1.4.1  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.5.3  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — visible rows / total sessions
@@ -683,7 +716,8 @@ Equivalent manual entry (one event shown):
 | `$CODEX_HOME/sessions/**/rollout-*.jsonl` | Codex CLI transcripts, plus the ChatGPT desktop app's conversations (default `~/.codex`; read-only) | Leave alone |
 | `$CODEX_HOME/thread-writer-locks/<uuid>.lock` | Codex's per-thread writer lock — ast probes the flock for liveness (read-only) | Leave alone |
 | `~/.ast/index.json` | mtime/size-invalidated session-metadata cache (schema 6, entries carry `agent`) | Yes — regenerates on next run |
-| `~/.ast/state.json` | done flags + hook status overlay + user prefs (auto-rescan, theme, sort, origin, agent view) | Yes — clears all `✓` marks, overlay, and prefs |
+| `~/.ast/state.json` | done flags (+ `undone` tombstones) + user prefs (auto-rescan, theme, sort, origin, agent view). Sync conflict copies (`state_*_Conflict.json`, `state.sync-conflict-*.json`, …) are merged back in and deleted automatically | Yes — clears all `✓` marks and prefs |
+| `~/.ast/status.<host>.json` | hook status overlay, one file per machine so a synced home never has two writers | Yes — status falls back to the process registry until the next hook |
 
 All `~/.claude/...` paths above honor **`$CLAUDE_CONFIG_DIR`** (same convention
 as Claude Code itself): when set, ast reads `projects/`, `sessions/`, `jobs/`,

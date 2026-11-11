@@ -11,11 +11,12 @@ Data sources:
   ~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl        — codex transcripts
   ~/.codex/thread-writer-locks/<uuid>.lock             — codex liveness (flock)
   ~/.ast/state.json                                    — done-state overlay
+  ~/.ast/status.<host>.json                            — hook status overlay
   ~/.ast/index.json                                    — indexing cache
 """
 from __future__ import annotations
 
-__version__ = "1.4.1"
+__version__ = "1.5.3"
 
 import argparse
 import json
@@ -47,6 +48,12 @@ def _claude_config_dir() -> Path:
 CONFIG_DIR = _claude_config_dir()
 PROJECTS_DIR = CONFIG_DIR / "projects"
 SESSIONS_REGISTRY_DIR = CONFIG_DIR / "sessions"
+# Claude Code's prompt history. It lives beside the synced projects dir but is
+# a plain local file, one per machine, and every line since 2025 carries the
+# sessionId the prompt was typed into, which is what tells ast on which Mac a
+# session was worked (see sync_device_record). Tests re-point it.
+CLAUDE_HISTORY_PATH = CONFIG_DIR / "history.jsonl"
+_DEFAULT_CLAUDE_HISTORY_PATH = CLAUDE_HISTORY_PATH
 # Agent-view background sessions: <config-dir>/jobs/<short>/state.json.
 # Hosted by the supervisor, not the pid registry above, so once an idle bg
 # process is stopped they leave no registry entry — the jobs scanner reads
@@ -91,7 +98,7 @@ INDEX_DIR = _ast_index_home()
 CACHE_PATH = INDEX_DIR / "index.json"
 # Bumped whenever the cached SessionMeta shape or extraction logic changes,
 # so stale entries are re-indexed instead of serving wrong snippets.
-_CACHE_SCHEMA = 6
+_CACHE_SCHEMA = 7
 STATE_PATH = CACHE_DIR / "state.json"
 
 # claude-session-tracker's home. ast forked from it, so a first run seeds its
@@ -296,6 +303,29 @@ _CLAUDE_SID_RE = re.compile(r"^(" + _UUID_RE + r")(?![0-9a-fA-F])")
 def _claude_session_id_of(path: Path) -> str:
     m = _CLAUDE_SID_RE.match(path.stem)
     return m.group(1) if m else path.stem
+
+
+# The name a sync client gives the losing version of a file, keyed on the
+# stem so the original's name is the captured `base` + the same suffix.
+# Synology's host is taken as one `_`-free token so a base that itself holds
+# underscores still resolves; iCloud's bare ` 2` is only trusted after a
+# session UUID, where no real file name ends that way.
+_CONFLICT_NAME_RES = (
+    re.compile(r"^(?P<base>.+)_[^_]+_[A-Z][a-z]{2}-\d{2}-\d{6}-\d{4}_Conflict$"),
+    re.compile(r"^(?P<base>.+)\.sync-conflict-\d{8}-\d{6}(?:-[A-Z0-9]+)?$"),
+    re.compile(r"^(?P<base>.+?) \([^()]*conflicted copy[^()]*\)$", re.IGNORECASE),
+    re.compile(r"^(?P<base>" + _UUID_RE + r") \d+$"),
+)
+
+
+def conflict_original(path: Path) -> Path | None:
+    """The file a sync conflict copy was split from, or None when `path` is
+    not named like one. The original may or may not still exist."""
+    for rx in _CONFLICT_NAME_RES:
+        m = rx.match(path.stem)
+        if m:
+            return path.with_name(m.group("base") + path.suffix)
+    return None
 
 
 def _claude_resume_argv(bin_: str, session_id: str, skip_perm: bool) -> list[str]:
@@ -1129,6 +1159,62 @@ def _open_in_cmux(cmux_mode, cwd, safe_cwd, core_cmd, session_id,
         return False, "cmux command timed out"
 
 
+def _build_raise_spawned_script(pid: int) -> str:
+    """AppleScript: raise the first window of process `pid` and make it
+    frontmost. Prints FOCUSED on a hit, PENDING while it has no window yet.
+
+    The `whose` filter is repeated on purpose: a process stored in a variable
+    resolves to `process "wezterm-gui"` by NAME, which with several instances
+    is the first one, not this pid."""
+    target = f"(first process whose unix id is {pid})"
+    return (
+        'tell application "System Events"\n'
+        f'  if (count of (every process whose unix id is {pid})) is 0 then '
+        'return "PENDING"\n'
+        f'  if (count of windows of {target}) is 0 then return "PENDING"\n'
+        f'  perform action "AXRaise" of window 1 of {target}\n'
+        f'  set frontmost of {target} to true\n'
+        'end tell\n'
+        'return "FOCUSED"'
+    )
+
+
+def _raise_spawned_window(proc, timeout: float = 4.0) -> bool:
+    """Wait for the window of a terminal we just spawned, then bring it to the
+    macOS foreground. True when it was raised.
+
+    `wezterm start` runs as a separate wezterm-gui process, so a `tell
+    application "WezTerm"` activate leaves the new window behind the current
+    one; only the spawned pid identifies it. Measured with `lsappinfo front`:
+    System Events `frontmost` brings that process forward, NSRunningApplication
+    activate does not. (Reading the front process back through System Events is
+    unreliable with several instances.)
+
+    False sends the caller to its app-level activate: the process exited without
+    a window (the CLI handed off to a running GUI), the script failed (no
+    Accessibility permission), or the deadline passed."""
+    import subprocess
+    import time
+    script = _build_raise_spawned_script(proc.pid)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if r.returncode != 0:
+            return False
+        if "FOCUSED" in r.stdout:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def _open_macos(term_program, shell_cmd, cwd):
     """macOS branch of open_in_new_terminal: AppleScript / per-terminal CLI."""
     import shutil
@@ -1155,14 +1241,14 @@ def _open_macos(term_program, shell_cmd, cwd):
     def _run_cli(argv: list[str], label: str,
                  activate_name: str | None = None) -> tuple[bool, str]:
         try:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True,
                 close_fds=True,
             )
-            if activate_name:
+            if activate_name and not _raise_spawned_window(proc):
                 _activate_macos_app(activate_name)
             return True, f"opened in {label}"
         except OSError as e:
@@ -2088,15 +2174,91 @@ def get_live_session_info(session_id: str) -> dict | None:
 
 # ---------- done-state overlay ----------
 
+# A home kept in a sync folder (Synology Drive, Syncthing, Dropbox) is shared
+# by several machines, and flock serializes writers on ONE machine only. When
+# two machines save state.json close together the sync client keeps one and
+# sets the other aside as a conflict copy — Synology
+# `state_<host>_<date>_Conflict.json`, Syncthing `state.sync-conflict-….json`,
+# Dropbox `state (… conflicted copy …).json`. ast never read those, so a done
+# flag set on the losing machine silently vanished. load_state() now folds
+# every such copy's done/undone entries back in and save_state() deletes the
+# copies it folded, so a lost race costs nothing.
+_STATE_CONFLICT_RE = re.compile(r"^state(?!\.json$).*conflict.*\.json$",
+                                re.IGNORECASE)
+# Transient load_state() key: conflict copies folded into this dict, which the
+# save that persists the merge may delete. Never written to disk.
+_ABSORBED_KEY = "__absorbed__"
+
+
+def _done_stamp(val) -> str:
+    """Timestamp of a done/undone entry. ast writes an ISO string; tolerate
+    the `{"at": iso}` shape older data and tests carry."""
+    if isinstance(val, dict):
+        val = val.get("at")
+    return val if isinstance(val, str) else ""
+
+
+def _merge_done(dst: dict, src: dict) -> None:
+    """Fold src's done/undone into dst, last writer wins per session.
+
+    `undone` is the tombstone of an unmark: without it a copy that still held
+    the old done flag would resurrect a session the user deliberately
+    reopened. A copy written before tombstones existed has none, so its done
+    entries win unless dst carries a later undone for the same session."""
+    done = dst.setdefault("done", {})
+    undone = dst.setdefault("undone", {})
+    for bucket, is_done in (("done", True), ("undone", False)):
+        for sid, val in (src.get(bucket) or {}).items():
+            cur = max(_done_stamp(done.get(sid)), _done_stamp(undone.get(sid)))
+            if sid in done or sid in undone:
+                if _done_stamp(val) <= cur:
+                    continue
+            if is_done:
+                done[sid] = val
+                undone.pop(sid, None)
+            else:
+                undone[sid] = val
+                done.pop(sid, None)
+    if not undone:
+        dst.pop("undone")
+
+
+def _state_conflict_copies() -> list[Path]:
+    try:
+        return sorted(p for p in STATE_PATH.parent.iterdir()
+                      if _STATE_CONFLICT_RE.match(p.name) and p.is_file())
+    except OSError:
+        return []
+
+
 def load_state() -> dict:
     try:
         with STATE_PATH.open("r", encoding="utf-8") as f:
-            return json.load(f)
+            state = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return {}
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    absorbed = []
+    for path in _state_conflict_copies():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                other = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue                 # unreadable copy: leave it for the user
+        if isinstance(other, dict):
+            _merge_done(state, other)
+        absorbed.append(str(path))
+    if absorbed:
+        state[_ABSORBED_KEY] = absorbed
+    return state
 
 
 def save_state(state: dict) -> None:
+    absorbed = state.pop(_ABSORBED_KEY, None) or []
+    # The hook status overlay moved to a per-machine file (see _status_path);
+    # drop the bucket older builds left here so it stops churning the sync.
+    state.pop("status", None)
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = STATE_PATH.with_suffix(f".{os.getpid()}.tmp")
@@ -2104,20 +2266,24 @@ def save_state(state: dict) -> None:
             json.dump(state, f, ensure_ascii=False, indent=2)
         tmp.replace(STATE_PATH)
     except OSError:
-        pass
+        return
+    for p in absorbed:
+        try:
+            Path(p).unlink()
+        except OSError:
+            pass
 
 
 @contextmanager
-def _state_lock():
-    """Serialize the read-modify-write of state.json across concurrently
-    running hook processes (many sessions can fire status hooks at once).
-    Advisory and best-effort: if fcntl is unavailable or the lock can't be
-    acquired, proceed unlocked rather than block a status update."""
+def _file_lock(lock_path: Path):
+    """Advisory and best-effort exclusive flock on `lock_path`: if fcntl is
+    unavailable or the lock can't be acquired, proceed unlocked rather than
+    block a status update."""
     f = None
     if fcntl is not None:
         try:
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            f = open(STATE_PATH.with_suffix(".lock"), "w")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            f = open(lock_path, "w")
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         except OSError:
             if f is not None:
@@ -2133,33 +2299,51 @@ def _state_lock():
                 f.close()
 
 
+@contextmanager
+def _state_lock():
+    """Serialize the read-modify-write of state.json across concurrently
+    running ast processes on this machine (see _file_lock)."""
+    with _file_lock(STATE_PATH.with_suffix(".lock")):
+        yield
+
+
 def done_ids() -> set[str]:
     state = load_state()
     return set((state.get("done") or {}).keys())
+
+
+def _apply_done(state: dict, session_id: str, value: bool) -> None:
+    """Set or clear one done flag, stamping an `undone` tombstone on clear so
+    a sync conflict copy still holding the flag can't bring it back."""
+    now = datetime.now(timezone.utc).isoformat()
+    done = state.setdefault("done", {})
+    undone = state.get("undone") or {}
+    if value:
+        done[session_id] = now
+        undone.pop(session_id, None)
+    else:
+        done.pop(session_id, None)
+        undone[session_id] = now
+    if undone:
+        state["undone"] = undone
+    else:
+        state.pop("undone", None)
 
 
 def mark_done(session_id: str) -> bool:
     """Toggle done state; return True if now marked done, False if unmarked."""
     with _state_lock():
         state = load_state()
-        done = state.setdefault("done", {})
-        if session_id in done:
-            del done[session_id]
-            save_state(state)
-            return False
-        done[session_id] = datetime.now(timezone.utc).isoformat()
+        now_done = session_id not in (state.get("done") or {})
+        _apply_done(state, session_id, now_done)
         save_state(state)
-        return True
+        return now_done
 
 
 def set_done(session_id: str, value: bool) -> None:
     with _state_lock():
         state = load_state()
-        done = state.setdefault("done", {})
-        if value:
-            done[session_id] = datetime.now(timezone.utc).isoformat()
-        else:
-            done.pop(session_id, None)
+        _apply_done(state, session_id, value)
         save_state(state)
 
 
@@ -2196,29 +2380,231 @@ def rm_guard_blocks(status: str, force: bool = False) -> bool:
     return (not force) and status in (STATUS_WORKING, STATUS_WAITING)
 
 
-def status_overlay() -> dict:
-    """state.json hook-driven status overlay: sid -> {state,event,ts}."""
-    val = load_state().get("status")
+def _status_path() -> Path:
+    """Per-machine file for the hook status overlay, beside state.json.
+
+    Status hooks fire on every turn of every session, so keeping the overlay
+    in the shared state.json rewrote that file constantly and was what made
+    the machines of a synced home collide (see _STATE_CONFLICT_RE). The
+    overlay only matters for sessions alive on this machine — classify_status
+    ignores it otherwise — so each machine keeps its own file, which a sync
+    client can copy around but never has two writers for."""
+    return STATE_PATH.with_name(f"status.{_host_id()}.json")
+
+
+def _host_id() -> str:
+    """This machine's name as it appears in per-machine file names:
+    the first label of the node name, filename-safe, `local` if empty."""
+    host = re.sub(r"[^A-Za-z0-9_-]", "_", os.uname().nodename.split(".")[0])
+    return host or "local"
+
+
+def _load_status() -> dict:
+    try:
+        with _status_path().open("r", encoding="utf-8") as f:
+            val = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
     return val if isinstance(val, dict) else {}
+
+
+def status_overlay() -> dict:
+    """Hook-driven status overlay: sid -> {state,event,ts}."""
+    return _load_status()
 
 
 def set_status(session_id: str, state: str | None, event: str) -> None:
     """Record (or clear, when state is None) a session's hook status."""
-    with _state_lock():
-        st = load_state()
-        bucket = st.get("status")
-        if not isinstance(bucket, dict):
-            bucket = {}
-            st["status"] = bucket
+    path = _status_path()
+    with _file_lock(path.with_suffix(".lock")):
+        bucket = _load_status()
         if state is None:
-            bucket.pop(session_id, None)
+            if bucket.pop(session_id, None) is None:
+                return
         else:
             bucket[session_id] = {
                 "state": state,
                 "event": event,
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
-        save_state(st)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(bucket, f, ensure_ascii=False, indent=2)
+            tmp.replace(path)
+        except OSError:
+            pass
+
+
+# ── Device record ────────────────────────────────────────────────────────────
+# Transcripts carry no host, and the synced projects dir mixes every Mac's
+# sessions. Each machine's local history.jsonl does know which sessions were
+# typed into on it, so every ast exports that set into the synced home as
+# devices.<host>.json — one writer per file, like status.<host>.json — and
+# load_device_map() merges them. Nothing of this goes into the index cache.
+
+_DEVICES_FILE_RE = re.compile(r"^devices\.([A-Za-z0-9_-]+)\.json$")
+_DEVICE_RECORD_VERSION = 1
+
+
+def _devices_path(host: str | None = None) -> Path:
+    return STATE_PATH.with_name(f"devices.{host or _host_id()}.json")
+
+
+def _read_json_dict(path: Path) -> dict:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            val = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return val if isinstance(val, dict) else {}
+
+
+def _device_sync_stubbed() -> bool:
+    """True when tests have moved ast's home but left the real history in
+    place: exporting it would read the user's 8MB file into a fixture."""
+    if CLAUDE_HISTORY_PATH != _DEFAULT_CLAUDE_HISTORY_PATH:
+        return False
+    home = _ast_home()
+    if CACHE_DIR != home or STATE_PATH != home / "state.json":
+        return True
+    # Tests that set AST_HOME to a temp dir before importing leave the module
+    # paths consistent with it; a real home never lives under the temp dir.
+    import tempfile
+    try:
+        tmp = Path(tempfile.gettempdir()).resolve()
+        here = STATE_PATH.parent.resolve()
+    except OSError:
+        return False
+    return here == tmp or tmp in here.parents
+
+
+def sync_device_record() -> bool:
+    """Fold new lines of the local history into this machine's device record.
+
+    Reads from the recorded offset when the file only grew, from the start
+    when it is new, replaced or shrank. A last line still missing its newline
+    is left for the next call. Returns True when the record was rewritten;
+    every failure reads as False so the TUI never prints over curses."""
+    if _device_sync_stubbed():
+        return False
+    src = CLAUDE_HISTORY_PATH
+    try:
+        st = src.stat()
+    except OSError:
+        return False
+    path = _devices_path()
+    # The TUI rescans every few seconds and history rarely moved since: answer
+    # from a lock-free read when the recorded source still matches.
+    source = _read_json_dict(path).get("source")
+    if (isinstance(source, dict) and source.get("path") == str(src)
+            and source.get("size") == st.st_size and source.get("mtime") == st.st_mtime):
+        return False
+    try:
+        with _file_lock(path.with_suffix(".lock")):
+            rec = _read_json_dict(path)
+            source = rec.get("source") if isinstance(rec.get("source"), dict) else {}
+            sessions = rec.get("sessions") if isinstance(rec.get("sessions"), dict) else {}
+            same_src = source.get("path") == str(src)
+            if (same_src and source.get("size") == st.st_size
+                    and source.get("mtime") == st.st_mtime):
+                return False
+            offset = source.get("offset") if same_src else None
+            if (not isinstance(offset, int) or offset < 0 or offset > st.st_size
+                    or st.st_size < (source.get("size") or 0)
+                    or source.get("ino", st.st_ino) != st.st_ino):
+                # Trimmed or replaced: read it all again, but keep what the
+                # record already knows — those prompts were still typed here.
+                offset = 0
+            with src.open("rb") as f:
+                f.seek(offset)
+                chunk = f.read()
+            end = chunk.rfind(b"\n") + 1
+            if end == 0 and same_src and source.get("offset") == offset:
+                # Only a half-written prompt arrived; rewriting would just
+                # push an unchanged record through the sync client.
+                return False
+            for raw in chunk[:end].splitlines():
+                try:
+                    evt = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(evt, dict):
+                    continue
+                sid, ts = evt.get("sessionId"), evt.get("timestamp")
+                if not isinstance(sid, str) or not sid or not isinstance(ts, (int, float)):
+                    continue
+                if ts > sessions.get(sid, -1):
+                    sessions[sid] = int(ts)
+            out = {"version": _DEVICE_RECORD_VERSION, "host": _host_id(),
+                   "source": {"path": str(src), "size": st.st_size,
+                              "mtime": st.st_mtime, "ino": st.st_ino,
+                              "offset": offset + end},
+                   "sessions": sessions}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
+            tmp.replace(path)
+            return True
+    except OSError:
+        return False
+
+
+def load_device_primary() -> str | None:
+    val = load_state().get("device_primary")
+    return val if isinstance(val, str) and val else None
+
+
+def save_device_primary(host: str | None) -> None:
+    st = load_state()
+    if host:
+        st["device_primary"] = host
+    else:
+        st.pop("device_primary", None)
+    save_state(st)
+
+
+def load_device_map(sync: bool = True) -> dict:
+    """sid -> host over every machine's device record. A session continued
+    on another Mac sits in two records; the later prompt names its host.
+
+    Equal timestamps mean a copied line: a new Mac set up with a copy of an
+    old Mac's history.jsonl holds every old prompt verbatim, and the records
+    alone cannot tell the original apart. The tie goes to the primary host
+    (`ast devices --primary`), else to the lowest host name, so every Mac
+    resolves it the same way whatever order the directory lists files in."""
+    if sync:
+        sync_device_record()
+    primary = load_device_primary()
+    rank = lambda h: (h != primary, h)
+    best: dict = {}
+    try:
+        entries = list(STATE_PATH.parent.iterdir())
+    except OSError:
+        return {}
+    for p in entries:
+        m = _DEVICES_FILE_RE.match(p.name)
+        if not m:
+            continue
+        rec = _read_json_dict(p)
+        host = m.group(1)
+        # A Synology conflict copy (`devices.<host>_<peer>_…_Conflict.json`)
+        # still fits the name pattern but carries the original's host.
+        if rec.get("host") != host:
+            continue
+        sessions = rec.get("sessions")
+        if not isinstance(sessions, dict):
+            continue
+        for sid, ts in sessions.items():
+            if not isinstance(ts, (int, float)):
+                continue
+            cur = best.get(sid)
+            if (cur is None or ts > cur[0]
+                    or (ts == cur[0] and rank(host) < rank(cur[1]))):
+                best[sid] = (ts, host)
+    return {sid: host for sid, (_, host) in best.items()}
 
 
 def resolve_status(session_id: str, live: set[str], done: set[str],
@@ -2246,6 +2632,8 @@ class StatusContext:
     overlay: dict
     jobs: dict
     pins: set = field(default_factory=set)  # agent-view pinned daemonShorts
+    devices: dict = field(default_factory=dict)  # sid -> host (load_device_map)
+    aliases: dict = field(default_factory=dict)  # host -> label (device_alias pref)
 
     @classmethod
     def capture(cls) -> "StatusContext":
@@ -2267,7 +2655,9 @@ class StatusContext:
                                  "updatedAt": rec.get("updatedAt")}
         return cls(live=live, done=done_ids(),
                    registry=registry, overlay=status_overlay(),
-                   jobs=scan_jobs(), pins=read_pins())
+                   jobs=scan_jobs(), pins=read_pins(),
+                   devices=load_device_map(),
+                   aliases=load_device_aliases())
 
     def resolve(self, session_id: str) -> str:
         return resolve_status(session_id, self.live, self.done,
@@ -2298,7 +2688,7 @@ def classify_status(*, done: bool, alive: bool,
                        job: dict | None = None) -> str:
     """Pure status decision. See spec 'Resolution priority'.
 
-    overlay: state.json status entry for this session, e.g.
+    overlay: status.<host>.json entry for this session, e.g.
              {"state": "waiting", "event": "Notification", "ts": "<iso>"} or None
     reg:     registry record for this session, e.g.
              {"status": "idle", "updatedAt": <ms>} or None
@@ -2591,6 +2981,159 @@ def save_agent_view(view: str) -> None:
     save_state(st)
 
 
+# Device view: which Mac's sessions are shown. "all", "local" (this machine),
+# "?" (no device record) or a host id from load_device_map(). `m`/`M` cycle it
+# in the TUI and `--device` accepts a host or its alias. A host or "local"
+# view drops the "?" rows — every codex session is "?" and would otherwise sit
+# in every machine's view — and reports how many it dropped, so the filter
+# never shrinks a listing silently.
+
+DEVICE_WIDTH = 6
+DEVICE_UNKNOWN = "?"
+DEVICE_VIEW_ALL = "all"
+DEVICE_VIEW_LOCAL = "local"
+
+
+def device_of(session_id: str, ctx) -> str | None:
+    """Host the session was last worked on. A session alive on this machine
+    is this machine's: the pid registry and codex locks are local-only."""
+    if session_id in ctx.live:
+        return _host_id()
+    return ctx.devices.get(session_id)
+
+
+def load_device_aliases() -> dict:
+    val = load_state().get("device_alias")
+    if not isinstance(val, dict):
+        return {}
+    return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, str) and v}
+
+
+def save_device_alias(host: str, name: str | None) -> None:
+    st = load_state()
+    aliases = st.get("device_alias") if isinstance(st.get("device_alias"), dict) else {}
+    if name:
+        aliases[host] = name
+    else:
+        aliases.pop(host, None)
+    st["device_alias"] = aliases
+    save_state(st)
+
+
+def device_label(host: str | None, aliases: dict) -> str:
+    """Column text: the alias, else the host cut to DEVICE_WIDTH (a plain cut
+    — `MBP-M4`/`MM-M6-` stay distinguishable, an ellipsis would eat one more)."""
+    if not host:
+        return DEVICE_UNKNOWN
+    name = aliases.get(host) or host
+    out, used = "", 0
+    for ch in unicodedata.normalize("NFC", name):
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + cw > DEVICE_WIDTH:
+            break
+        out += ch
+        used += cw
+    return out
+
+
+def resolve_device_view(value: str, aliases: dict, known: set) -> str | None:
+    """`--device` value -> "all" / "local" / "?" / a host id; None if unknown."""
+    v = (value or "").strip().lower()
+    if v in (DEVICE_VIEW_ALL, DEVICE_VIEW_LOCAL, DEVICE_UNKNOWN):
+        return v
+    for host, alias in aliases.items():
+        if alias.lower() == v:
+            return host
+    for host in known:
+        if host.lower() == v:
+            return host
+    return None
+
+
+def filter_device(sessions, view: str, ctx) -> tuple:
+    """(kept rows, "?" rows dropped). "all" and unknown views keep everything."""
+    rows = list(sessions)
+    if view == DEVICE_UNKNOWN:
+        return [s for s in rows if device_of(s.session_id, ctx) is None], 0
+    if view == DEVICE_VIEW_LOCAL:
+        view = _host_id()
+    elif view == DEVICE_VIEW_ALL or not view:
+        return rows, 0
+    kept, hidden = [], 0
+    for s in rows:
+        host = device_of(s.session_id, ctx)
+        if host is None:
+            hidden += 1
+        elif host == view:
+            kept.append(s)
+    return kept, hidden
+
+
+def device_choices(ctx) -> tuple:
+    """The `m` cycle: all, local, then every other known host."""
+    others = sorted(set(ctx.devices.values()) - {_host_id()})
+    return (DEVICE_VIEW_ALL, DEVICE_VIEW_LOCAL, *others)
+
+
+def cycle_device(view: str, choices: tuple, step: int = 1) -> str:
+    try:
+        i = choices.index(view)
+    except ValueError:
+        i = 0
+    return choices[(i + step) % len(choices)]
+
+
+def _device_view_label(view: str, aliases: dict) -> str:
+    if view in (DEVICE_VIEW_LOCAL, DEVICE_UNKNOWN):
+        return view
+    return device_label(view, aliases)
+
+
+def device_note(view: str, aliases: dict, hidden: int) -> str:
+    """Trailing `  [device:mbp, ?:12 hidden]` tag for CLI summaries."""
+    if not view or view == DEVICE_VIEW_ALL:
+        return ""
+    extra = f", ?:{hidden} hidden" if hidden else ""
+    return f"  [device:{_device_view_label(view, aliases)}{extra}]"
+
+
+def load_device_view() -> str:
+    val = load_state().get("device")
+    return val if isinstance(val, str) and val else DEVICE_VIEW_ALL
+
+
+def save_device_view(view: str) -> None:
+    st = load_state()
+    st["device"] = view or DEVICE_VIEW_ALL
+    save_state(st)
+
+
+def device_view_for(arg: str | None, ctx) -> str | None:
+    """Effective device view: an explicit `--device` (one-off) resolved
+    against aliases and known hosts, else the saved TUI view. None means the
+    explicit value matched nothing; the caller reports it and exits 2."""
+    if not arg:
+        return load_device_view()
+    known = set(ctx.devices.values()) | {_host_id()}
+    view = resolve_device_view(arg, ctx.aliases, known)
+    if view is None:
+        print(f"unknown device {arg!r} (see `ast devices`)", file=sys.stderr)
+    return view
+
+
+def device_cell(session_id: str, ctx) -> str:
+    return pad_display(device_label(device_of(session_id, ctx), ctx.aliases), DEVICE_WIDTH)
+
+
+def device_resume_warning(session_id: str, ctx) -> str | None:
+    """One-line notice when a session was last worked on another Mac."""
+    host = device_of(session_id, ctx)
+    if host is None or host == _host_id():
+        return None
+    return (f"note: {session_id[:8]} was last worked on "
+            f"{device_label(host, ctx.aliases)}; resuming it on this Mac")
+
+
 def _detect_terminal_is_light(env: dict | None = None) -> bool | None:
     """Best-effort terminal-background detection via ``COLORFGBG``.
 
@@ -2656,6 +3199,9 @@ class SessionMeta:
     prs: list = field(default_factory=list)  # [{host,repo,number,url}] from transcript
     entrypoint: str = ""  # transcript `entrypoint`: cli | sdk-py | sdk-cli | sdk-ts
     agent: str = DEFAULT_AGENT  # AGENTS key of the CLI that wrote the transcript
+    # Sync conflict copies folded into this row by dedupe_sessions(); never
+    # cached — it describes sibling files, not this transcript.
+    conflicts: int = 0
 
 
 @dataclass
@@ -2699,6 +3245,8 @@ CONFIDENCE_MARGIN = 2
 # "real" user message.
 _SYSTEM_WRAPPER_PREFIXES = (
     "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
     "<command-name>",
     "<command-message>",
     "<command-args>",
@@ -3186,10 +3734,15 @@ def dedupe_sessions(metas: list[SessionMeta]) -> list[SessionMeta]:
     keep the first copy — callers feed the path-sorted `all_session_files()`,
     so the pick is deterministic."""
     best: dict[str, SessionMeta] = {}
+    copies: dict[str, int] = {}
     for m in metas:
+        if conflict_original(m.path) is not None:
+            copies[m.session_id] = copies.get(m.session_id, 0) + 1
         cur = best.get(m.session_id)
         if cur is None or _dup_rank(m) > _dup_rank(cur):
             best[m.session_id] = m
+    for sid, n in copies.items():
+        best[sid].conflicts = n
     return [m for m in metas if best[m.session_id] is m]
 
 
@@ -3367,6 +3920,8 @@ def session_to_dict(s: "SessionMeta", ctx: "StatusContext") -> dict:
         "entrypoint": s.entrypoint or "",
         "origin": session_origin(s),
         "agent": s.agent or DEFAULT_AGENT,
+        "device": device_of(s.session_id, ctx),
+        "device_label": device_label(device_of(s.session_id, ctx), ctx.aliases),
         "job": _job_json(job),
         "prs": list(s.prs or []),
         "pinned": bool(short and short in ctx.pins),
@@ -3401,6 +3956,10 @@ def cmd_list(args: argparse.Namespace) -> int:
     # the TUI `a` key last saved.
     agent_view = getattr(args, "agent", None) or load_agent_view()
     sessions = filter_agent(sessions, agent_view)
+    device_view = device_view_for(getattr(args, "device", None), ctx)
+    if device_view is None:
+        return 2
+    sessions, dev_hidden = filter_device(sessions, device_view, ctx)
     # Column sort: an explicit --sort is a one-off override (natural direction,
     # flipped by --reverse); no flag uses the saved TUI preference. Sort runs
     # BEFORE --limit so the slice keeps the top-N of the chosen order. getattr
@@ -3432,6 +3991,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         f"{'#':>{num_w}} "
         f"{pad_display('ST', STATUS_WIDTH)} "
         f"{'AGENT':<{AGENT_VIEW_WIDTH}}  "
+        f"{'DEVICE':<{DEVICE_WIDTH}}  "
         f"{'LAST ACTIVITY':<16}  "
         f"{'SESSION':<10} "
         f"{'MSGS':>4}  "
@@ -3448,12 +4008,13 @@ def cmd_list(args: argparse.Namespace) -> int:
         job = ctx.jobs.get(s.session_id)
         tags = " ".join(t for t in (
             pin_marker((job or {}).get("short"), ctx.pins),
-            job_badge(job), pr_badge(s.prs)) if t)
+            job_badge(job), pr_badge(s.prs), conflict_badge(s.conflicts)) if t)
         proj = shorten_path(s.cwd) + (f"  {tags}" if tags else "")
         print(
             f"{idx:>{num_w}} "
             f"{pad_display(st, STATUS_WIDTH)} "
             f"{s.agent:<{AGENT_VIEW_WIDTH}}  "
+            f"{device_cell(s.session_id, ctx)}  "
             f"{ts:<16}  "
             f"{sid:<10} "
             f"{s.msg_count:>4}  "
@@ -3464,7 +4025,8 @@ def cmd_list(args: argparse.Namespace) -> int:
     summary = "  ".join(f"{status_label(g)}:{counts[g]}"
                         for g in STATUS_ALL if counts[g])
     print(f"\n{len(sessions)} session(s)  [{summary}]"
-          f"{origin_note(origin)}{agent_note(agent_view)}")
+          f"{origin_note(origin)}{agent_note(agent_view)}"
+          f"{device_note(device_view, ctx.aliases, dev_hidden)}")
     return 0
 
 
@@ -3516,17 +4078,25 @@ def cmd_search(args: argparse.Namespace) -> int:
     agent_view = getattr(args, "agent", None) or load_agent_view()
     if agent_view in AGENTS:
         hits = [h for h in hits if h[0].agent == agent_view]
+    ctx = StatusContext.capture()
+    device_view = device_view_for(getattr(args, "device", None), ctx)
+    if device_view is None:
+        return 2
+    kept_meta, dev_hidden = filter_device([h[0] for h in hits], device_view, ctx)
+    kept_ids = {id(m) for m in kept_meta}
+    hits = [h for h in hits if id(h[0]) in kept_ids]
     hits.sort(key=lambda h: h[0].last_ts or _EPOCH, reverse=True)
     if args.limit:
         hits = hits[: args.limit]
-    notes = f"{origin_note(origin)}{agent_note(agent_view)}"
+    notes = (f"{origin_note(origin)}{agent_note(agent_view)}"
+             f"{device_note(device_view, ctx.aliases, dev_hidden)}")
     if not hits:
         print(f"(no matches for {args.query!r}{notes})")
         return 0
-    ctx = StatusContext.capture()
     for meta, matches in hits:
         st = ctx.resolve(meta.session_id)
         print(f"\n{status_label(st)}  {meta.agent:<{AGENT_VIEW_WIDTH}}  "
+              f"{device_cell(meta.session_id, ctx)}  "
               f"{meta.session_id[:8]}  {fmt_ts(meta.last_ts)}  "
               f"{shorten_path(meta.cwd)}  ({len(matches)} hit(s))")
         for ts, role, snippet in matches[:3]:
@@ -3770,6 +4340,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
     target = require_session(args.session_id)
     if target is None:
         return 1
+    note = device_resume_warning(target.session_id, StatusContext.capture())
+    if note:
+        # stderr, and never a prompt: GUI and scripted callers must not block.
+        print(note, file=sys.stderr)
     cwd = target.cwd or "."
     short = job_short_for(target.session_id)
     if getattr(args, "spawn", False):
@@ -4142,6 +4716,189 @@ def _rm_one(prefix: str, args: argparse.Namespace, ctx) -> int:
     return 0
 
 
+# ---------- merge sync conflict copies of transcripts ----------
+#
+# A synced ~/.claude/projects (or $CODEX_HOME/sessions) is written by several
+# machines, and when two of them touch one transcript the sync client keeps
+# the loser beside it (see _CONFLICT_NAME_RES). dedupe_sessions() shows only
+# the file still named `<sid>.jsonl`, so whatever exists solely in the copy —
+# often days of conversation — is invisible to the list and to `--resume`.
+# `ast merge-conflicts` folds each copy back into its original.
+
+def find_transcript_conflicts() -> dict[Path, list[Path]]:
+    """original path -> its conflict copies, across every agent's store.
+
+    Walks the stores directly rather than all_session_files(): codex never
+    lists a copy (its name breaks _CODEX_ROLLOUT_RE) and subagent transcripts
+    conflict just the same."""
+    groups: dict[Path, list[Path]] = {}
+    for root in (PROJECTS_DIR, CODEX_SESSIONS_DIR):
+        if not root.exists():
+            continue
+        for p in sorted(root.rglob("*.jsonl")):
+            orig = conflict_original(p)
+            if orig is not None:
+                groups.setdefault(orig, []).append(p)
+    return groups
+
+
+def _event_key_ts(line: str) -> tuple[tuple, str]:
+    """(dedupe key, timestamp) of one transcript line. Claude events carry a
+    unique `uuid`; anything without one (codex rollout lines, claude summary
+    and snapshot records) is identified by its exact text."""
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return ("raw", line), ""
+    if not isinstance(obj, dict):
+        return ("raw", line), ""
+    uid = obj.get("uuid")
+    ts = obj.get("timestamp")
+    key = ("uuid", uid) if isinstance(uid, str) and uid else ("raw", line)
+    return key, ts if isinstance(ts, str) else ""
+
+
+def merge_transcript_lines(sources: list[list[str]]) -> tuple[list[str], int]:
+    """Union of several versions of one transcript, in timestamp order.
+
+    The first source wins a duplicate, and each source's own line order is
+    never changed: a line without a timestamp inherits its predecessor's and
+    the sources are k-way merged (heapq.merge keeps every input's order and
+    breaks ties by input position). Claude links events by `parentUuid`, so a
+    union of two diverged versions is a valid tree holding both branches.
+    Returns (merged lines, how many came from sources after the first)."""
+    import heapq
+    seen: set[tuple] = set()
+    seqs: list[list[tuple[str, int, str]]] = []
+    added = 0
+    for idx, lines in enumerate(sources):
+        seq, prev = [], ""
+        for raw in lines:
+            line = raw.rstrip("\n")
+            if not line.strip():
+                continue
+            key, ts = _event_key_ts(line)
+            prev = ts or prev
+            if key in seen:
+                continue
+            seen.add(key)
+            seq.append((prev, idx, line))
+            if idx:
+                added += 1
+        seqs.append(seq)
+    merged = heapq.merge(*seqs, key=lambda t: (t[0], t[1]))
+    return [line for _, _, line in merged], added
+
+
+def _read_lines(path: Path) -> list[str]:
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        return f.readlines()
+
+
+def _conflict_backup_dir() -> Path:
+    return CACHE_DIR / "backups" / "conflicts" / datetime.now().strftime(
+        "%Y%m%d-%H%M%S")
+
+
+def merge_conflict_group(original: Path, copies: list[Path],
+                         backup_dir: Path) -> int:
+    """Fold `copies` into `original`; the pre-merge original is copied and the
+    copies are moved into `backup_dir`, so the merge can always be undone.
+
+    An original that no longer exists is replaced by the merge of its copies.
+    The merge is written to a temp file beside the original and swapped in, so
+    a crash leaves either version whole. Returns the lines added."""
+    sources = ([_read_lines(original)] if original.exists() else [])
+    sources += [_read_lines(c) for c in copies]
+    lines, added = merge_transcript_lines(sources)
+    if not original.exists():
+        added = len(lines)
+    base = PROJECTS_DIR if _path_under(original, PROJECTS_DIR) else CODEX_SESSIONS_DIR
+
+    def _backup_path(p: Path) -> Path:
+        try:
+            rel = p.relative_to(base)
+        except ValueError:
+            rel = Path(p.name)
+        dest = backup_dir / base.name / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        return dest
+
+    # The list's LAST ACTIVITY is the file mtime (fast indexing), so the merge
+    # keeps the newest mtime among its sources instead of jumping to "now".
+    mtime = max(p.stat().st_mtime for p in (original, *copies) if p.exists())
+    if original.exists():
+        shutil.copy2(str(original), str(_backup_path(original)))
+    tmp = original.with_name(f".{original.name}.{os.getpid()}.merge")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.writelines(line + "\n" for line in lines)
+    os.utime(tmp, (mtime, mtime))
+    tmp.replace(original)
+    for c in copies:
+        shutil.move(str(c), str(_backup_path(c)))
+    return added
+
+
+def cmd_merge_conflicts(args: argparse.Namespace) -> int:
+    """`ast merge-conflicts` — fold sync conflict copies back into their
+    transcripts. Live sessions are skipped unless --force (their process keeps
+    appending to the original and would race the swap)."""
+    groups = find_transcript_conflicts()
+    if not groups:
+        print("(no sync conflict copies)")
+        return 0
+    live = StatusContext.capture().live
+    force = getattr(args, "force", False)
+    todo, skipped = [], []
+    for orig, copies in sorted(groups.items()):
+        sid = agent_for_path(orig).session_id_of(orig)
+        (skipped if sid in live and not force else todo).append((orig, copies, sid))
+    for orig, copies, sid in todo:
+        state = "" if orig.exists() else "  (original missing — copy becomes it)"
+        print(f"  {sid[:8]}  {shorten_path(str(orig.parent))}  "
+              f"+{len(copies)} cop{'y' if len(copies) == 1 else 'ies'}{state}")
+    if skipped:
+        ids8 = ", ".join(sid[:8] for _, _, sid in skipped)
+        print(f"({len(skipped)} skipped — live: {ids8}; pass --force to include)",
+              file=sys.stderr)
+    if not todo:
+        return 1
+    if getattr(args, "dry_run", False):
+        print(f"(dry run — {len(todo)} session(s), nothing merged)")
+        return 0
+    if not getattr(args, "yes", False):
+        if not sys.stdin.isatty():
+            print("Refusing to merge without confirmation — pass -y/--yes "
+                  "(non-interactive).", file=sys.stderr)
+            return 1
+        try:
+            reply = input(f"Merge {len(todo)} session(s)? [y/N] ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+    backup_dir = _conflict_backup_dir()
+    touched, errors, total = [], 0, 0
+    for orig, copies, sid in todo:
+        try:
+            total += merge_conflict_group(orig, copies, backup_dir)
+            touched += [orig, *copies]
+        except OSError as exc:
+            errors += 1
+            print(f"✗ {sid[:8]}: {exc}", file=sys.stderr)
+    invalidate_cache_entries(touched)
+    done_n = len(todo) - errors
+    print(f"{'✗' if errors else '✓'} merged {done_n} session(s), "
+          f"+{total} line(s); copies moved to {shorten_path(str(backup_dir))}")
+    return 1 if errors else 0
+
+
+def conflict_badge(n: int) -> str:
+    """Row tag for a session with unmerged sync conflict copies."""
+    return f"[conflict{'' if n <= 1 else f':{n}'}]" if n > 0 else ""
+
+
 def cmd_rm(args: argparse.Namespace) -> int:
     """Remove (unlink) session transcripts and purge their cache/state/mark
     traces, reusing the same `_delete_sessions` path as the TUI `Del` key.
@@ -4398,7 +5155,7 @@ def cmd_prompt_hook(args: argparse.Namespace) -> int:
 #
 # `ast status-hook` is wired into ~/.claude/settings.json by `ast install-hook`
 # under several Claude Code lifecycle events. It reads the hook JSON on stdin,
-# maps hook_event_name -> a status, and records it into state.json["status"].
+# maps hook_event_name -> a status, and records it into status.<host>.json.
 # No stdout (non-blocking; 0 tokens). See the waiting-status design spec.
 
 _HOOK_STATE = {
@@ -4646,6 +5403,7 @@ HELP_LINES = [
     "",
     "Session actions (normal mode)",
     "  a / A                  cycle agent view (all→claude→codex; A backwards) — saved",
+    "  m / M                  cycle device view (all→local→other Macs; M backwards) — saved",
     "  i / I                  auto-rescan interval popup (Off/5/10/30/60/120s)",
     "  v / V                  preview the focused session (scroll/search modal)",
     "                         ↑↓ scroll · PgUp/PgDn page · g/G top/bottom · q/Esc/v close",
@@ -5910,6 +6668,48 @@ def _delete_sessions(targets: list[SessionMeta], sessions: list[SessionMeta],
     return deleted, errors
 
 
+def _device_hint(view: str, aliases: dict, hidden: int) -> str:
+    """Header hint for the device view: `  ⌂mbp`, `  ⌂mbp ?2` when "?" rows
+    were dropped; empty for "all". Kept as short as the agent hint beside it."""
+    if not view or view == DEVICE_VIEW_ALL:
+        return ""
+    extra = f" ?{hidden}" if hidden else ""
+    return f"  ⌂{_device_view_label(view, aliases)}{extra}"
+
+
+def _confirm_other_device_modal(stdscr, target: SessionMeta, label: str) -> bool:
+    """Ask before resuming a session last worked on another Mac. y → True."""
+    import curses
+    _, w2 = stdscr.getmaxyx()
+    box_w = min(72, max(48, w2 - 6))
+    box_h = 8
+    win = _centered_win(stdscr, box_h, box_w)
+    try:
+        win.box()
+        title = " other device "
+        win.addnstr(0, max(2, (box_w - len(title)) // 2), title,
+                    box_w - 4, curses.color_pair(5) | curses.A_BOLD)
+        info = truncate(f"{target.session_id[:8]}  {shorten_path(target.cwd)}", box_w - 6)
+        win.addnstr(2, 3, info, box_w - 6)
+        win.addnstr(3, 3, f"This session was last worked on {label}.", box_w - 6)
+        win.addnstr(5, 3, "Resume it on this Mac? (y/N)", box_w - 6, curses.A_BOLD)
+        win.refresh()
+    except curses.error:
+        pass
+    return _read_yes_no(stdscr)
+
+
+def _read_yes_no(stdscr) -> bool:
+    """y/Y → True; any other key → False. A terminal resize (or a timed-out
+    read) is not an answer, so it never cancels the question by itself."""
+    import curses
+    while True:
+        ch = stdscr.getch()
+        if ch in (curses.KEY_RESIZE, -1):
+            continue
+        return ch in (ord('y'), ord('Y'))
+
+
 def _confirm_skip_perm_modal(stdscr, target: SessionMeta) -> bool | None:
     """Ask whether to apply --dangerously-skip-permissions for this resume.
 
@@ -6010,11 +6810,12 @@ def _tui_footer_info(row) -> str:
 
 
 def _tui_columns(n_items, n_sessions, w):
-    """List-view column widths: (num, status, agent, ts, sid, msgs, msg, proj).
+    """List-view column widths: (num, status, agent, device, ts, sid, msgs, msg, proj).
 
     Pure layout math shared by the header row and `_tui_draw_rows`."""
     num_w = max(3, len(str(n_items or n_sessions)))
     agent_w = AGENT_VIEW_WIDTH
+    device_w = DEVICE_WIDTH
     ts_w = 16
     sid_w = 8
     msgs_w = 4
@@ -6022,13 +6823,14 @@ def _tui_columns(n_items, n_sessions, w):
     # Fixed width up through MSGS column. Tight 1-space separators around
     # ST (#→ST, ST→AGENT) and between SESSION→MSGS; the rest use 2-space
     # separators.
-    fixed = ((1 + num_w + 1) + (status_w + 1) + (agent_w + 2) + (ts_w + 2)
+    fixed = ((1 + num_w + 1) + (status_w + 1) + (agent_w + 2) + (device_w + 2)
+             + (ts_w + 2)
              + (sid_w + 1) + (msgs_w + 2) + 2)
     remaining = max(30, w - fixed - 1)
     # split remaining: ~50% message, ~50% project (project at least 20)
     proj_w = max(20, remaining // 2)
     msg_w = max(20, remaining - proj_w - 2)
-    return num_w, status_w, agent_w, ts_w, sid_w, msgs_w, msg_w, proj_w
+    return num_w, status_w, agent_w, device_w, ts_w, sid_w, msgs_w, msg_w, proj_w
 
 
 def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
@@ -6037,7 +6839,7 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
 
     Pure render — reads state, writes only to the screen (no state mutation)."""
     import curses
-    num_w, status_w, agent_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
+    num_w, status_w, agent_w, device_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
     for i in range(list_h):
         idx = top + i
         if idx >= len(items):
@@ -6059,14 +6861,17 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
             proj_full = f"{proj_full}  ⎇{s.git_branch}"
         _job = ctx.jobs.get(s.session_id)
         for _tag in (pin_marker((_job or {}).get("short"), ctx.pins),
-                     job_badge(_job), pr_badge(s.prs)):
+                     job_badge(_job), pr_badge(s.prs),
+                     conflict_badge(s.conflicts)):
             if _tag:
                 proj_full = f"{proj_full}  {_tag}"
         proj_cell = truncate_display_tail(proj_full, proj_w)
 
         line_before_status = f"{mark}{idx + 1:>{num_w}} "
+        dev_host = device_of(s.session_id, ctx)
+        dev_cell = pad_display(device_label(dev_host, ctx.aliases), device_w)
         line_after_status = (
-            f" {(s.agent or DEFAULT_AGENT):<{agent_w}}  "
+            f" {(s.agent or DEFAULT_AGENT):<{agent_w}}  {dev_cell}  "
             f"{ts:<{ts_w}}  {sid:<{sid_w}} "
             f"{s.msg_count:>{msgs_w}}  {msg_cell}  {proj_cell}"
         )
@@ -6090,6 +6895,12 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
                 col = pre_dw + status_w
                 stdscr.addnstr(list_top + i, col, line_after_status, max(0, w - col),
                                pre_attr)
+                if dev_host is not None and dev_host != _host_id():
+                    # Another Mac's session: the cell the user scans for.
+                    dx = col + 1 + agent_w + 2
+                    if dx < w:
+                        stdscr.addnstr(list_top + i, dx, dev_cell, max(0, w - dx),
+                                       curses.color_pair(5) | curses.A_BOLD)
             except curses.error:
                 pass
 
@@ -6097,7 +6908,8 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
 def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
              days: int | None, skip_perm_default: bool = False,
              hide_done_default: bool = False, theme: str = "dark",
-             agent_view_override: str | None = None):
+             agent_view_override: str | None = None,
+             device_view_override: str | None = None):
     import curses
     import time
     curses.curs_set(0)
@@ -6133,6 +6945,9 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
     origin: str = load_origin()  # f cycles all→user→agent, F walks backwards
     # a cycles all→claude→codex…, A backwards; `ast pick --agent` overrides
     # the saved view for this launch only.
+    # m cycles all→local→other hosts, M backwards; `ast pick --device` overrides
+    device_view: str = device_view_override or load_device_view()
+    dev_hidden = [0]   # "?" rows the device view dropped; the header reports it
     agent_view: str = (agent_view_override if agent_view_override in agent_choices()
                        else load_agent_view())
     hide_done: bool = hide_done_default  # H toggle: hide 작업종료 from the view
@@ -6153,6 +6968,7 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
             pool = filter_origin(pool, origin)
         if agent_view != AGENT_VIEW_ALL:
             pool = filter_agent(pool, agent_view)
+        pool, dev_hidden[0] = filter_device(pool, device_view, ctx)
         if cwd_only and launch_cwd:
             pool = [s for s in pool
                     if unicodedata.normalize("NFC", s.cwd or "").startswith(launch_cwd)]
@@ -6229,8 +7045,9 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
                 f"{STATUS_ENDED}{scounts[STATUS_ENDED]} "
                 f"{STATUS_DONE}{scounts[STATUS_DONE]}"
                 f"{auto_hint}{sort_hint}{origin_hint}{agent_hint}"
+                f"{_device_hint(device_view, ctx.aliases, dev_hidden[0])}"
                 f"{mark_hint}{search_hint}{hide_hint}{cwd_hint}"
-                "   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit "
+                "   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit "
             )
 
         header = _header_line(items)
@@ -6250,12 +7067,13 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
         # The mark column (1 char) lives in `line_before_status`, so header
         # starts with a leading space to match row alignment.
         cols = _tui_columns(len(items), len(sessions), w)
-        num_w, status_w, agent_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
+        num_w, status_w, agent_w, device_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
 
         col_header = (
             f" {'#':>{num_w}} "
             f"{pad_display('ST', status_w)} "
             f"{'AGENT':<{agent_w}}  "
+            f"{'DEVICE':<{device_w}}  "
             f"{'LAST ACTIVITY':<{ts_w}}  "
             f"{'SESSION':<{sid_w}} "
             f"{'MSGS':>{msgs_w}}  "
@@ -6272,7 +7090,7 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
             # pure ASCII, so character index == display column; the (x, width)
             # of each sortable column is derived from the same field widths the
             # f-string above used, so no width drift.
-            _ts_x = num_w + 2 + status_w + 1 + agent_w + 2
+            _ts_x = num_w + 2 + status_w + 1 + agent_w + 2 + device_w + 2
             _sort_x = {
                 "status":  (num_w + 2, status_w),
                 "time":    (_ts_x, ts_w),
@@ -6526,6 +7344,12 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
                     toast = (f"→ attach {sid8}  {info}" if ok
                              else f"Attach failed: {info}  ({sid8})")
                     continue
+                _dev = device_of(target.session_id, ctx)
+                if (_dev is not None and _dev != _host_id()
+                        and not _confirm_other_device_modal(
+                            stdscr, target, device_label(_dev, ctx.aliases))):
+                    toast = "Resume cancelled"
+                    continue
                 open_cwd = target.cwd
                 _spec = agent_of(target)
                 if (target.cwd and not os.path.isdir(target.cwd)
@@ -6703,6 +7527,14 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
             top = 0
             toast = ("Agent: all" if agent_view == AGENT_VIEW_ALL
                      else f"Agent: {agent_view} only")
+        elif ch in (ord('m'), ord('M')):  # cycle device view (M = backwards)
+            device_view = cycle_device(device_view, device_choices(ctx),
+                                       -1 if ch == ord('M') else 1)
+            save_device_view(device_view)
+            sel = 0
+            top = 0
+            toast = ("Device: all" if device_view == DEVICE_VIEW_ALL
+                     else f"Device: {_device_view_label(device_view, ctx.aliases)} only")
         elif ch in (ord('i'), ord('I')):  # auto-rescan interval popup
             _res = _auto_rescan_modal(stdscr, auto_enabled, auto_interval)
             if _res is not None:
@@ -6822,6 +7654,16 @@ def cmd_pick(args: argparse.Namespace) -> int:
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error:
         pass
+    device_view = None
+    if getattr(args, "device", None):
+        # Resolve before curses starts so a bad value is a plain error, not a
+        # TUI that silently falls back to the saved view.
+        dev_ctx = StatusContext(live=set(), done=set(), registry={}, overlay={},
+                                jobs={}, devices=load_device_map(),
+                                aliases=load_device_aliases())
+        device_view = device_view_for(args.device, dev_ctx)
+        if device_view is None:
+            return 2
     print("Loading sessions…", file=sys.stderr, end="", flush=True)
     sessions = load_all_sessions(
         cwd_filter=args.cwd,
@@ -6849,7 +7691,8 @@ def cmd_pick(args: argparse.Namespace) -> int:
               f"using xterm-256color)            ", file=sys.stderr)
     try:
         curses.wrapper(_pick_ui, sessions, args.cwd, args.days, skip_perm,
-                       hide_done, theme, getattr(args, "agent", None))
+                       hide_done, theme, getattr(args, "agent", None),
+                       device_view)
     except KeyboardInterrupt:
         pass
     # The TUI handles Enter by spawning a new terminal window, so we don't
@@ -8007,6 +8850,83 @@ def cmd_restore(args: argparse.Namespace) -> int:
         tar.close()
 
 
+def _device_record_hosts() -> set:
+    """Every host with a device record in the home, plus this machine."""
+    hosts = {_host_id()}
+    try:
+        entries = list(STATE_PATH.parent.iterdir())
+    except OSError:
+        return hosts
+    for p in entries:
+        m = _DEVICES_FILE_RE.match(p.name)
+        if m and _read_json_dict(p).get("host") == m.group(1):
+            hosts.add(m.group(1))
+    return hosts
+
+
+def _require_known_host(host: str, known: set) -> bool:
+    if host in known:
+        return True
+    print(f"unknown host {host!r}; known: {', '.join(sorted(known))}", file=sys.stderr)
+    return False
+
+
+def cmd_devices(args: argparse.Namespace) -> int:
+    """List the machines that have a device record, or set/clear an alias."""
+    if getattr(args, "alias", None):
+        host, sep, name = args.alias.partition("=")
+        host, name = host.strip(), name.strip()
+        if not sep or not host or not name:
+            print("--alias expects HOST=NAME", file=sys.stderr)
+            return 2
+        if not _require_known_host(host, _device_record_hosts()):
+            return 2
+        if name.lower() in (DEVICE_VIEW_ALL, DEVICE_VIEW_LOCAL, DEVICE_UNKNOWN):
+            print(f"alias {name!r} is reserved (all, local, ?)", file=sys.stderr)
+            return 2
+        if display_width(name) > DEVICE_WIDTH:
+            print(f"alias {name!r} is longer than the {DEVICE_WIDTH}-column DEVICE cell",
+                  file=sys.stderr)
+            return 2
+        taken = [h for h, a in load_device_aliases().items()
+                 if h != host and a.lower() == name.lower()]
+        if taken:
+            print(f"alias {name!r} already names {taken[0]}", file=sys.stderr)
+            return 2
+        save_device_alias(host, name)
+        print(f"alias {host.strip()} → {name.strip()}")
+        return 0
+    if getattr(args, "primary", None):
+        if not _require_known_host(args.primary.strip(), _device_record_hosts()):
+            return 2
+        save_device_primary(args.primary.strip())
+        print(f"primary device: {args.primary.strip()}")
+        return 0
+    if getattr(args, "no_primary", False):
+        save_device_primary(None)
+        print("primary device cleared")
+        return 0
+    if getattr(args, "unalias", None):
+        save_device_alias(args.unalias.strip(), None)
+        print(f"alias removed: {args.unalias.strip()}")
+        return 0
+    devices = load_device_map()
+    aliases = load_device_aliases()
+    primary = load_device_primary()
+    counts: dict = {}
+    for host in devices.values():
+        counts[host] = counts.get(host, 0) + 1
+    here = _host_id()
+    for host in _device_record_hosts():
+        counts.setdefault(host, 0)
+    print(f" {'HOST':<20} {'ALIAS':<8} {'SESSIONS':>8}")
+    for host in sorted(counts):
+        mark = "*" if host == here else " "
+        tag = "  primary" if host == primary else ""
+        print(f"{mark}{host:<20} {aliases.get(host, '-'):<8} {counts[host]:>8}{tag}")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     sessions = load_all_sessions()
     ctx = StatusContext.capture()
@@ -8130,6 +9050,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pick.add_argument("--theme", choices=THEME_CHOICES,
                         default=argparse.SUPPRESS,
                         help="TUI color theme (toggle in-TUI with t)")
+    p_pick.add_argument("--device", default=None, metavar="NAME",
+                        help="only sessions last worked on NAME: a host, its alias, local, ? or all")
     p_pick.add_argument("--agent", choices=agent_choices(), default=None,
                         help="start in one agent CLI's view (default: the "
                              "last view saved by the `a` key)")
@@ -8153,6 +9075,8 @@ def _build_parser() -> argparse.ArgumentParser:
                              "(agent = SDK-spawned; default: saved TUI preference)")
     p_list.add_argument("--json", action="store_true",
                         help="emit machine-readable JSON (for cst.app) instead of the table")
+    p_list.add_argument("--device", default=None, metavar="NAME",
+                        help="only sessions last worked on NAME: a host, its alias, local, ? or all")
     p_list.add_argument("--agent", choices=agent_choices(), default=None,
                         help="show one agent CLI's sessions (default: the "
                              "view saved by the TUI `a` key, else all)")
@@ -8166,6 +9090,8 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="who started the session: all|user|agent "
                                "(default: saved TUI preference)")
     p_search.add_argument("-i", "--ignore-case", action="store_true")
+    p_search.add_argument("--device", default=None, metavar="NAME",
+                        help="only sessions last worked on NAME: a host, its alias, local, ? or all")
     p_search.add_argument("--agent", choices=agent_choices(), default=None,
                           help="restrict to one agent CLI's sessions "
                                "(default: the saved TUI view, else all)")
@@ -8264,6 +9190,19 @@ def _build_parser() -> argparse.ArgumentParser:
                                 "restored threads to codex's state DB")
     p_restore.set_defaults(func=cmd_restore)
 
+    p_dev = sub.add_parser("devices", help="machines with a device record; set aliases")
+    g_dev = p_dev.add_mutually_exclusive_group()
+    g_dev.add_argument("--alias", metavar="HOST=NAME", default=None,
+                       help="show HOST as NAME in the DEVICE column")
+    g_dev.add_argument("--unalias", metavar="HOST", default=None,
+                       help="drop HOST's alias")
+    g_dev.add_argument("--primary", metavar="HOST", default=None,
+                       help="HOST wins sessions whose prompts appear with the same "
+                            "timestamp on several Macs (a copied history.jsonl)")
+    g_dev.add_argument("--no-primary", action="store_true",
+                       help="clear the primary device")
+    p_dev.set_defaults(func=cmd_devices)
+
     p_stats = sub.add_parser("stats", help="summary stats")
     p_stats.add_argument("--top", type=int, default=15)
     p_stats.set_defaults(func=cmd_stats)
@@ -8311,6 +9250,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_undone = sub.add_parser("undone", help="clear done flag")
     p_undone.add_argument("session_id")
     p_undone.set_defaults(func=cmd_undone)
+
+    p_mc = sub.add_parser("merge-conflicts",
+                          help="fold sync conflict copies of transcripts "
+                               "back into their originals")
+    p_mc.add_argument("--dry-run", dest="dry_run", action="store_true",
+                      help="list what would be merged without writing")
+    p_mc.add_argument("-y", "--yes", action="store_true",
+                      help="skip confirmation (required when non-interactive)")
+    p_mc.add_argument("--force", action="store_true",
+                      help="include live sessions (their process may still "
+                           "append to the original)")
+    p_mc.set_defaults(func=cmd_merge_conflicts)
 
     p_rm = sub.add_parser("rm",
                           help="remove (unlink) session transcript(s) "
@@ -8363,7 +9314,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_shook = sub.add_parser(
         "status-hook",
-        help="lifecycle hook: record working/waiting/idle into state.json")
+        help="lifecycle hook: record working/waiting/idle into status.<host>.json")
     p_shook.add_argument("event", nargs="?", default=None,
                          help="event name (fallback when stdin has no "
                               "hook_event_name)")

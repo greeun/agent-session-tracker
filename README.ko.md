@@ -35,7 +35,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. 확인
 ast --version
-# agent-session-tracker v1.4.1
+# agent-session-tracker v1.5.3
 
 # 4. (선택) 토큰 0짜리 done!/undone! 프롬프트 훅 + 상태 정밀 레이어 설치
 ast install-hook
@@ -192,17 +192,18 @@ chatgpt.com(웹·모바일)에만 있는 대화는 디스크에 rollout이 없�
 ast list [--limit 30] [--cwd PREFIX] [--days N]
          [--status working|waiting|idle|ended|done|active]
          [--sort time|status|msgs|message|project] [--reverse]
-         [--origin all|user|agent] [--agent all|claude|codex|chatgpt] [--json]
+         [--origin all|user|agent] [--agent all|claude|codex|chatgpt]
+         [--device NAME|local|?|all] [--json]
 ```
 
 ```
-agent-session-tracker v1.4.1
-  #  ST  AGENT    LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
-  1  ●   claude   2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
-  2  !   claude   2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
-  3  ◦   codex    2026-05-24 01:15  019cb053    12  실패건을 해결하라.        ~/project/url-shortener
-  4  ✓   chatgpt  2026-05-24 01:15  01a07c61     4  서비스기획의 역할은?      ~/Documents/Codex/2026-05-24/new-chat
-  5  ○   claude   2026-05-23 21:24  afbd9e28   241  pnpm 적용 되어 있는가?    ~/project/url-shortener
+agent-session-tracker v1.5.3
+  #  ST  AGENT    DEVICE  LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
+  1  ●   claude   work    2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
+  2  !   claude   mbp     2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
+  3  ◦   codex    ?       2026-05-24 01:15  019cb053    12  실패건을 해결하라.        ~/project/url-shortener
+  4  ✓   chatgpt  ?       2026-05-24 01:15  01a07c61     4  서비스기획의 역할은?      ~/Documents/Codex/2026-05-24/new-chat
+  5  ○   claude   mini    2026-05-23 21:24  afbd9e28   241  pnpm 적용 되어 있는가?    ~/project/url-shortener
 ```
 
 - 번호는 1부터, 1000개 이상 세션은 자동으로 컬럼 폭 확장
@@ -226,6 +227,27 @@ agent-session-tracker v1.4.1
   세션만 보여 준다(`chatgpt`는 ChatGPT 데스크톱 앱 대화이며, 위 설명 참고). 명시적 `--agent`는 일회성이고, 플래그가 없으면 TUI `a` 키가
   마지막으로 저장한 뷰를 사용하며, 요약 줄에 `[agent:codex]`로 표시된다.
   `ast search`와 `ast pick`도 같은 플래그를 지원.
+- **기기:** **DEVICE** 열은 세션을 마지막으로 진행한 맥을 보여 준다. 여러 맥이
+  `~/.claude/projects`를 동기화해 함께 쓸 때 어느 맥의 세션인지 구분하기 위한 것이다.
+  transcript에는 호스트 정보가 없으므로, 각 맥의 ast가 그 맥의 로컬
+  `~/.claude/history.jsonl`(입력한 프롬프트마다 한 줄)에 있는 세션을
+  `~/.ast/devices.<host>.json`으로 내보내고, 목록을 표시할 때 이 파일들을 합친다.
+  다른 맥에서 이어서 작업한 세션은 마지막 프롬프트를 입력한 맥으로 표시되고,
+  이 맥에서 실행 중인 세션은 이 맥으로 표시된다. 과거 세션을 채우려면 각 맥에서
+  새 ast를 한 번 실행한다. 기록이 없는 세션(codex/chatgpt, `claude -p`, bg 작업)은
+  `?`로 표시된다. `--device NAME`에는 호스트, 별칭, `local`, `?`, `all`을 지정할 수
+  있다. zsh에서는 `?`가 글롭으로 해석되므로 `--device '?'`처럼 따옴표로 감싼다.
+  호스트나 `local`로 거르면 `?` 행은 빠지고 그 수가 요약 줄에
+  `[device:mbp, ?:12 hidden]`처럼 표시된다. 플래그가 없으면 TUI `m` 키가 마지막으로
+  저장한 뷰를 사용한다. `ast search`와 `ast pick`도 같은 플래그를 지원한다.
+  `ast devices --alias MBP-M4P-24-H=mbp`로 별칭을 지정하며(`state.json`으로 공유),
+  `ast devices`는 알려진 호스트와 별칭, 세션 수를 보여 주고 이 맥에 `*`를 붙인다.
+  다른 맥의 `history.jsonl`을 복사해서 시작한 맥에는 복사된 프롬프트가 같은
+  타임스탬프로 들어 있다. 이런 동점은 `ast devices --primary HOST`로 지정한 기준
+  맥(복사 원본)으로 판정하고, 기준 맥이 없으면 호스트 이름이 앞서는 쪽으로 판정해
+  모든 맥에서 같은 결과가 나온다.
+  다른 맥에서 진행한 세션을 `ast resume`하면 안내 한 줄을 출력하고, TUI Enter는
+  이 맥에서 재개할지 먼저 묻는다.
 - **`--json`** — 테이블 대신 기계가 읽는 JSON으로 출력
   (cst.app macOS 컴패니언이 소비하는 계약). 각 세션에 `entrypoint`, `origin`,
   `agent` 필드가 포함된다.
@@ -398,6 +420,17 @@ JSONL의 모든 이벤트의 `cwd` 필드를 재작성하고 파일을 새 프�
 | `--dry-run` | 재작성 계획 표시 (변경 없음) |
 | `-y` / `--yes` | 확인 건너뛰기 |
 
+### `ast merge-conflicts` — 동기화 충돌 사본 병합
+
+`~/.claude/projects`(또는 `~/.codex/sessions`)를 동기화 폴더에 두고 두 기기가 같은 세션에 기록하면, 동기화 클라이언트는 진 쪽 버전을 옆에 따로 보관합니다(`<sid>_<host>_<date>_Conflict.jsonl`, `.sync-conflict-…`, `(… conflicted copy …)`). 목록은 `<sid>.jsonl`만 보여 주고 해당 행에 `[conflict]` 배지를 붙입니다. 그래서 사본에만 있는 대화는 병합하기 전까지 목록과 resume에서 보이지 않습니다.
+
+```bash
+ast merge-conflicts --dry-run   # 충돌 사본이 있는 세션 목록
+ast merge-conflicts -y          # 확인 없이 병합
+```
+
+이벤트는 합집합으로 병합합니다(Claude 이벤트는 `uuid`, 그 밖의 줄은 내용 기준). 두 파일 각각의 줄 순서를 유지하면서 시각 순서로 합치며, 병합 전 원본은 `~/.ast/backups/conflicts/<시각>/`에 복사하고, 병합한 사본은 같은 곳으로 옮깁니다. 실행 중인 세션은 `--force`를 지정하지 않으면 건너뜁니다.
+
 ### `ast rm <id> [<id> ...]` — 세션 트랜스크립트 삭제
 
 ```bash
@@ -519,6 +552,7 @@ fzf 스타일 필터, 상태 글리프, 모달, 액션 키를 갖춘 curses 선�
 | **`C`** / **`c`** | cwd-only 토글 — TUI 실행 cwd 아래의 세션만 표시 (NFC-정규화 prefix 매치) |
 | **`R`** / **`r`** / **`Ctrl-R`** | 세션 목록 + 라이브 프로세스 레지스트리 재스캔. 재스캔이 진행되는 동안 하단 줄에 진행률이 표시됩니다 — `Rescanning… 42% (994/2370)`. 자동 재스캔도 같은 진행률을 표시하지만, 약 0.35초를 넘겨 실행될 때에만 나타납니다 (캐시가 이미 채워진 재스캔은 그 전에 끝나므로 표시되지 않습니다). |
 | **`a`** / **`A`** | 에이전트 뷰 순환: `all → claude → codex → chatgpt` (`A`는 역방향). `all`이 아닐 때 헤더에 `⚙codex` 표시. 저장되며 `ast list --agent`와 공유. |
+| **`m`** / **`M`** | 기기 뷰 순환: `all → local → 다른 맥` (`M`은 역방향). `all`이 아닐 때 헤더에 `⌂mbp`(숨긴 `?` 행이 있으면 `?N` 추가) 표시. 저장되며 `ast list --device`와 공유. 다른 맥 세션의 DEVICE 칸은 강조 표시된다. |
 | **`i`** / **`I`** | 자동 재스캔 간격 팝업 (Off / 5 / 10 / 30 / 60 / 120초; 기본 ON 10초, `state.json`에 저장; 세션이 **새로** `!` 대기로 전이 시 `curses.beep()` + 고정 TUI 토스트 — macOS 데스크톱 알림 없음). 1.18 이전에는 `a` 키였음. |
 | **`s`** | 정렬 컬럼 순환 (화면 컬럼 순서대로): `status → time → msgs → message → project` (해당 컬럼의 자연 방향으로 리셋). 헤더에 `sort:<col>▼/▲` 표시 + 활성 컬럼 하이라이트. 저장됨. |
 | **`S`** | 현재 정렬 방향 반전. 저장됨. |
@@ -551,7 +585,7 @@ fzf 스타일 필터, 상태 글리프, 모달, 액션 키를 갖춘 curses 선�
 ### 헤더
 
 ```
- agent-session-tracker v1.4.1  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.5.3  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — 보이는 행 / 전체 세션 수
@@ -677,7 +711,8 @@ TUI에서 `Enter`를 누르면 **현재 쓰는 터미널 앱과 동일한 앱의
 | `$CODEX_HOME/sessions/**/rollout-*.jsonl` | Codex CLI 트랜스크립트와 ChatGPT 데스크톱 앱 대화 (기본 `~/.codex`; 읽기 전용) | 건드리지 말 것 |
 | `$CODEX_HOME/thread-writer-locks/<uuid>.lock` | codex의 스레드별 writer 잠금 — cst는 flock 탐지로 실행 여부만 확인 (읽기 전용) | 건드리지 말 것 |
 | `~/.ast/index.json` | mtime/size 무효화 세션 메타 캐시 (스키마 6, 항목마다 `agent` 보유) | 예 (다음 실행 시 재생성) |
-| `~/.ast/state.json` | done 플래그 + 훅 상태 오버레이 + 사용자 설정(자동 재스캔·테마·정렬·생성 주체·에이전트 뷰) | 예 (모든 `✓` 마크·오버레이·설정 초기화) |
+| `~/.ast/state.json` | done 플래그(+ `undone` 해제 기록) + 사용자 설정(자동 재스캔·테마·정렬·생성 주체·에이전트 뷰). 동기화 충돌본(`state_*_Conflict.json`, `state.sync-conflict-*.json` 등)은 자동으로 병합한 뒤 삭제 | 예 (모든 `✓` 마크·설정 초기화) |
+| `~/.ast/status.<host>.json` | 훅 상태 오버레이. 기기마다 파일을 따로 두어 동기화 홈에서도 쓰는 주체가 하나뿐 | 예 (다음 훅 전까지 프로세스 레지스트리로 상태 판정) |
 
 위 표의 `~/.claude/...` 경로는 모두 **`$CLAUDE_CONFIG_DIR`**를 따릅니다
 (Claude Code 자체와 같은 규약): 설정돼 있으면 `projects/`, `sessions/`,
