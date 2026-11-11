@@ -2495,8 +2495,11 @@ def sync_device_record() -> bool:
                 return False
             offset = source.get("offset") if same_src else None
             if (not isinstance(offset, int) or offset < 0 or offset > st.st_size
-                    or st.st_size < (source.get("size") or 0)):
-                offset, sessions = 0, {}
+                    or st.st_size < (source.get("size") or 0)
+                    or source.get("ino", st.st_ino) != st.st_ino):
+                # Trimmed or replaced: read it all again, but keep what the
+                # record already knows — those prompts were still typed here.
+                offset = 0
             with src.open("rb") as f:
                 f.seek(offset)
                 chunk = f.read()
@@ -2515,7 +2518,8 @@ def sync_device_record() -> bool:
                     sessions[sid] = int(ts)
             out = {"version": _DEVICE_RECORD_VERSION, "host": _host_id(),
                    "source": {"path": str(src), "size": st.st_size,
-                              "mtime": st.st_mtime, "offset": offset + end},
+                              "mtime": st.st_mtime, "ino": st.st_ino,
+                              "offset": offset + end},
                    "sessions": sessions}
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(f".{os.getpid()}.tmp")

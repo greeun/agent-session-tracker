@@ -81,12 +81,23 @@ class TestSync(_Base):
         self.assertTrue(tk.sync_device_record())
         self.assertEqual(self._record()["sessions"], {"s1": 100, "s2": 200, "s3": 300})
 
-    def test_shrunk_source_rereads(self):
+    def test_shrunk_source_rereads_and_keeps_known_sessions(self):
+        # A trimmed history still proves s1/s2 were typed on this Mac.
         self.hist.write_text(_line("s1", 100) + _line("s2", 200), "utf-8")
         tk.sync_device_record()
         self.hist.write_text(_line("s9", 900), "utf-8")
         tk.sync_device_record()
-        self.assertEqual(self._record()["sessions"], {"s9": 900})
+        self.assertEqual(self._record()["sessions"], {"s1": 100, "s2": 200, "s9": 900})
+        self.assertEqual(self._record()["source"]["offset"], self.hist.stat().st_size)
+
+    def test_replaced_by_bigger_file_rereads_from_start(self):
+        self.hist.write_text(_line("s1", 100), "utf-8")
+        tk.sync_device_record()
+        new = self.hist.with_name("history.new")
+        new.write_text(_line("s5", 500) + _line("s6", 600), "utf-8")
+        new.replace(self.hist)   # new inode, larger than the recorded offset
+        tk.sync_device_record()
+        self.assertEqual(self._record()["sessions"], {"s1": 100, "s5": 500, "s6": 600})
 
     def test_partial_last_line_deferred(self):
         full = _line("s1", 100)
