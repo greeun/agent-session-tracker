@@ -5352,6 +5352,7 @@ HELP_LINES = [
     "",
     "Session actions (normal mode)",
     "  a / A                  cycle agent view (all→claude→codex; A backwards) — saved",
+    "  m / M                  cycle device view (all→local→other Macs; M backwards) — saved",
     "  i / I                  auto-rescan interval popup (Off/5/10/30/60/120s)",
     "  v / V                  preview the focused session (scroll/search modal)",
     "                         ↑↓ scroll · PgUp/PgDn page · g/G top/bottom · q/Esc/v close",
@@ -6616,6 +6617,38 @@ def _delete_sessions(targets: list[SessionMeta], sessions: list[SessionMeta],
     return deleted, errors
 
 
+def _device_hint(view: str, aliases: dict, hidden: int) -> str:
+    """Header hint for the device view: `  ⌂mbp`, `  ⌂mbp ?2` when "?" rows
+    were dropped; empty for "all". Kept as short as the agent hint beside it."""
+    if not view or view == DEVICE_VIEW_ALL:
+        return ""
+    extra = f" ?{hidden}" if hidden else ""
+    return f"  ⌂{_device_view_label(view, aliases)}{extra}"
+
+
+def _confirm_other_device_modal(stdscr, target: SessionMeta, label: str) -> bool:
+    """Ask before resuming a session last worked on another Mac. y → True."""
+    import curses
+    _, w2 = stdscr.getmaxyx()
+    box_w = min(72, max(48, w2 - 6))
+    box_h = 8
+    win = _centered_win(stdscr, box_h, box_w)
+    try:
+        win.box()
+        title = " other device "
+        win.addnstr(0, max(2, (box_w - len(title)) // 2), title,
+                    box_w - 4, curses.color_pair(5) | curses.A_BOLD)
+        info = truncate(f"{target.session_id[:8]}  {shorten_path(target.cwd)}", box_w - 6)
+        win.addnstr(2, 3, info, box_w - 6)
+        win.addnstr(3, 3, f"This session was last worked on {label}.", box_w - 6)
+        win.addnstr(5, 3, "Resume it on this Mac? (y/N)", box_w - 6, curses.A_BOLD)
+        win.refresh()
+    except curses.error:
+        pass
+    ch = stdscr.getch()
+    return ch in (ord('y'), ord('Y'))
+
+
 def _confirm_skip_perm_modal(stdscr, target: SessionMeta) -> bool | None:
     """Ask whether to apply --dangerously-skip-permissions for this resume.
 
@@ -6716,11 +6749,12 @@ def _tui_footer_info(row) -> str:
 
 
 def _tui_columns(n_items, n_sessions, w):
-    """List-view column widths: (num, status, agent, ts, sid, msgs, msg, proj).
+    """List-view column widths: (num, status, agent, device, ts, sid, msgs, msg, proj).
 
     Pure layout math shared by the header row and `_tui_draw_rows`."""
     num_w = max(3, len(str(n_items or n_sessions)))
     agent_w = AGENT_VIEW_WIDTH
+    device_w = DEVICE_WIDTH
     ts_w = 16
     sid_w = 8
     msgs_w = 4
@@ -6728,13 +6762,14 @@ def _tui_columns(n_items, n_sessions, w):
     # Fixed width up through MSGS column. Tight 1-space separators around
     # ST (#→ST, ST→AGENT) and between SESSION→MSGS; the rest use 2-space
     # separators.
-    fixed = ((1 + num_w + 1) + (status_w + 1) + (agent_w + 2) + (ts_w + 2)
+    fixed = ((1 + num_w + 1) + (status_w + 1) + (agent_w + 2) + (device_w + 2)
+             + (ts_w + 2)
              + (sid_w + 1) + (msgs_w + 2) + 2)
     remaining = max(30, w - fixed - 1)
     # split remaining: ~50% message, ~50% project (project at least 20)
     proj_w = max(20, remaining // 2)
     msg_w = max(20, remaining - proj_w - 2)
-    return num_w, status_w, agent_w, ts_w, sid_w, msgs_w, msg_w, proj_w
+    return num_w, status_w, agent_w, device_w, ts_w, sid_w, msgs_w, msg_w, proj_w
 
 
 def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
@@ -6743,7 +6778,7 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
 
     Pure render — reads state, writes only to the screen (no state mutation)."""
     import curses
-    num_w, status_w, agent_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
+    num_w, status_w, agent_w, device_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
     for i in range(list_h):
         idx = top + i
         if idx >= len(items):
@@ -6772,8 +6807,10 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
         proj_cell = truncate_display_tail(proj_full, proj_w)
 
         line_before_status = f"{mark}{idx + 1:>{num_w}} "
+        dev_host = device_of(s.session_id, ctx)
+        dev_cell = pad_display(device_label(dev_host, ctx.aliases), device_w)
         line_after_status = (
-            f" {(s.agent or DEFAULT_AGENT):<{agent_w}}  "
+            f" {(s.agent or DEFAULT_AGENT):<{agent_w}}  {dev_cell}  "
             f"{ts:<{ts_w}}  {sid:<{sid_w}} "
             f"{s.msg_count:>{msgs_w}}  {msg_cell}  {proj_cell}"
         )
@@ -6797,6 +6834,12 @@ def _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
                 col = pre_dw + status_w
                 stdscr.addnstr(list_top + i, col, line_after_status, max(0, w - col),
                                pre_attr)
+                if dev_host is not None and dev_host != _host_id():
+                    # Another Mac's session: the cell the user scans for.
+                    dx = col + 1 + agent_w + 2
+                    if dx < w:
+                        stdscr.addnstr(list_top + i, dx, dev_cell, max(0, w - dx),
+                                       curses.color_pair(5) | curses.A_BOLD)
             except curses.error:
                 pass
 
@@ -6841,6 +6884,9 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
     origin: str = load_origin()  # f cycles all→user→agent, F walks backwards
     # a cycles all→claude→codex…, A backwards; `ast pick --agent` overrides
     # the saved view for this launch only.
+    # m cycles all→local→other hosts, M backwards; `ast pick --device` overrides
+    device_view: str = device_view_override or load_device_view()
+    dev_hidden = [0]   # "?" rows the device view dropped; the header reports it
     agent_view: str = (agent_view_override if agent_view_override in agent_choices()
                        else load_agent_view())
     hide_done: bool = hide_done_default  # H toggle: hide 작업종료 from the view
@@ -6861,6 +6907,7 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
             pool = filter_origin(pool, origin)
         if agent_view != AGENT_VIEW_ALL:
             pool = filter_agent(pool, agent_view)
+        pool, dev_hidden[0] = filter_device(pool, device_view, ctx)
         if cwd_only and launch_cwd:
             pool = [s for s in pool
                     if unicodedata.normalize("NFC", s.cwd or "").startswith(launch_cwd)]
@@ -6937,8 +6984,9 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
                 f"{STATUS_ENDED}{scounts[STATUS_ENDED]} "
                 f"{STATUS_DONE}{scounts[STATUS_DONE]}"
                 f"{auto_hint}{sort_hint}{origin_hint}{agent_hint}"
+                f"{_device_hint(device_view, ctx.aliases, dev_hidden[0])}"
                 f"{mark_hint}{search_hint}{hide_hint}{cwd_hint}"
-                "   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit "
+                "   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit "
             )
 
         header = _header_line(items)
@@ -6958,12 +7006,13 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
         # The mark column (1 char) lives in `line_before_status`, so header
         # starts with a leading space to match row alignment.
         cols = _tui_columns(len(items), len(sessions), w)
-        num_w, status_w, agent_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
+        num_w, status_w, agent_w, device_w, ts_w, sid_w, msgs_w, msg_w, proj_w = cols
 
         col_header = (
             f" {'#':>{num_w}} "
             f"{pad_display('ST', status_w)} "
             f"{'AGENT':<{agent_w}}  "
+            f"{'DEVICE':<{device_w}}  "
             f"{'LAST ACTIVITY':<{ts_w}}  "
             f"{'SESSION':<{sid_w}} "
             f"{'MSGS':>{msgs_w}}  "
@@ -6980,7 +7029,7 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
             # pure ASCII, so character index == display column; the (x, width)
             # of each sortable column is derived from the same field widths the
             # f-string above used, so no width drift.
-            _ts_x = num_w + 2 + status_w + 1 + agent_w + 2
+            _ts_x = num_w + 2 + status_w + 1 + agent_w + 2 + device_w + 2
             _sort_x = {
                 "status":  (num_w + 2, status_w),
                 "time":    (_ts_x, ts_w),
@@ -7234,6 +7283,12 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
                     toast = (f"→ attach {sid8}  {info}" if ok
                              else f"Attach failed: {info}  ({sid8})")
                     continue
+                _dev = device_of(target.session_id, ctx)
+                if (_dev is not None and _dev != _host_id()
+                        and not _confirm_other_device_modal(
+                            stdscr, target, device_label(_dev, ctx.aliases))):
+                    toast = "Resume cancelled"
+                    continue
                 open_cwd = target.cwd
                 _spec = agent_of(target)
                 if (target.cwd and not os.path.isdir(target.cwd)
@@ -7411,6 +7466,14 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
             top = 0
             toast = ("Agent: all" if agent_view == AGENT_VIEW_ALL
                      else f"Agent: {agent_view} only")
+        elif ch in (ord('m'), ord('M')):  # cycle device view (M = backwards)
+            device_view = cycle_device(device_view, device_choices(ctx),
+                                       -1 if ch == ord('M') else 1)
+            save_device_view(device_view)
+            sel = 0
+            top = 0
+            toast = ("Device: all" if device_view == DEVICE_VIEW_ALL
+                     else f"Device: {_device_view_label(device_view, ctx.aliases)} only")
         elif ch in (ord('i'), ord('I')):  # auto-rescan interval popup
             _res = _auto_rescan_modal(stdscr, auto_enabled, auto_interval)
             if _res is not None:
