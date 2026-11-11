@@ -48,6 +48,12 @@ def _claude_config_dir() -> Path:
 CONFIG_DIR = _claude_config_dir()
 PROJECTS_DIR = CONFIG_DIR / "projects"
 SESSIONS_REGISTRY_DIR = CONFIG_DIR / "sessions"
+# Claude Code's prompt history. It lives beside the synced projects dir but is
+# a plain local file, one per machine, and every line since 2025 carries the
+# sessionId the prompt was typed into, which is what tells ast on which Mac a
+# session was worked (see sync_device_record). Tests re-point it.
+CLAUDE_HISTORY_PATH = CONFIG_DIR / "history.jsonl"
+_DEFAULT_CLAUDE_HISTORY_PATH = CLAUDE_HISTORY_PATH
 # Agent-view background sessions: <config-dir>/jobs/<short>/state.json.
 # Hosted by the supervisor, not the pid registry above, so once an idle bg
 # process is stopped they leave no registry entry — the jobs scanner reads
@@ -2383,8 +2389,14 @@ def _status_path() -> Path:
     overlay only matters for sessions alive on this machine — classify_status
     ignores it otherwise — so each machine keeps its own file, which a sync
     client can copy around but never has two writers for."""
+    return STATE_PATH.with_name(f"status.{_host_id()}.json")
+
+
+def _host_id() -> str:
+    """This machine's name as it appears in per-machine file names:
+    the first label of the node name, filename-safe, `local` if empty."""
     host = re.sub(r"[^A-Za-z0-9_-]", "_", os.uname().nodename.split(".")[0])
-    return STATE_PATH.with_name(f"status.{host or 'local'}.json")
+    return host or "local"
 
 
 def _load_status() -> dict:
@@ -2425,6 +2437,127 @@ def set_status(session_id: str, state: str | None, event: str) -> None:
             pass
 
 
+# ── Device record ────────────────────────────────────────────────────────────
+# Transcripts carry no host, and the synced projects dir mixes every Mac's
+# sessions. Each machine's local history.jsonl does know which sessions were
+# typed into on it, so every ast exports that set into the synced home as
+# devices.<host>.json — one writer per file, like status.<host>.json — and
+# load_device_map() merges them. Nothing of this goes into the index cache.
+
+_DEVICES_FILE_RE = re.compile(r"^devices\.([A-Za-z0-9_-]+)\.json$")
+_DEVICE_RECORD_VERSION = 1
+
+
+def _devices_path(host: str | None = None) -> Path:
+    return STATE_PATH.with_name(f"devices.{host or _host_id()}.json")
+
+
+def _read_json_dict(path: Path) -> dict:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            val = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return val if isinstance(val, dict) else {}
+
+
+def _device_sync_stubbed() -> bool:
+    """True when tests have moved ast's home but left the real history in
+    place: exporting it would read the user's 8MB file into a fixture."""
+    home = _ast_home()
+    stubbed = CACHE_DIR != home or STATE_PATH != home / "state.json"
+    return stubbed and CLAUDE_HISTORY_PATH == _DEFAULT_CLAUDE_HISTORY_PATH
+
+
+def sync_device_record() -> bool:
+    """Fold new lines of the local history into this machine's device record.
+
+    Reads from the recorded offset when the file only grew, from the start
+    when it is new, replaced or shrank. A last line still missing its newline
+    is left for the next call. Returns True when the record was rewritten;
+    every failure reads as False so the TUI never prints over curses."""
+    if _device_sync_stubbed():
+        return False
+    src = CLAUDE_HISTORY_PATH
+    try:
+        st = src.stat()
+    except OSError:
+        return False
+    path = _devices_path()
+    try:
+        with _file_lock(path.with_suffix(".lock")):
+            rec = _read_json_dict(path)
+            source = rec.get("source") if isinstance(rec.get("source"), dict) else {}
+            sessions = rec.get("sessions") if isinstance(rec.get("sessions"), dict) else {}
+            same_src = source.get("path") == str(src)
+            if (same_src and source.get("size") == st.st_size
+                    and source.get("mtime") == st.st_mtime):
+                return False
+            offset = source.get("offset") if same_src else None
+            if (not isinstance(offset, int) or offset < 0 or offset > st.st_size
+                    or st.st_size < (source.get("size") or 0)):
+                offset, sessions = 0, {}
+            with src.open("rb") as f:
+                f.seek(offset)
+                chunk = f.read()
+            end = chunk.rfind(b"\n") + 1
+            for raw in chunk[:end].splitlines():
+                try:
+                    evt = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(evt, dict):
+                    continue
+                sid, ts = evt.get("sessionId"), evt.get("timestamp")
+                if not isinstance(sid, str) or not sid or not isinstance(ts, (int, float)):
+                    continue
+                if ts > sessions.get(sid, -1):
+                    sessions[sid] = int(ts)
+            out = {"version": _DEVICE_RECORD_VERSION, "host": _host_id(),
+                   "source": {"path": str(src), "size": st.st_size,
+                              "mtime": st.st_mtime, "offset": offset + end},
+                   "sessions": sessions}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
+            tmp.replace(path)
+            return True
+    except OSError:
+        return False
+
+
+def load_device_map(sync: bool = True) -> dict:
+    """sid -> host over every machine's device record. A session continued
+    on another Mac sits in two records; the later prompt names its host."""
+    if sync:
+        sync_device_record()
+    best: dict = {}
+    try:
+        entries = list(STATE_PATH.parent.iterdir())
+    except OSError:
+        return {}
+    for p in entries:
+        m = _DEVICES_FILE_RE.match(p.name)
+        if not m:
+            continue
+        rec = _read_json_dict(p)
+        host = m.group(1)
+        # A Synology conflict copy (`devices.<host>_<peer>_…_Conflict.json`)
+        # still fits the name pattern but carries the original's host.
+        if rec.get("host") != host:
+            continue
+        sessions = rec.get("sessions")
+        if not isinstance(sessions, dict):
+            continue
+        for sid, ts in sessions.items():
+            if not isinstance(ts, (int, float)):
+                continue
+            if sid not in best or ts > best[sid][0]:
+                best[sid] = (ts, host)
+    return {sid: host for sid, (_, host) in best.items()}
+
+
 def resolve_status(session_id: str, live: set[str], done: set[str],
                    registry: dict | None = None,
                    overlay: dict | None = None,
@@ -2450,6 +2583,7 @@ class StatusContext:
     overlay: dict
     jobs: dict
     pins: set = field(default_factory=set)  # agent-view pinned daemonShorts
+    devices: dict = field(default_factory=dict)  # sid -> host (load_device_map)
 
     @classmethod
     def capture(cls) -> "StatusContext":
@@ -2471,7 +2605,8 @@ class StatusContext:
                                  "updatedAt": rec.get("updatedAt")}
         return cls(live=live, done=done_ids(),
                    registry=registry, overlay=status_overlay(),
-                   jobs=scan_jobs(), pins=read_pins())
+                   jobs=scan_jobs(), pins=read_pins(),
+                   devices=load_device_map())
 
     def resolve(self, session_id: str) -> str:
         return resolve_status(session_id, self.live, self.done,
