@@ -48,9 +48,12 @@ class TestAstHomeDerivation(unittest.TestCase):
         self.assertNotEqual(tk._ast_home(), Path.home() / ".cst")
 
     def test_module_paths_derive_from_cache_dir(self):
-        # index.json / state.json live side by side under the single home.
-        self.assertEqual(tk.CACHE_PATH, tk.CACHE_DIR / "index.json")
+        # state.json lives in the home; index.json in the index dir, which is
+        # the home itself unless AST_INDEX_DIR moved it (as a synced home does).
         self.assertEqual(tk.STATE_PATH, tk.CACHE_DIR / "state.json")
+        self.assertEqual(tk.CACHE_PATH, tk.INDEX_DIR / "index.json")
+        if not os.environ.get("AST_INDEX_DIR"):
+            self.assertEqual(tk.INDEX_DIR, tk.CACHE_DIR)
 
 
 class _SeedEnv(unittest.TestCase):

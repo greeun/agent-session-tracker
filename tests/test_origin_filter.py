@@ -202,11 +202,40 @@ class TestJsonOutput(unittest.TestCase):
         self.assertEqual(d["origin"], "agent")
 
 
-class TestCmdListOriginArg(unittest.TestCase):
+class _IsolatedStore(unittest.TestCase):
+    """cmd_list against an empty temp store: every root ast reads is re-pointed,
+    so the user's real sessions, registry and device records never leak in."""
+    _KEYS = ("PROJECTS_DIR", "CODEX_SESSIONS_DIR", "CODEX_LOCKS_DIR", "CACHE_DIR",
+             "CACHE_PATH", "STATE_PATH", "JOBS_DIR", "DAEMON_DIR",
+             "SESSIONS_REGISTRY_DIR", "CLAUDE_HISTORY_PATH")
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self._orig = {k: getattr(tk, k) for k in self._KEYS}
+        self.addCleanup(lambda: [setattr(tk, k, v) for k, v in self._orig.items()])
+        for k in self._KEYS:
+            setattr(tk, k, root / k.lower())
+        tk.CACHE_PATH = tk.CACHE_DIR / "index.json"
+        tk.STATE_PATH = tk.CACHE_DIR / "state.json"
+
+    def _list(self, ns):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = tk.cmd_list(ns)
+        return rc, out.getvalue()
+
+
+class TestCmdListOriginArg(_IsolatedStore):
     def test_bare_namespace_without_origin_attr_does_not_crash(self):
         ns = argparse.Namespace(cwd=None, days=None, status=None, limit=1)
         self.assertNotIn("origin", vars(ns))
-        self.assertEqual(tk.cmd_list(ns), 0)
+        rc, out = self._list(ns)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "(no sessions found)")
 
 
 class TestParserOriginFlag(unittest.TestCase):
