@@ -150,6 +150,33 @@ class TestCmdDevices(_Base):
         rc, _, _ = self._run(no_primary=True)
         self.assertIsNone(tk.load_device_primary())
 
+    def _known(self):
+        (tk.CACHE_DIR / "devices.HOSTB.json").write_text(json.dumps(
+            {"version": 1, "host": "HOSTB", "sessions": {"s1": 1}}), "utf-8")
+
+    def test_alias_rejects_unknown_host(self):
+        self._known()
+        rc, _, err = self._run(alias="HOSTZ=zed")
+        self.assertEqual(rc, 2)
+        self.assertIn("HOSTZ", err)
+        self.assertEqual(tk.load_device_aliases(), {})
+
+    def test_alias_rejects_reserved_long_and_taken_names(self):
+        self._known()
+        for bad in ("local", "ALL", "?", "toolongname"):
+            rc, _, _ = self._run(alias=f"HOSTB={bad}")
+            self.assertEqual(rc, 2, bad)
+        self.assertEqual(self._run(alias="HOSTA=mbp")[0], 0)   # this Mac is known
+        rc, _, err = self._run(alias="HOSTB=MBP")
+        self.assertEqual(rc, 2)
+        self.assertIn("HOSTA", err)
+
+    def test_primary_rejects_unknown_host(self):
+        self._known()
+        rc, _, _ = self._run(primary="HOSTZ")
+        self.assertEqual(rc, 2)
+        self.assertIsNone(tk.load_device_primary())
+
     def test_unalias(self):
         tk.save_device_alias("HOSTB", "mbp")
         rc, _, _ = self._run(unalias="HOSTB")

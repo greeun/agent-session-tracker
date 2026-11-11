@@ -35,7 +35,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. 확인
 ast --version
-# agent-session-tracker v1.5.1
+# agent-session-tracker v1.5.2
 
 # 4. (선택) 토큰 0짜리 done!/undone! 프롬프트 훅 + 상태 정밀 레이어 설치
 ast install-hook
@@ -197,7 +197,7 @@ ast list [--limit 30] [--cwd PREFIX] [--days N]
 ```
 
 ```
-agent-session-tracker v1.5.1
+agent-session-tracker v1.5.2
   #  ST  AGENT    DEVICE  LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
   1  ●   claude   work    2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
   2  !   claude   mbp     2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
@@ -236,7 +236,8 @@ agent-session-tracker v1.5.1
   이 맥에서 실행 중인 세션은 이 맥으로 표시된다. 과거 세션을 채우려면 각 맥에서
   새 ast를 한 번 실행한다. 기록이 없는 세션(codex/chatgpt, `claude -p`, bg 작업)은
   `?`로 표시된다. `--device NAME`에는 호스트, 별칭, `local`, `?`, `all`을 지정할 수
-  있으며, 호스트나 `local`로 거르면 `?` 행은 빠지고 그 수가 요약 줄에
+  있다. zsh에서는 `?`가 글롭으로 해석되므로 `--device '?'`처럼 따옴표로 감싼다.
+  호스트나 `local`로 거르면 `?` 행은 빠지고 그 수가 요약 줄에
   `[device:mbp, ?:12 hidden]`처럼 표시된다. 플래그가 없으면 TUI `m` 키가 마지막으로
   저장한 뷰를 사용한다. `ast search`와 `ast pick`도 같은 플래그를 지원한다.
   `ast devices --alias MBP-M4P-24-H=mbp`로 별칭을 지정하며(`state.json`으로 공유),
@@ -584,7 +585,7 @@ fzf 스타일 필터, 상태 글리프, 모달, 액션 키를 갖춘 curses 선�
 ### 헤더
 
 ```
- agent-session-tracker v1.5.1  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.5.2  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — 보이는 행 / 전체 세션 수

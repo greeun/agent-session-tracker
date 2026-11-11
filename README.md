@@ -36,7 +36,7 @@ ln -sf ~/.claude/skills/agent-session-tracker/tracker.py ~/.local/bin/ast
 
 # 3. Verify
 ast --version
-# agent-session-tracker v1.5.1
+# agent-session-tracker v1.5.2
 
 # 4. (optional) wire the 0-token done!/undone! prompt hook + status precision layer
 ast install-hook
@@ -196,7 +196,7 @@ ast list [--limit 30] [--cwd PREFIX] [--days N]
 ```
 
 ```
-agent-session-tracker v1.5.1
+agent-session-tracker v1.5.2
   #  ST  AGENT    DEVICE  LAST ACTIVITY     SESSION   MSGS  MESSAGE                   PROJECT
   1  ●   claude   work    2026-05-24 01:17  960faaa8   261  claude-sessions 는…       ~/.claude/skills
   2  !   claude   mbp     2026-05-24 01:16  06d116f7    34  proceed? (y/N)            ~/project/url-shortener
@@ -236,7 +236,8 @@ agent-session-tracker v1.5.1
   continued on another Mac goes to the one with the later prompt, and a session
   alive on this Mac is this Mac's. Run the new ast once on each Mac to backfill
   its history. Sessions with no record (codex/chatgpt, `claude -p`, bg jobs)
-  show `?`. `--device NAME` takes a host, its alias, `local`, `?` or `all`;
+  show `?`. `--device NAME` takes a host, its alias, `local`, `?` or `all`
+  (quote it as `--device '?'` in zsh, which otherwise globs the `?`);
   a host or `local` view drops the `?` rows and says so in the summary
   (`[device:mbp, ?:12 hidden]`). With no flag the view the TUI `m` key last
   saved is used. Same flag on `ast search` and `ast pick`. Name the hosts with
@@ -589,7 +590,7 @@ A cursor appears on the prompt line. Live filtering happens as you type.
 ### Header bar
 
 ```
- agent-session-tracker v1.5.1  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
+ agent-session-tracker v1.5.2  12/563  ●3 !1 ◦0 ○558 ✓1  ⟳10s  sort:time▼  👤user  ⚙codex  [✓ hidden]  [📂 ~/project]   ? help  Enter open  o folder  / filter  s sort  f origin  a agent  m device  i auto  ^R rescan  ^D mark✓  H hide✓  C cwd  Esc quit
 ```
 
 - `12/563` — visible rows / total sessions
