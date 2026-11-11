@@ -1,7 +1,7 @@
 ---
 name: agent-session-tracker
 description: Track live/waiting/ended/done status of Claude Code sessions — and Codex CLI sessions and ChatGPT desktop app conversations alongside them. List, search, resume, export, backup, restore sessions via `ast` CLI or TUI. Use when user says "list sessions", "세션 상태", "ast", "session tracker", "codex 세션", "chatgpt 세션", "ChatGPT 앱 대화", or wants to resume/search/export/backup sessions.
-version: 1.5.1
+version: 1.5.2
 ---
 
 # agent-session-tracker
@@ -29,7 +29,7 @@ process is ended/job-state; a live one resolves overlay → registry → `●`):
   in TUI, `ast done <id>`, or the `done!` prompt hook). Persists in
   `~/.ast/state.json`.
 
-Main script: `tracker.py` (stdlib only, Python 3.10+, v1.5.1). Installed as
+Main script: `tracker.py` (stdlib only, Python 3.10+, v1.5.2). Installed as
 `~/.local/bin/ast`. All `~/.claude/...` data paths honor `$CLAUDE_CONFIG_DIR`
 (same convention as Claude Code itself) and `~/.codex/...` honors
 `$CODEX_HOME` (Codex's own convention); ast's own files live under `~/.ast`
@@ -97,6 +97,7 @@ ast list --agent codex    # one agent's sessions: all(default)|claude|codex|chat
                           #   no --agent uses the view the TUI `a` key last saved;
                           #   same flag on `search` and `pick`; summary shows [agent:codex]
 ast list --device mbp     # sessions last worked on one Mac: a host, its alias, local, ? or all
+                          #   (zsh: quote it, --device '?')
                           #   from each Mac's local ~/.claude/history.jsonl, exported to
                           #   ~/.ast/devices.<host>.json; run ast once per Mac to backfill;
                           #   a host/local view drops "?" rows: [device:mbp, ?:3 hidden]

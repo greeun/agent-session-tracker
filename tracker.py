@@ -16,7 +16,7 @@ Data sources:
 """
 from __future__ import annotations
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
 import argparse
 import json
@@ -2464,9 +2464,20 @@ def _read_json_dict(path: Path) -> dict:
 def _device_sync_stubbed() -> bool:
     """True when tests have moved ast's home but left the real history in
     place: exporting it would read the user's 8MB file into a fixture."""
+    if CLAUDE_HISTORY_PATH != _DEFAULT_CLAUDE_HISTORY_PATH:
+        return False
     home = _ast_home()
-    stubbed = CACHE_DIR != home or STATE_PATH != home / "state.json"
-    return stubbed and CLAUDE_HISTORY_PATH == _DEFAULT_CLAUDE_HISTORY_PATH
+    if CACHE_DIR != home or STATE_PATH != home / "state.json":
+        return True
+    # Tests that set AST_HOME to a temp dir before importing leave the module
+    # paths consistent with it; a real home never lives under the temp dir.
+    import tempfile
+    try:
+        tmp = Path(tempfile.gettempdir()).resolve()
+        here = STATE_PATH.parent.resolve()
+    except OSError:
+        return False
+    return here == tmp or tmp in here.parents
 
 
 def sync_device_record() -> bool:
@@ -2484,6 +2495,12 @@ def sync_device_record() -> bool:
     except OSError:
         return False
     path = _devices_path()
+    # The TUI rescans every few seconds and history rarely moved since: answer
+    # from a lock-free read when the recorded source still matches.
+    source = _read_json_dict(path).get("source")
+    if (isinstance(source, dict) and source.get("path") == str(src)
+            and source.get("size") == st.st_size and source.get("mtime") == st.st_mtime):
+        return False
     try:
         with _file_lock(path.with_suffix(".lock")):
             rec = _read_json_dict(path)
@@ -2504,6 +2521,10 @@ def sync_device_record() -> bool:
                 f.seek(offset)
                 chunk = f.read()
             end = chunk.rfind(b"\n") + 1
+            if end == 0 and same_src and source.get("offset") == offset:
+                # Only a half-written prompt arrived; rewriting would just
+                # push an unchanged record through the sync client.
+                return False
             for raw in chunk[:end].splitlines():
                 try:
                     evt = json.loads(raw)
@@ -6673,8 +6694,18 @@ def _confirm_other_device_modal(stdscr, target: SessionMeta, label: str) -> bool
         win.refresh()
     except curses.error:
         pass
-    ch = stdscr.getch()
-    return ch in (ord('y'), ord('Y'))
+    return _read_yes_no(stdscr)
+
+
+def _read_yes_no(stdscr) -> bool:
+    """y/Y → True; any other key → False. A terminal resize (or a timed-out
+    read) is not an answer, so it never cancels the question by itself."""
+    import curses
+    while True:
+        ch = stdscr.getch()
+        if ch in (curses.KEY_RESIZE, -1):
+            continue
+        return ch in (ord('y'), ord('Y'))
 
 
 def _confirm_skip_perm_modal(stdscr, target: SessionMeta) -> bool | None:
@@ -8817,17 +8848,55 @@ def cmd_restore(args: argparse.Namespace) -> int:
         tar.close()
 
 
+def _device_record_hosts() -> set:
+    """Every host with a device record in the home, plus this machine."""
+    hosts = {_host_id()}
+    try:
+        entries = list(STATE_PATH.parent.iterdir())
+    except OSError:
+        return hosts
+    for p in entries:
+        m = _DEVICES_FILE_RE.match(p.name)
+        if m and _read_json_dict(p).get("host") == m.group(1):
+            hosts.add(m.group(1))
+    return hosts
+
+
+def _require_known_host(host: str, known: set) -> bool:
+    if host in known:
+        return True
+    print(f"unknown host {host!r}; known: {', '.join(sorted(known))}", file=sys.stderr)
+    return False
+
+
 def cmd_devices(args: argparse.Namespace) -> int:
     """List the machines that have a device record, or set/clear an alias."""
     if getattr(args, "alias", None):
         host, sep, name = args.alias.partition("=")
-        if not sep or not host.strip() or not name.strip():
+        host, name = host.strip(), name.strip()
+        if not sep or not host or not name:
             print("--alias expects HOST=NAME", file=sys.stderr)
             return 2
-        save_device_alias(host.strip(), name.strip())
+        if not _require_known_host(host, _device_record_hosts()):
+            return 2
+        if name.lower() in (DEVICE_VIEW_ALL, DEVICE_VIEW_LOCAL, DEVICE_UNKNOWN):
+            print(f"alias {name!r} is reserved (all, local, ?)", file=sys.stderr)
+            return 2
+        if display_width(name) > DEVICE_WIDTH:
+            print(f"alias {name!r} is longer than the {DEVICE_WIDTH}-column DEVICE cell",
+                  file=sys.stderr)
+            return 2
+        taken = [h for h, a in load_device_aliases().items()
+                 if h != host and a.lower() == name.lower()]
+        if taken:
+            print(f"alias {name!r} already names {taken[0]}", file=sys.stderr)
+            return 2
+        save_device_alias(host, name)
         print(f"alias {host.strip()} → {name.strip()}")
         return 0
     if getattr(args, "primary", None):
+        if not _require_known_host(args.primary.strip(), _device_record_hosts()):
+            return 2
         save_device_primary(args.primary.strip())
         print(f"primary device: {args.primary.strip()}")
         return 0
@@ -8846,7 +8915,8 @@ def cmd_devices(args: argparse.Namespace) -> int:
     for host in devices.values():
         counts[host] = counts.get(host, 0) + 1
     here = _host_id()
-    counts.setdefault(here, 0)
+    for host in _device_record_hosts():
+        counts.setdefault(host, 0)
     print(f" {'HOST':<20} {'ALIAS':<8} {'SESSIONS':>8}")
     for host in sorted(counts):
         mark = "*" if host == here else " "

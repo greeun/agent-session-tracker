@@ -171,6 +171,37 @@ class TestMerge(_Base):
         self.assertEqual(tk.StatusContext.capture().devices.get("s1"), "HOSTB")
 
 
+class TestSyncCost(_Base):
+    def test_partial_line_growth_does_not_rewrite(self):
+        self.hist.write_text(_line("s1", 100) + '{"display": "x', "utf-8")
+        tk.sync_device_record()
+        path = tk.CACHE_DIR / "devices.HOSTA.json"
+        os.utime(path, (1, 1))
+        with self.hist.open("a", encoding="utf-8") as f:
+            f.write('yz')            # still no newline
+        self.assertFalse(tk.sync_device_record())
+        self.assertEqual(path.stat().st_mtime, 1)
+
+    def test_unchanged_source_skips_the_lock(self):
+        self.hist.write_text(_line("s1", 100), "utf-8")
+        tk.sync_device_record()
+        orig = tk._file_lock
+        self.addCleanup(setattr, tk, "_file_lock", orig)
+
+        def boom(*a, **k):
+            raise AssertionError("lock taken for an unchanged history")
+        tk._file_lock = boom
+        self.assertFalse(tk.sync_device_record())
+
+    def test_home_under_tempdir_with_real_history_is_skipped(self):
+        # AST_HOME pointed at a temp dir before import: CACHE_DIR == _ast_home()
+        self.addCleanup(setattr, tk, "_ast_home", tk._ast_home)
+        tk._ast_home = lambda: tk.CACHE_DIR
+        tk.CLAUDE_HISTORY_PATH = tk._DEFAULT_CLAUDE_HISTORY_PATH
+        self.assertFalse(tk.sync_device_record())
+        self.assertFalse((tk.CACHE_DIR / "devices.HOSTA.json").exists())
+
+
 class TestHostId(unittest.TestCase):
     def test_status_path_uses_host_id(self):
         self.assertEqual(tk._status_path().name, f"status.{tk._host_id()}.json")

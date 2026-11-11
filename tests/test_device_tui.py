@@ -128,6 +128,20 @@ class TestPure(unittest.TestCase):
         self.assertEqual(len(cols), 9)
         self.assertEqual(cols[3], tk.DEVICE_WIDTH)
 
+    def test_yes_no_ignores_resize(self):
+        import curses
+
+        class Scr:
+            def __init__(self, keys):
+                self.keys = list(keys)
+
+            def getch(self):
+                return self.keys.pop(0)
+
+        self.assertTrue(tk._read_yes_no(Scr([curses.KEY_RESIZE, ord("y")])))
+        self.assertFalse(tk._read_yes_no(Scr([curses.KEY_RESIZE, -1, ord("n")])))
+        self.assertFalse(tk._read_yes_no(Scr([27])))
+
     def test_header_hint(self):
         self.assertEqual(tk._device_hint("all", {}, 5), "")
         self.assertEqual(tk._device_hint("HOSTB", {"HOSTB": "mbp"}, 0), "  ⌂mbp")
