@@ -133,6 +133,29 @@ class TestMerge(_Base):
         self._write_dev("devices.HOSTB.json", {"s1": 500, "s2": 1})
         self.assertEqual(tk.load_device_map(sync=False), {"s1": "HOSTB", "s2": "HOSTB"})
 
+    def test_tie_goes_to_primary_host(self):
+        # A history copied to a new Mac duplicates every line, timestamp included.
+        self._write_dev("devices.HOSTA.json", {"s1": 100})
+        self._write_dev("devices.HOSTB.json", {"s1": 100})
+        tk.save_device_primary("HOSTB")
+        self.assertEqual(tk.load_device_map(sync=False), {"s1": "HOSTB"})
+        tk.save_device_primary("HOSTA")
+        self.assertEqual(tk.load_device_map(sync=False), {"s1": "HOSTA"})
+
+    def test_tie_without_primary_is_host_name_order(self):
+        for names in (("HOSTB", "HOSTA"), ("HOSTA", "HOSTB")):
+            for p in tk.CACHE_DIR.glob("devices.*.json"):
+                p.unlink()
+            for n in names:
+                self._write_dev(f"devices.{n}.json", {"s1": 100})
+            self.assertEqual(tk.load_device_map(sync=False), {"s1": "HOSTA"})
+
+    def test_later_prompt_beats_primary(self):
+        self._write_dev("devices.HOSTA.json", {"s1": 200})
+        self._write_dev("devices.HOSTB.json", {"s1": 100})
+        tk.save_device_primary("HOSTB")
+        self.assertEqual(tk.load_device_map(sync=False), {"s1": "HOSTA"})
+
     def test_conflict_copy_ignored(self):
         self._write_dev("devices.HOSTB.json", {"s1": 5})
         self._write_dev("devices.HOSTB_MBP_Nov-11_Conflict.json", {"s2": 9}, host="HOSTB")

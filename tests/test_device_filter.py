@@ -110,7 +110,9 @@ class TestPersistence(_Base):
 
 class TestCmdDevices(_Base):
     def _run(self, **kw):
-        ns = argparse.Namespace(alias=kw.get("alias"), unalias=kw.get("unalias"))
+        ns = argparse.Namespace(alias=kw.get("alias"), unalias=kw.get("unalias"),
+                                primary=kw.get("primary"),
+                                no_primary=kw.get("no_primary", False))
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = tk.cmd_devices(ns)
@@ -135,6 +137,18 @@ class TestCmdDevices(_Base):
         rc, _, err = self._run(alias="bad")
         self.assertEqual(rc, 2)
         self.assertIn("HOST=NAME", err)
+
+    def test_primary_set_list_clear(self):
+        (tk.CACHE_DIR / "devices.HOSTB.json").write_text(json.dumps(
+            {"version": 1, "host": "HOSTB", "sessions": {"s1": 1}}), "utf-8")
+        rc, _, _ = self._run(primary="HOSTB")
+        self.assertEqual(rc, 0)
+        self.assertEqual(tk.load_device_primary(), "HOSTB")
+        rc, out, _ = self._run()
+        row = next(l for l in out.splitlines() if "HOSTB" in l)
+        self.assertTrue(row.rstrip().endswith("primary"), row)
+        rc, _, _ = self._run(no_primary=True)
+        self.assertIsNone(tk.load_device_primary())
 
     def test_unalias(self):
         tk.save_device_alias("HOSTB", "mbp")
