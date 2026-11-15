@@ -7251,6 +7251,10 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
                     else:
                         search_query = query
                         search_hits = result
+                        # The full-text hits replace the metadata filter;
+                        # keeping `query` would intersect them with
+                        # id/cwd/first-msg matches and hide transcript-only hits.
+                        query = ""
                         sel = 0
                         top = 0
                         toast = f"Full-text: {len(result)} session(s) matched"
