@@ -302,7 +302,8 @@ stale `!` self-heals to `◦` to avoid a stuck state.
 - `Ctrl-R` — rescan (stays in search mode)
 - **`Enter`** — commit filter, exit search mode (filter stays applied;
   use ↑↓ + Enter in normal mode to open)
-- `Tab` — escalate to full-text transcript search
+- `Tab` — escalate to full-text transcript search; rows stream in as they
+  match (`searching N%` on the prompt line), `Esc` stops and clears
 - `Esc` — clear query and exit mode
 
 **Modals** — `?` help · `v` preview · `i` auto-rescan · `Del` delete-confirm

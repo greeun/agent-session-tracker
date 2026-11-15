@@ -5326,49 +5326,63 @@ def _tui_search_prompt(stdscr, initial: str = "") -> str | None:
         curses.curs_set(0)
 
 
-def _tui_run_search(stdscr, sessions: list[SessionMeta], query: str) -> dict[str, str] | None:
-    import curses
-    regex = compile_query(query, case_insensitive=True)
-    hits: dict[str, str] = {}
-    h, w = stdscr.getmaxyx()
-    total = len(sessions)
-    stdscr.nodelay(True)
+def _fulltext_snippet(meta: SessionMeta, regex: "re.Pattern[str]") -> str | None:
+    """The first full-text match in one session as a display snippet, or None.
+    A session-id match needs no file I/O."""
+    if regex.search(meta.session_id):
+        return f"[session ID: {meta.session_id}]"
     try:
-        for i, s in enumerate(sessions, 1):
-            try:
-                ch = stdscr.getch()
-                if ch == 27:
-                    return None
-            except curses.error:
-                pass
-            if i == 1 or i == total or i % 5 == 0:
-                msg = f" Searching {i}/{total}…  (Esc to cancel) "
-                try:
-                    stdscr.addnstr(h - 1, 0, msg.ljust(w - 1), w - 1,
-                                   curses.color_pair(2) | curses.A_BOLD)
-                    stdscr.refresh()
-                except curses.error:
-                    pass
-            # Fast path: session ID match needs no file I/O
-            if regex.search(s.session_id):
-                hits[s.session_id] = f"[session ID: {s.session_id}]"
+        for turn in agent_of(meta).iter_turns(meta.path):
+            text = turn.text
+            if not text:
                 continue
-            try:
-                for turn in agent_of(s).iter_turns(s.path):
-                    text = turn.text
-                    if not text:
-                        continue
-                    m = regex.search(text)
-                    if m:
-                        start = max(0, m.start() - 40)
-                        end = min(len(text), m.end() + 80)
-                        hits[s.session_id] = text[start:end].replace("\n", " ")
-                        break
-            except OSError:
-                continue
-        return hits
-    finally:
-        stdscr.nodelay(False)
+            m = regex.search(text)
+            if m:
+                start = max(0, m.start() - 40)
+                end = min(len(text), m.end() + 80)
+                return text[start:end].replace("\n", " ")
+    except OSError:
+        pass
+    return None
+
+
+class FulltextScan:
+    """Incremental TUI full-text search (`/` → Tab).
+
+    `step()` scans sessions until a time budget runs out, so the main loop can
+    repaint between slices and rows appear as they match instead of after the
+    whole collection is read. `hits` is the live dict the list renders from;
+    sessions are scanned in the order given (the list's newest-first order)."""
+
+    def __init__(self, sessions: list[SessionMeta], query: str) -> None:
+        self.regex = compile_query(query, case_insensitive=True)
+        self.sessions = list(sessions)
+        self.total = len(self.sessions)
+        self.pos = 0
+        self.hits: dict[str, str] = {}
+
+    @property
+    def done(self) -> bool:
+        return self.pos >= self.total
+
+    def step(self, budget_s: float = 0.05, clock=None) -> bool:
+        """Scan at least one session, then keep going until `budget_s` has
+        passed. Returns True once every session has been scanned."""
+        import time
+        clock = clock or time.monotonic
+        deadline = clock() + budget_s
+        while not self.done:
+            meta = self.sessions[self.pos]
+            self.pos += 1
+            snip = _fulltext_snippet(meta, self.regex)
+            if snip is not None:
+                self.hits[meta.session_id] = snip
+            if clock() >= deadline:
+                break
+        return self.done
+
+    def progress(self) -> str:
+        return f"{progress_pct(self.pos, self.total)}% ({self.pos}/{self.total})"
 
 
 HELP_LINES = [
@@ -5398,7 +5412,7 @@ HELP_LINES = [
     "      Ctrl-R             rescan sessions + live-process registry",
     "      Enter              commit filter, exit prompt (filter stays applied)",
     "                         → then use ↑↓, Enter, D, R, Del normally",
-    "      Tab                escalate to full-text transcript search",
+    "      Tab                full-text transcript search (rows appear as they match; Esc clears)",
     "      Esc                clear query and exit prompt",
     "",
     "Session actions (normal mode)",
@@ -6940,6 +6954,8 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
     _toast_shown = ""
     search_query: str = ""
     search_hits: dict[str, str] | None = None
+    fts: FulltextScan | None = None   # running Tab full-text scan, if any
+    sel_sid: str | None = None        # focused row, kept steady while hits arrive
     search_mode: bool = False  # True while typing inside the `/` prompt
     sort_key, sort_reverse = load_sort()  # column sort (s cycles, S reverses)
     origin: str = load_origin()  # f cycles all→user→agent, F walks backwards
@@ -6981,7 +6997,12 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
     _in_cmux = bool(os.environ.get("CMUX_WORKSPACE_ID"))
 
     while True:
+        if fts is not None:
+            if fts.step():
+                toast = f"Full-text: {len(fts.hits)} session(s) matched"
+                fts = None
         if (auto_enabled and auto_interval > 0 and not search_mode
+                and fts is None
                 and time.monotonic() - last_rescan >= auto_interval):
             last_rescan = time.monotonic()
             try:
@@ -7009,6 +7030,13 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         items = filtered()
+        if search_hits is not None and sel_sid is not None:
+            # New hits insert above the cursor as they arrive; follow the
+            # session rather than the row index.
+            for _i, _s in enumerate(items):
+                if _s.session_id == sel_sid:
+                    sel = _i
+                    break
         if sel >= len(items):
             sel = max(0, len(items) - 1)
         if sel < top:
@@ -7022,6 +7050,7 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
             mark_hint = f"  ✓{len(marked)}" if marked else ""
             search_hint = (
                 f"  🔎 {search_query!r}→{len(search_hits)}"
+                + (f" {progress_pct(fts.pos, fts.total)}%" if fts else "")
                 if search_hits is not None else ""
             )
             scounts = ctx.counts(rows)
@@ -7059,6 +7088,8 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
                 bits.append(f"filter={query!r}")
             if search_hits is not None:
                 bits.append(f"text={search_query!r}→{len(search_hits)}")
+                if fts is not None:
+                    bits.append(f"searching {fts.progress()}")
             prompt = "  " + "  ".join(bits) + "   (/ to edit, Esc/clear)"
         else:
             prompt = "  (press / to filter, ? for help)"
@@ -7127,6 +7158,7 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
 
         _tui_draw_rows(stdscr, items, top, sel, list_top, list_h, marked,
                        search_hits, ctx, w, cols)
+        sel_sid = items[sel].session_id if items else None
 
         # footer line
         if toast:
@@ -7160,7 +7192,9 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
         # KEY_UP/KEY_DOWN ints. getch() + keypad(True) handles special keys
         # reliably, and for multi-byte text input (Korean etc.) we assemble
         # the UTF-8 sequence ourselves.
-        if auto_enabled and auto_interval > 0 and not search_mode:
+        if fts is not None:
+            stdscr.timeout(0)   # keep scanning; a key still lands between slices
+        elif auto_enabled and auto_interval > 0 and not search_mode:
             stdscr.timeout(AUTO_RESCAN_TICK_MS)
         else:
             stdscr.timeout(-1)
@@ -7245,19 +7279,19 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
                 if not query:
                     toast = "Type a query first"
                 else:
-                    result = _tui_run_search(stdscr, sessions, query)
-                    if result is None:
-                        toast = "Full-text search cancelled"
-                    else:
-                        search_query = query
-                        search_hits = result
-                        # The full-text hits replace the metadata filter;
-                        # keeping `query` would intersect them with
-                        # id/cwd/first-msg matches and hide transcript-only hits.
-                        query = ""
-                        sel = 0
-                        top = 0
-                        toast = f"Full-text: {len(result)} session(s) matched"
+                    # Rows appear as they match: the main loop advances the
+                    # scan between keypresses (see `fts.step` above).
+                    fts = FulltextScan(sessions, query)
+                    search_query = query
+                    search_hits = fts.hits
+                    # The full-text hits replace the metadata filter;
+                    # keeping `query` would intersect them with
+                    # id/cwd/first-msg matches and hide transcript-only hits.
+                    query = ""
+                    sel = 0
+                    top = 0
+                    sel_sid = None
+                    toast = ""
                 search_mode = False
             elif ch == 4:  # Ctrl-D — toggle 작업종료 on the current row
                 # Mirrors normal-mode `D`; lets users mark done while still
@@ -7394,6 +7428,7 @@ def _pick_ui(stdscr, sessions_ref: list[SessionMeta], cwd_filter: str | None,
                 query = ""
                 search_query = ""
                 search_hits = None
+                fts = None
                 sel = 0
                 top = 0
                 toast = "Filter & search cleared"

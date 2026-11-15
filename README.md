@@ -584,7 +584,7 @@ A cursor appears on the prompt line. Live filtering happens as you type.
 | `Ctrl-A` | Toggle marks on all visible (stays in search mode) |
 | `Ctrl-D` | Toggle done on current row (stays in search mode) |
 | `Ctrl-R` | Rescan (stays in search mode) |
-| `Tab` | Escalate to full-text transcript search for the current query |
+| `Tab` | Escalate to full-text transcript search for the current query — rows appear as they match while the scan runs (`searching 42%` on line 2), and `Esc` stops it |
 | `Esc` | Clear query and exit search mode |
 
 ### Header bar
