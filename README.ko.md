@@ -39,6 +39,8 @@ ast --version
 
 # 4. (선택) 토큰 0짜리 done!/undone! 프롬프트 훅 + 상태 정밀 레이어 설치
 ast install-hook
+# Codex 안에서 done!, undone!, ast! 사용 (선택)
+ast install-hook --agent codex
 ```
 
 `~/.local/bin`이 `PATH`에 포함돼 있어야 합니다. Python 3.10+ 필요.
@@ -128,12 +130,13 @@ ast --theme light --tui       # TUI 색 테마 지정(auto|dark|light; `t`/`T`�
 | 트랜스크립트 | `~/.claude/projects/**/*.jsonl` | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<시각>-<uuid>.jsonl` (기본 `~/.codex`; 서브에이전트 rollout은 `subagents/`처럼 숨김) |
 | list / search / show / export / TUI / done / rm | ✓ | ✓ |
 | 재개 (`Enter`, `ast resume`) | `claude --resume <id>` | `codex resume <uuid>` (권한 생략 → `--dangerously-bypass-approvals-and-sandbox`) |
-| 실행 상태 | pid 레지스트리 + 훅 오버레이 | `thread-writer-locks/<uuid>.lock`의 flock 탐지: 잠겨 있으면 실행 중; rollout이 90초 이내에 갱신되었으면 `●`, 아니면 `◦`. codex는 `!` 대기를 감지할 수 없음 |
+| 실행 상태 | pid 레지스트리 + 훅 오버레이 | flock 탐지 + rollout 수정 시각. 선택적으로 Codex 훅을 설치하면 작업·유휴 및 권한 승인 대기도 감지 |
 | 생성 주체 (`--origin`) | `entrypoint` cli 대 `sdk-*` | `source` cli / vscode → user; exec / mcp / subagent → agent |
 | 재배치 (`ast relocate`) | 트랜스크립트를 `projects/<인코딩된 새 cwd>/`로 이동 | 기록된 cwd만 제자리에서 재작성 — rollout 경로에는 시작 날짜만 담기므로 파일을 옮길 필요가 없음. `--keep-original`은 무시하지 않고 거부함(사본을 놓을 새 위치가 없어, 그대로 진행하면 보존하라고 지정한 파일 자체를 재작성하게 됨) |
 | 백업 / 복원 | 아카이브의 `projects/…` 아래에 저장 | 같은 아카이브의 `codex/…` 아래에 저장되며, 복원 시 각자의 데이터 루트로 되돌아감 |
 | 서브에이전트 (`ast subagents`) | 트랜스크립트 옆의 `subagents/*.jsonl` | `parent_thread_id`가 이 스레드를 가리키는 rollout(codex의 guardian·subagent 스레드) |
-| attach / jobs / bg / hooks | ✓ | ✗ — codex에 대응 기능이 없는 Claude Code 전용 기능 (`not supported for codex sessions`) |
+| hooks | `ast install-hook` | `ast install-hook --agent codex` |
+| attach / jobs / bg | ✓ | ✗ — codex에 대응 기능이 없는 Claude Code 전용 기능 (`not supported for codex sessions`) |
 
 codex의 대화는 rollout의 `response_item`/`message` 레코드 중 role이 `user`
 또는 `assistant`인 것이며, `developer` 레코드와 codex가 user 역할로 주입하는
@@ -651,6 +654,52 @@ TUI에서 `Enter`를 누르면 **현재 쓰는 터미널 앱과 동일한 앱의
 
 ## 훅
 
+### Codex에서 사용하기
+
+```bash
+ast install-hook --agent codex
+```
+
+`$CODEX_HOME/hooks.json`(기본 `~/.codex/hooks.json`)에 등록합니다. Codex를
+재시작한 뒤 CLI의 `/hooks`, 데스크톱 앱의 **Settings > Hooks**에서 새 훅을
+검토하고 신뢰해야 실행됩니다. 이는 [Codex의 훅 신뢰 요구사항](https://learn.chatgpt.com/docs/hooks)이며
+ast가 자동으로 우회하지 않습니다. 기존 다른 훅은 보존합니다.
+
+이후 아래 내용을 프롬프트 전체로 입력합니다.
+
+```text
+done!                              # 현재 세션 완료 표시
+undone!                            # 현재 세션 완료 취소
+done! abcd1234                     # 특정 세션 완료 표시 (ID 앞부분 가능)
+ast!                               # 최근 Codex 세션 10개 조회
+ast! --agent all --days 7 --limit 20
+```
+
+위 명령은 로컬에서 처리하고 모델 호출 전에 프롬프트를 차단하므로 토큰을
+사용하지 않습니다. `ast!`는 `ast list`의 옵션만 받으며 조회 개수는 1–50개입니다.
+일반 프롬프트는 그대로 진행합니다. 상태 훅은 권한 승인 대기와 작업·유휴 전이도
+기록합니다. 현재 세션은 훅의 `session_id`로 식별하며 작업 경로나 최신 시간으로 추측하지 않습니다.
+
+짧은 스킬 호출 `$ast`도 사용할 수 있습니다. 아래 경로를 실제 저장소 경로로 바꿉니다.
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+ln -s /path/to/agent-session-tracker/codex/ast "${CODEX_HOME:-$HOME/.codex}/skills/ast"
+```
+
+새 Codex 세션에서 `$ast 최근 세션 보여줘`를 입력하거나 `/skills`에서 `ast`를
+선택합니다. 기존 `$agent-session-tracker`도 동작합니다. 스킬 호출은 모델을 사용합니다.
+
+**`/ast` 입력:** 일반 메시지로 제출되면 훅이 같은 조회를 처리합니다. Codex CLI는
+등록되지 않은 슬래시 명령을 훅 실행 전에 차단하므로 `ast!`를 사용하거나
+`/ast` 앞에 공백을 하나 넣어 입력하세요. 네이티브 `/ast` 메뉴를 등록하는 기능은
+아닙니다. [Codex 입력 처리](https://github.com/openai/codex/blob/main/codex-rs/tui/src/bottom_pane/chat_composer.rs)
+
+제거는 `ast uninstall-hook --agent codex`입니다. 기본 `ast install-hook`과
+`ast uninstall-hook`은 계속 Claude Code 설정만 대상으로 합니다.
+
+### Claude Code에서 사용하기
+
 `ast install-hook`은 Claude Code 라이프사이클 훅을 `~/.claude/settings.json`에 등록합니다. 훅은 **선택사항** — 없어도 `ast`는 동작합니다 — 하지만 설치하면:
 
 1. **토큰 0**짜리 `done!` / `undone!` 프롬프트 명령
@@ -692,7 +741,7 @@ TUI에서 `Enter`를 누르면 **현재 쓰는 터미널 앱과 동일한 앱의
 ### 운영 노트
 
 - **`!`는 훅 없이도 동작.** Claude Code 2.x가 `~/.claude/sessions/<pid>.json`에 `status:"waiting"` / `waitingFor`를 직접 기록하므로 `ast`가 그대로 읽음.
-- **멱등 설치.** `ast install-hook` 재실행 시 ast 항목을 먼저 제거하고 재추가합니다. 다른 훅은 그대로 두며, `cst`의 훅도 여기에 해당합니다. ast는 명령이 `ast prompt-hook` / `ast status-hook`으로 끝나는 항목만 자기 것으로 인식하기 때문입니다.
+- **멱등 설치.** `ast install-hook` 재실행 시 ast의 핸들러만 제거하고 재추가합니다. `cst`의 훅과 같은 그룹 안에 있는 다른 핸들러도 보존합니다.
 - **자기 치유.** 레지스트리가 마지막 훅 이벤트보다 최신 `idle`을 보고하면 고착된 `!`는 자동으로 `◦`로 정정됨.
 - **cmux 호환.** cmux가 `--settings`로 자체 Claude 훅을 주입해도, Claude Code가 `~/.claude/settings.json`과 합산 로드하므로 ast 훅도 동일 session id로 정상 동작 — 충돌 없음.
 - **핫 리로드.** `tracker.py` 코드 변경은 즉시 반영(매번 `ast`를 새로 실행). `settings.json` 변경만 `/hooks`를 한 번 열거나 재시작해야 설정 워처가 리로드.

@@ -21,8 +21,9 @@ process is ended/job-state; a live one resolves overlay → registry → `●`):
 - **●** working — the agent is actively producing output.
 - **!** waiting — the agent is waiting for your input or a permission
   decision (this is where time leaks; from the Claude Code registry by
-  default, `ast install-hook` adds precision). Claude Code only — codex
-  exposes no waiting signal.
+  default, `ast install-hook` adds precision). Codex permission waiting is
+  available with `ast install-hook --agent codex`; without hooks it is inferred
+  as working/idle only.
 - **◦** idle — turn finished, process still alive.
 - **○** ended — process is gone (or was never registered).
 - **✓** done — user explicitly marked the session finished (`D`/`d`/`Ctrl-D`
@@ -183,11 +184,50 @@ ast logs <id>            # a bg session's recent output (claude logs <short>)
 # Hooks (install once, then automatic):
 ast install-hook   [--settings PATH]   # wire prompt-hook + status-hook
 ast uninstall-hook [--settings PATH]   # remove ast entries, keep foreign hooks
+ast install-hook --agent codex         # Codex: $CODEX_HOME/hooks.json
+ast uninstall-hook --agent codex       # remove only ast's Codex hooks
 ast prompt-hook                        # (internal) intercepts done!/undone!
 ast status-hook [event]                # (internal) records working/waiting/idle
 ```
 
 ## Prompt hook — `done!` / `undone!` with zero AI tokens
+
+### Codex setup and short commands
+
+Run `ast install-hook --agent codex` to register hooks in
+`$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`). Restart Codex, then
+review and trust the new hooks using `/hooks` in the CLI or **Settings > Hooks**
+in the desktop app. Hook trust is a Codex requirement; ast does not bypass it.
+Existing foreign hooks are preserved, including handlers sharing a matcher group.
+
+After setup, submit one of these as the entire prompt:
+
+- `done!` / `undone!`: mark or clear **this** Codex session using the hook's
+  `session_id`, even before the first transcript flush. Never infer self by cwd
+  or recency. `done! <id>` / `undone! <id>` resolve an explicit prefix; marking
+  another working session remains refused.
+- `ast!`: list the latest 10 Codex sessions locally. List flags work, e.g.
+  `ast! --agent all --days 7 --limit 20` (limit 1–50). This shortcut only lists;
+  it cannot resume, delete, or execute shell text.
+- `/ast`: the same list **when submitted as ordinary text**. Codex CLI rejects
+  unknown slash commands before hooks run; use `ast!`, or put a space before
+  `/ast`. Installing hooks does not register a native slash command.
+
+All these commands block the prompt before a model call. Other prompts pass
+through normally. If `done!` reaches the model, explain that hooks are missing,
+disabled, or untrusted; don't claim it was handled by the zero-token hook.
+
+For a short agent-assisted skill invocation, link the bundled `codex/ast`
+directory into `$CODEX_HOME/skills/ast`, then use `$ast <request>` (or `/skills`).
+The existing `$agent-session-tracker <request>` also works. `$ast` alone shows
+the latest 10 sessions across agents. These skill requests do invoke the model.
+
+Codex records working at ordinary prompt submission and tool use, waiting at
+`PermissionRequest`, idle at `Stop`/`Interrupt`, and clears status at `SessionEnd`.
+Subagent status hooks do not change their parent's state. Codex has no Claude
+`Notification` event; permission waiting does not cover every kind of input wait.
+
+### Claude Code setup
 
 `ast install-hook` adds two hook commands to `~/.claude/settings.json`:
 `ast prompt-hook` (on `UserPromptSubmit`) and `ast status-hook` (on
@@ -203,7 +243,7 @@ The hook runs `set_done()` locally and **blocks the prompt before it reaches
 the model** (0 tokens). Trigger must be the whole prompt — `I am done!` /
 `done! nice work` pass through untouched. Install is idempotent, and foreign
 hooks are preserved — a `cst` install's own entries included, since `ast` only
-claims commands ending in `ast prompt-hook` / `ast status-hook`. Code changes take effect
+claims its own `ast prompt-hook` / `ast status-hook` handlers. Code changes take effect
 immediately; only settings.json edits need `/hooks` opened once or a restart.
 
 ### Live status accuracy
@@ -322,12 +362,13 @@ Everything else is agent-agnostic. What each agent gets:
 | transcripts | `~/.claude/projects/**/*.jsonl` | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` (subagent rollouts hidden, like `subagents/`) |
 | list / search / show / export / TUI / done / rm | ✓ | ✓ |
 | resume (`Enter`, `ast resume`) | `claude --resume <id>` | `codex resume <uuid>` (skip-perm → `--dangerously-bypass-approvals-and-sandbox`) |
-| live status | pid registry + hooks | `thread-writer-locks/<uuid>.lock` flock probe: held → alive; rollout written < 90 s ago → `●`, else `◦`; `!` waiting is not detectable |
+| live status | pid registry + hooks | flock probe + rollout mtime; optional Codex hooks add working/idle and permission waiting |
 | origin (`--origin`) | `entrypoint` cli vs sdk-* | `source` cli/vscode = user; exec / mcp / subagent = agent |
 | relocate | moves the transcript into `projects/<encoded-new-cwd>/` | rewrites the cwd in place — a rollout's path encodes only its start date, so the file never moves (`--keep-original` is refused: there is no second location to copy to) |
 | backup / restore | archived under `projects/…` | archived under `codex/…` in the same tarball; each member restores to its own agent's root |
 | subagents | `subagents/*.jsonl` beside the transcript | rollouts whose `parent_thread_id` names this thread (guardian / subagent) |
-| attach / jobs / bg / hooks | ✓ | ✗ — Claude Code features with no codex counterpart, refused with `not supported for codex sessions` |
+| hooks | `ast install-hook` | `ast install-hook --agent codex` |
+| attach / jobs / bg | ✓ | ✗ — Claude Code features with no codex counterpart, refused with `not supported for codex sessions` |
 
 Codex messages are the rollout's `response_item`/`message` records with role
 `user` or `assistant`; `developer` records and codex's own user-role wrappers
