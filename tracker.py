@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 import tarfile
@@ -844,7 +845,7 @@ CODEX_AGENT = AgentSpec(
     session_id_of=_codex_session_id_of,
     iter_turns=_codex_iter_turns,
     resume_argv=_codex_resume_argv,
-    caps=frozenset({"resume", "relocate", "backup", "subagents"}),
+    caps=frozenset({"resume", "relocate", "backup", "subagents", "hooks"}),
     skip_perm_flag="--dangerously-bypass-approvals-and-sandbox",
     live_probe=codex_live_probe,
     live_info=codex_live_info,
@@ -5073,18 +5074,34 @@ def cmd_jobs(args: argparse.Namespace) -> int:
 HOOK_EVENT = "UserPromptSubmit"
 HOOK_CMD = "ast prompt-hook"
 SETTINGS_PATH_DEFAULT = CONFIG_DIR / "settings.json"
+CODEX_HOOKS_PATH_DEFAULT = CODEX_HOME / "hooks.json"
 PROMPT_HOOK_RE = re.compile(
     r"^(?:(done|undone)!|/(done|undone))(?:\s+(\S+))?\s*$")
+AST_PROMPT_RE = re.compile(r"^(?:ast!|/ast)(?:[ \t]+([^\r\n]*))?$")
 
 STATUS_HOOK_CMD = "ast status-hook"
 # Events wired by install-hook. PreToolUse/SessionStart intentionally omitted
 # (write amplification / false-working); the mapper still understands them.
 STATUS_HOOK_EVENTS = ("UserPromptSubmit", "Notification",
                       "PermissionRequest", "Stop", "SessionEnd")
+CODEX_STATUS_HOOK_EVENTS = ("PreToolUse", "PostToolUse", "PermissionRequest", "Stop",
+                           "Interrupt", "SessionEnd")
 
 
-def _our_hook_specs() -> dict[str, list[tuple[str, int]]]:
+def _our_hook_specs(agent: str = "claude") -> dict[str, list[tuple[str, int]]]:
     """event -> list of (command, timeout) entries ast manages."""
+    if agent == "codex":
+        # GUI callers need neither an inherited PATH nor an executable symlink.
+        base = [sys.executable, str(Path(__file__).resolve())]
+        prompt = shlex.join(base + ["prompt-hook", "--agent", "codex"])
+        status = shlex.join(base + ["status-hook", "--agent", "codex"])
+        # Codex runs handlers concurrently. The prompt handler records working
+        # only for prompts it lets through, so blocked commands can't leave a
+        # spurious working overlay (there will be no Stop event for them).
+        specs = {HOOK_EVENT: [(prompt, 25)]}
+        for event in CODEX_STATUS_HOOK_EVENTS:
+            specs[event] = [(status, 3 if event in ("SessionEnd", "Interrupt") else 10)]
+        return specs
     specs: dict[str, list[tuple[str, int]]] = {}
     specs.setdefault(HOOK_EVENT, []).append((HOOK_CMD, 25))  # prompt-hook
     for ev in STATUS_HOOK_EVENTS:
@@ -5095,26 +5112,62 @@ def _our_hook_specs() -> dict[str, list[tuple[str, int]]]:
 def _is_our_hook_cmd(cmd: str) -> bool:
     """True for our own hook commands, so install-hook / uninstall-hook stay
     idempotent and leave foreign entries (ast's included) alone."""
-    c = (cmd or "").strip()
-    return (c.endswith("ast prompt-hook")
-            or c.endswith("ast status-hook"))
+    if not isinstance(cmd, str):
+        return False
+    try:
+        argv = shlex.split(cmd or "")
+    except ValueError:
+        return False
+    if argv[-2:] in (["--agent", "codex"], ["--agent", "claude"]):
+        argv = argv[:-2]
+    if len(argv) < 2 or argv[-1] not in ("prompt-hook", "status-hook"):
+        return False
+    if len(argv) == 2 and Path(argv[0]).name == "ast":
+        return True
+    return (len(argv) == 3 and Path(argv[0]).name.startswith("python")
+            and argv[1] == str(Path(__file__).resolve()))
+
+
+def _ast_prompt_output(arguments: str, agent: str) -> str:
+    """Read-only list shortcut; never run arbitrary shell text or a TUI."""
+    import io
+    from contextlib import redirect_stdout, redirect_stderr
+    buf = io.StringIO()
+    with redirect_stdout(buf), redirect_stderr(buf):
+        try:
+            words = shlex.split(arguments)
+            opts = _build_parser().parse_args(["list", "--agent", agent,
+                                                "--limit", "10"] + words)
+            if opts.limit <= 0 or opts.limit > 50:
+                print("[ast] --limit must be between 1 and 50 in a prompt shortcut.")
+            else:
+                cmd_list(opts)
+        except ValueError as exc:
+            print(f"[ast] {exc}")
+        except SystemExit:
+            pass  # argparse help/errors belong in the hook's one JSON response
+    return buf.getvalue().strip()
 
 
 def cmd_prompt_hook(args: argparse.Namespace) -> int:
-    raw = sys.stdin.read()
     try:
+        raw = sys.stdin.read()
         data = json.loads(raw) if raw.strip() else {}
-    except json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return 0  # unparseable payload — let the prompt go through
+    if not isinstance(data, dict):
+        return 0
+    if any(not isinstance(data.get(k, ""), str)
+           for k in ("prompt", "session_id")):
+        return 0
+    if any(data.get(k) is not None and not isinstance(data[k], str)
+           for k in ("cwd", "transcript_path")):
+        return 0
     prompt = (data.get("prompt") or "").strip()
     session_id = (data.get("session_id") or "").strip()
-
-    m = PROMPT_HOOK_RE.match(prompt)
-    if not m:
-        return 0  # not our command — normal prompt, goes to the model
-
-    action = m.group(1) or m.group(2)         # "done" | "undone"
-    raw_target = m.group(3) or session_id     # explicit arg wins, else self
+    agent = getattr(args, "agent", "claude")
+    if agent == "codex" and data.get("agent_id"):
+        return 0  # a child hook's session_id identifies its parent
 
     def _block(reason: str) -> int:
         print(json.dumps({"decision": "block", "reason": reason},
@@ -5122,11 +5175,32 @@ def cmd_prompt_hook(args: argparse.Namespace) -> int:
         return 0
 
     note = "Note: this prompt was not sent to the model (0 tokens)."
+    ast_match = AST_PROMPT_RE.fullmatch(prompt)
+    if ast_match:
+        return _block(_ast_prompt_output(ast_match.group(1) or "", agent)
+                      + "\n" + note)
+
+    m = PROMPT_HOOK_RE.match(prompt)
+    if not m:
+        if agent == "codex" and session_id:
+            set_status(session_id, "working", HOOK_EVENT)
+        return 0  # not our command — normal prompt, goes to the model
+
+    action = m.group(1) or m.group(2)         # "done" | "undone"
+    raw_target = m.group(3) or session_id     # explicit arg wins, else self
+
     if not raw_target:
         return _block(
             f"[ast {action}] no session id — payload had no session_id and "
             f"none was given. Nothing changed.\n{note}")
-    target = find_session(raw_target)
+    if agent == "codex" and not m.group(3):
+        # UserPromptSubmit may precede the first rollout flush. The hook's
+        # session_id is authoritative for self-done; never guess by cwd/time.
+        target = SessionMeta(session_id=session_id,
+                             path=Path(data.get("transcript_path") or "."),
+                             cwd=data.get("cwd") or "")
+    else:
+        target = find_session(raw_target)
     if target is None:
         return _block(
             f"[ast {action}] failed — no session matching '{raw_target}' "
@@ -5162,9 +5236,11 @@ _HOOK_STATE = {
     "SessionStart": "working",
     "UserPromptSubmit": "working",
     "PreToolUse": "working",
+    "PostToolUse": "working",
     "Notification": "waiting",
     "PermissionRequest": "waiting",
     "Stop": "idle",
+    "Interrupt": "idle",
     "SessionEnd": "-",   # sentinel: clear the overlay entry
 }
 
@@ -5185,6 +5261,13 @@ def cmd_status_hook(args: argparse.Namespace) -> int:
         return 0
     if not isinstance(data, dict):
         return 0
+    # Codex subagent hook payloads identify their *parent* in session_id.
+    # A child's Stop must not mark the still-running parent idle.
+    if getattr(args, "agent", "claude") == "codex" and data.get("agent_id"):
+        return 0
+    if any(not isinstance(data.get(k, ""), str)
+           for k in ("hook_event_name", "session_id")):
+        return 0
     event = (data.get("hook_event_name")
              or getattr(args, "event", None) or "").strip()
     sid = (data.get("session_id") or "").strip()
@@ -5203,9 +5286,12 @@ def _load_settings(path: Path) -> tuple[dict | None, str | None]:
     except OSError:
         return None, f"(settings file not found: {path})"
     try:
-        return json.loads(text), None
+        data = json.loads(text)
     except json.JSONDecodeError as e:
         return None, f"(settings file is not valid JSON: {e})"
+    if not isinstance(data, dict) or not isinstance(data.get("hooks", {}), dict):
+        return None, "(settings and hooks must be JSON objects)"
+    return data, None
 
 
 def _write_settings(path: Path, data: dict) -> None:
@@ -5218,17 +5304,33 @@ def _write_settings(path: Path, data: dict) -> None:
 def _strip_our_entries(hook_list: list) -> tuple[list, int]:
     kept, removed = [], 0
     for entry in hook_list:
-        cmds = [h.get("command", "") for h in (entry.get("hooks") or [])
-                if isinstance(h, dict)]
-        if any(_is_our_hook_cmd(c) for c in cmds):
+        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            kept.append(entry)
+            continue
+        handlers = entry["hooks"]
+        foreign = [h for h in handlers
+                   if not (isinstance(h, dict) and h.get("type") == "command"
+                           and _is_our_hook_cmd(h.get("command", "")))]
+        if len(foreign) != len(handlers):
             removed += 1
+            if foreign:
+                kept.append({**entry, "hooks": foreign})
             continue
         kept.append(entry)
     return kept, removed
 
 
+def _hook_settings_path(args: argparse.Namespace) -> Path:
+    explicit = getattr(args, "settings", None)
+    if explicit:
+        return Path(explicit).expanduser()
+    return (CODEX_HOOKS_PATH_DEFAULT if getattr(args, "agent", "claude") == "codex"
+            else SETTINGS_PATH_DEFAULT)
+
+
 def cmd_install_hook(args: argparse.Namespace) -> int:
-    path = Path(os.path.expanduser(args.settings))
+    agent = getattr(args, "agent", "claude")
+    path = _hook_settings_path(args)
     if not path.exists():
         # No settings file yet — start from an empty structure and create it so
         # a first-time install doesn't fail on a missing ~/.claude/settings.json.
@@ -5241,7 +5343,7 @@ def cmd_install_hook(args: argparse.Namespace) -> int:
             return 1
         work, _ = _load_settings(path)            # independent copy to mutate
     hooks = work.setdefault("hooks", {})
-    specs = _our_hook_specs()
+    specs = _our_hook_specs(agent)
     other_total = 0
     for event, cmds in specs.items():
         lst = hooks.get(event, [])
@@ -5264,19 +5366,21 @@ def cmd_install_hook(args: argparse.Namespace) -> int:
           f"  events: {', '.join(specs)}\n"
           f"  ({other_total} foreign hook entr"
           f"{'y' if other_total == 1 else 'ies'} preserved)\n"
-          f"  Open /hooks once (or restart) if it doesn't fire immediately.")
+          + ("  Restart Codex, then open /hooks to review and trust these hooks."
+             if agent == "codex" else
+             "  Open /hooks once (or restart) if it doesn't fire immediately."))
     return 0
 
 
 def cmd_uninstall_hook(args: argparse.Namespace) -> int:
-    path = Path(os.path.expanduser(args.settings))
+    path = _hook_settings_path(args)
     data, err = _load_settings(path)
     if data is None:
         print(err, file=sys.stderr)
         return 1
     hooks = data.get("hooks") or {}
     total_removed = 0
-    for event in _our_hook_specs():
+    for event in _our_hook_specs(getattr(args, "agent", "claude")):
         lst = hooks.get(event)
         if not isinstance(lst, list):
             continue
@@ -9348,7 +9452,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_phook = sub.add_parser(
         "prompt-hook",
-        help="UserPromptSubmit hook: intercept /done & /undone (0 tokens)")
+        help="UserPromptSubmit hook: done!/undone! and ast! (0 tokens)")
+    p_phook.add_argument("--agent", choices=("claude", "codex"), default="claude",
+                         help="hook host (default: claude)")
     p_phook.set_defaults(func=cmd_prompt_hook)
 
     p_shook = sub.add_parser(
@@ -9357,22 +9463,28 @@ def _build_parser() -> argparse.ArgumentParser:
     p_shook.add_argument("event", nargs="?", default=None,
                          help="event name (fallback when stdin has no "
                               "hook_event_name)")
+    p_shook.add_argument("--agent", choices=("claude", "codex"), default="claude",
+                         help="hook host (default: claude)")
     p_shook.set_defaults(func=cmd_status_hook)
 
     p_ihook = sub.add_parser(
         "install-hook",
-        help="wire prompt-hook into ~/.claude/settings.json (idempotent)")
-    p_ihook.add_argument("--settings", default=str(SETTINGS_PATH_DEFAULT),
-                         help="settings.json path "
-                              "(default: ~/.claude/settings.json)")
+        help="install Claude Code or Codex lifecycle hooks (idempotent)")
+    p_ihook.add_argument("--agent", choices=("claude", "codex"), default="claude",
+                         help="hook host (default: claude)")
+    p_ihook.add_argument("--settings", default=None,
+                         help="override settings path (default: Claude settings.json "
+                              "or $CODEX_HOME/hooks.json for --agent codex)")
     p_ihook.set_defaults(func=cmd_install_hook)
 
     p_uhook = sub.add_parser(
         "uninstall-hook",
-        help="remove prompt-hook from settings.json (keeps other hooks)")
-    p_uhook.add_argument("--settings", default=str(SETTINGS_PATH_DEFAULT),
-                         help="settings.json path "
-                              "(default: ~/.claude/settings.json)")
+        help="remove ast's Claude Code or Codex hooks (keeps other hooks)")
+    p_uhook.add_argument("--agent", choices=("claude", "codex"), default="claude",
+                         help="hook host (default: claude)")
+    p_uhook.add_argument("--settings", default=None,
+                         help="override settings path (default: Claude settings.json "
+                              "or $CODEX_HOME/hooks.json for --agent codex)")
     p_uhook.set_defaults(func=cmd_uninstall_hook)
 
     return ap

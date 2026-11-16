@@ -235,10 +235,11 @@ class TestCommands(_Base):
         self.assertIn("rewrite in place", out)
 
     def test_claude_only_capabilities_stay_gated(self):
-        """attach / jobs / hooks are Claude Code features with no codex
+        """attach / jobs are Claude Code features with no codex
         counterpart, so require_cap still refuses them."""
         target = tk.find_session(SID[:8])
-        for cap in ("attach", "jobs", "hooks"):
+        self.assertTrue(tk.require_cap(target, "hooks", "hooks"))
+        for cap in ("attach", "jobs"):
             err = io.StringIO()
             with redirect_stderr(err):
                 allowed = tk.require_cap(target, cap, cap)

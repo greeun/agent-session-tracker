@@ -40,9 +40,50 @@ ast --version
 
 # 4. (optional) wire the 0-token done!/undone! prompt hook + status precision layer
 ast install-hook
+# Codex hooks (optional): done!, undone!, and ast! inside Codex
+ast install-hook --agent codex
 ```
 
 Requires `~/.local/bin` in `PATH` and Python 3.10+.
+
+### Inside Codex
+
+After `ast install-hook --agent codex`, restart Codex and review/trust the new
+hooks in `/hooks` (CLI) or **Settings > Hooks** (desktop). Codex requires this
+review before user hooks can run. See the [Codex hook contract](https://learn.chatgpt.com/docs/hooks).
+
+Enter a whole prompt:
+
+```text
+done!                              # mark this session done
+undone!                            # clear this session's done flag
+done! abcd1234                     # mark an explicit session (prefix supported)
+ast!                               # latest 10 Codex sessions, no model call
+ast! --agent all --days 7 --limit 20
+```
+
+These shortcuts run locally and prevent a model request. `ast!` accepts only
+`ast list` flags, with a limit of 1–50. Ordinary prompts continue normally.
+Codex hooks also record permission waiting and working/idle transitions.
+
+For agent-assisted requests, use `$agent-session-tracker <request>`. To add the
+short `$ast` skill, link this repo's bundled alias (replace `/path/to`):
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+ln -s /path/to/agent-session-tracker/codex/ast "${CODEX_HOME:-$HOME/.codex}/skills/ast"
+```
+
+Start a new Codex session, then enter `$ast show recent sessions` or select
+`ast` from `/skills`. A skill request uses the model; `ast!` does not.
+
+**Slash syntax:** hooks also handle `/ast` when it is submitted as ordinary
+text. Codex CLI rejects unregistered slash commands before hooks run; use
+`ast!`, or type a space before `/ast`. This does not add a native `/ast` menu
+entry. [Codex input handling](https://github.com/openai/codex/blob/main/codex-rs/tui/src/bottom_pane/chat_composer.rs)
+
+Remove these hooks with `ast uninstall-hook --agent codex`; foreign hooks and
+transcripts are preserved. The default hook commands still target Claude Code.
 
 ### Already running `cst`?
 
@@ -128,12 +169,13 @@ the TUI `a` key narrow the view.
 | Transcripts | `~/.claude/projects/**/*.jsonl` | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` (default `~/.codex`; subagent rollouts hidden like `subagents/`) |
 | list / search / show / export / TUI / done / rm | ✓ | ✓ |
 | Resume (`Enter`, `ast resume`) | `claude --resume <id>` | `codex resume <uuid>` (skip-perm → `--dangerously-bypass-approvals-and-sandbox`) |
-| Live status | pid registry + hook overlay | flock probe on `thread-writer-locks/<uuid>.lock`: held → alive; rollout written < 90 s ago → `●`, else `◦`. `!` waiting is not detectable for codex |
+| Live status | pid registry + hook overlay | flock probe + rollout mtime; optional Codex hooks add working/idle and permission waiting |
 | Origin (`--origin`) | `entrypoint` cli vs `sdk-*` | `source` cli / vscode → user; exec / mcp / subagent → agent |
 | Relocate (`ast relocate`) | Moves the transcript into `projects/<encoded-new-cwd>/` | Rewrites the recorded cwd in place — a rollout's path encodes only its start date, so the file never moves. `--keep-original` is refused rather than ignored: there is no second location to copy to, so honoring it would mean rewriting the very file it asks to preserve |
 | Backup / restore | Archived under `projects/…` | Archived under `codex/…` of the same tarball; each member restores to its own agent's root |
 | Subagents (`ast subagents`) | `subagents/*.jsonl` beside the transcript | Rollouts whose `parent_thread_id` names this thread (codex's guardian / subagent threads) |
-| attach / jobs / bg / hooks | ✓ | ✗ — Claude Code features with no codex counterpart (`not supported for codex sessions`) |
+| hooks | `ast install-hook` | `ast install-hook --agent codex` |
+| attach / jobs / bg | ✓ | ✗ — Claude Code features with no codex counterpart (`not supported for codex sessions`) |
 
 Codex turns are the rollout's `response_item`/`message` records with role
 `user` or `assistant`; `developer` records and codex's own user-role wrappers
@@ -697,7 +739,7 @@ Equivalent manual entry (one event shown):
 ### Operational notes
 
 - **`!` works without hooks.** Claude Code 2.x already writes `status:"waiting"` / `waitingFor` into `~/.claude/sessions/<pid>.json`; `ast` reads it directly.
-- **Idempotent install.** Re-running `ast install-hook` strips ast entries first, then re-adds them. Foreign hooks are untouched — including `cst`'s, since ast only claims commands ending in `ast prompt-hook` / `ast status-hook`.
+- **Idempotent install.** Re-running `ast install-hook` strips ast's own handlers first, then re-adds them. Foreign handlers are kept, including `cst`'s and handlers sharing a matcher group with ast.
 - **Self-healing overlay.** If the registry reports a newer `idle` event than the last hook event, a stale `!` will collapse to `◦` automatically.
 - **cmux compatibility.** cmux injects its own Claude hooks via `--settings`; Claude Code merges them additively with `~/.claude/settings.json`, so ast's hooks still fire on the same session id — no conflict.
 - **Hot reload.** Code changes to `tracker.py` take effect immediately (each hook invocation re-runs `ast`). Only `settings.json` changes need `/hooks` opened once (or a restart) so the settings watcher reloads.
