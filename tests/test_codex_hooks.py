@@ -135,6 +135,76 @@ class TestCodexHooks(unittest.TestCase):
         overlay = next(self.ast.glob("status.*.json"))
         self.assertEqual(json.loads(overlay.read_text())[SID]["state"], "idle")
 
+    def workflow_registry(self, commands=None):
+        skill = self.root / "workflows 한글" / "rw" / "SKILL.md"
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text("---\nname: rw\ndescription: test workflow\n---\nOnly a fixture.\n")
+        self.ast.mkdir(parents=True, exist_ok=True)
+        (self.ast / "prompt-commands.json").write_text(json.dumps({
+            "commands": commands if commands is not None else {"rw": str(skill)}}))
+        return skill
+
+    def test_registered_workflow_routes_to_model_without_running_actions(self):
+        skill = self.workflow_registry()
+        for prompt in ("rw!", "rw! develop --no-push", " /rw develop --squash"):
+            result = self.hook(prompt)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            body = json.loads(result.stdout)
+            self.assertNotIn("decision", body)
+            context = body["hookSpecificOutput"]
+            self.assertEqual(context["hookEventName"], "UserPromptSubmit")
+            self.assertIn(str(skill), context["additionalContext"])
+            self.assertIn(SID, context["additionalContext"])
+            self.assertNotIn("--no-push", context["additionalContext"])
+            self.assertFalse(self.state().get("done"))
+        overlay = next(self.ast.glob("status.*.json"))
+        self.assertEqual(json.loads(overlay.read_text())[SID]["state"], "working")
+
+    def test_workflow_arguments_stay_user_input_and_never_reach_a_shell(self):
+        self.workflow_registry()
+        arguments = '; touch owned $(touch owned2) `touch owned3`'
+        result = self.hook(f"rw! {arguments}")
+        context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn(arguments, context)
+        for name in ("owned", "owned2", "owned3"):
+            self.assertFalse((self.root / name).exists())
+
+    def test_workflow_is_opt_in_exact_single_line_and_codex_only(self):
+        self.assertEqual(self.hook("rw!").stdout, "")
+        self.workflow_registry()
+        for prompt in ("please run rw!", "rw!\ntouch owned", "rw!foo", "unknown!"):
+            self.assertEqual(self.hook(prompt).stdout, "")
+        result = self.cli("prompt-hook", payload={"prompt": "rw!", "session_id": SID})
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.hook("rw!", agent_id=OTHER).stdout, "")
+
+    def test_invalid_registered_path_blocks_without_recording_working(self):
+        for value in (str(self.root / "missing" / "SKILL.md"), "relative/SKILL.md",
+                      str(self.root / "script.py"), 7, "bad\u0000/SKILL.md"):
+            self.workflow_registry({"rw": value})
+            body = json.loads(self.hook("rw!").stdout)
+            self.assertEqual(body["decision"], "block")
+            self.assertIn("nothing ran", body["reason"])
+        self.assertFalse(list(self.ast.glob("status.*.json")))
+        self.assertFalse(self.state().get("done"))
+
+    def test_workflow_registry_cannot_override_local_builtins(self):
+        skill = self.workflow_registry()
+        self.workflow_registry({name: str(skill) for name in ("done", "undone", "ast")})
+        for prompt in ("done!", "undone!", "ast!"):
+            body = json.loads(self.hook(prompt).stdout)
+            self.assertEqual(body["decision"], "block")
+            self.assertIn("0 tokens", body["reason"])
+            self.assertNotIn("hookSpecificOutput", body)
+
+    def test_malformed_workflow_registry_does_not_break_normal_prompts(self):
+        self.ast.mkdir(parents=True)
+        registry = self.ast / "prompt-commands.json"
+        for value in ("{oops", "[]", '{"commands": []}', " " * 65537):
+            registry.write_text(value)
+            self.assertEqual(self.hook("고쳐줘").stdout, "")
+            self.assertEqual(self.hook("rw!").stdout, "")
+
     def test_status_events_and_subagents(self):
         for event, state in (("PermissionRequest", "waiting"), ("PostToolUse", "working"),
                              ("Interrupt", "idle"), ("Stop", "idle")):

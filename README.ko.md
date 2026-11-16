@@ -695,6 +695,20 @@ ln -s /path/to/agent-session-tracker/codex/ast "${CODEX_HOME:-$HOME/.codex}/skil
 `/ast` 앞에 공백을 하나 넣어 입력하세요. 네이티브 `/ast` 메뉴를 등록하는 기능은
 아닙니다. [Codex 입력 처리](https://github.com/openai/codex/blob/main/codex-rs/tui/src/bottom_pane/chat_composer.rs)
 
+**모델을 사용하는 워크플로 단축키:** `~/.ast/prompt-commands.json`
+(`AST_HOME` 설정 시 그 경로)에 아래처럼 등록하면 기존 Codex 프롬프트 훅이
+`rw! develop --no-push` 같은 입력을 해당 스킬로 연결합니다.
+
+```json
+{"commands": {"rw": "/absolute/path/to/rw/SKILL.md"}}
+```
+
+훅은 스킬 경로와 현재 세션 ID를 모델에 전달하고, 실제 작업은 모델이 수행합니다.
+따라서 `done!`와 달리 모델 토큰을 사용합니다. 인자는 사용자 입력으로 유지하며
+훅이 셸 코드로 실행하지 않습니다. 정확히 일치하는 한 줄 입력만 처리하고,
+등록된 파일이 없으면 작업을 시작하지 않고 안내합니다. `done!`·`undone!`·`ast!`는
+기존 로컬 처리를 유지합니다. 훅 설치·활성화·신뢰는 여전히 필요합니다.
+
 제거는 `ast uninstall-hook --agent codex`입니다. 기본 `ast install-hook`과
 `ast uninstall-hook`은 계속 Claude Code 설정만 대상으로 합니다.
 

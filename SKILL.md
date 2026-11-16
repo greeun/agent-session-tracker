@@ -217,6 +217,22 @@ All these commands block the prompt before a model call. Other prompts pass
 through normally. If `done!` reaches the model, explain that hooks are missing,
 disabled, or untrusted; don't claim it was handled by the zero-token hook.
 
+Optional model-assisted commands can be registered in
+`$AST_HOME/prompt-commands.json` (default `~/.ast/prompt-commands.json`):
+
+```json
+{"commands": {"rw": "/absolute/path/to/rw/SKILL.md"}}
+```
+
+Then `rw! [arguments]` (or `/rw` submitted as ordinary text) adds the skill's
+path and the hook's authoritative session ID as model context. Arguments
+remain in the user prompt. These workflows **do use the model**; the hook
+does not execute shell commands or perform their actions. Only exact,
+single-line commands are routed. Missing/invalid registered skill files block
+the request with a notice. Reserved `done!`, `undone!`, and `ast!` keep their
+local-only behavior. Registration does not replace Codex hook installation,
+enablement, or trust. Do not claim a workflow ran just because routing worked.
+
 For a short agent-assisted skill invocation, link the bundled `codex/ast`
 directory into `$CODEX_HOME/skills/ast`, then use `$ast <request>` (or `/skills`).
 The existing `$agent-session-tracker <request>` also works. `$ast` alone shows

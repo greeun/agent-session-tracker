@@ -82,6 +82,21 @@ text. Codex CLI rejects unregistered slash commands before hooks run; use
 `ast!`, or type a space before `/ast`. This does not add a native `/ast` menu
 entry. [Codex input handling](https://github.com/openai/codex/blob/main/codex-rs/tui/src/bottom_pane/chat_composer.rs)
 
+**Optional model-assisted workflow shortcuts:** register absolute skill paths
+in `$AST_HOME/prompt-commands.json` (default `~/.ast/prompt-commands.json`):
+
+```json
+{"commands": {"rw": "/absolute/path/to/rw/SKILL.md"}}
+```
+
+Then submit `rw! develop --no-push` as the whole prompt. The existing Codex
+prompt hook adds the skill path and current session ID as model context;
+the model performs the workflow. Arguments remain user input and are never
+executed by the hook. These shortcuts use model tokens. Only exact single-line
+commands are routed; a missing registered skill blocks the request with a
+notice. `done!`, `undone!`, and `ast!` retain their local-only behavior.
+Hook installation, enablement, and trust are still required.
+
 Remove these hooks with `ast uninstall-hook --agent codex`; foreign hooks and
 transcripts are preserved. The default hook commands still target Claude Code.
 

@@ -5078,6 +5078,9 @@ CODEX_HOOKS_PATH_DEFAULT = CODEX_HOME / "hooks.json"
 PROMPT_HOOK_RE = re.compile(
     r"^(?:(done|undone)!|/(done|undone))(?:\s+(\S+))?\s*$")
 AST_PROMPT_RE = re.compile(r"^(?:ast!|/ast)(?:[ \t]+([^\r\n]*))?$")
+WORKFLOW_PROMPT_RE = re.compile(
+    r"^(?:([a-z][a-z0-9-]{0,63})!|/([a-z][a-z0-9-]{0,63}))"
+    r"(?:[ \t]+[^\r\n]*)?$")
 
 STATUS_HOOK_CMD = "ast status-hook"
 # Events wired by install-hook. PreToolUse/SessionStart intentionally omitted
@@ -5149,6 +5152,56 @@ def _ast_prompt_output(arguments: str, agent: str) -> str:
     return buf.getvalue().strip()
 
 
+def _codex_workflow_prompt(prompt: str, session_id: str) -> dict | None:
+    """Route explicitly registered local workflows to the model, never a shell.
+
+    Registration is optional and lives in ast's own home; it neither changes
+    Codex hook trust/config nor assumes a particular skills/repository layout.
+    Arguments stay in the original user prompt, not elevated hook context.
+    """
+    match = WORKFLOW_PROMPT_RE.fullmatch(prompt)
+    if not match:
+        return None
+    name = match.group(1) or match.group(2)
+    if name in ("done", "undone", "ast"):
+        return None  # built-ins retain their existing local-only semantics
+    registry = CACHE_DIR / "prompt-commands.json"
+    try:
+        with registry.open() as stream:
+            raw = stream.read(65537)
+        if len(raw) > 65536:
+            return None
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    commands = data.get("commands") if isinstance(data, dict) else None
+    if not isinstance(commands, dict) or name not in commands:
+        return None
+    value = commands[name]
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        return {"decision": "block", "reason": f"[ast {name}] invalid workflow path; nothing ran."}
+    path = Path(value).expanduser()
+    try:
+        valid = path.is_absolute() and path.name == "SKILL.md" and path.is_file()
+    except (OSError, ValueError):
+        valid = False
+    if not valid:
+        return {"decision": "block", "reason": f"[ast {name}] registered SKILL.md is missing or invalid; nothing ran."}
+    return {"hookSpecificOutput": {
+        "hookEventName": HOOK_EVENT,
+        "additionalContext": (
+            f"The user invoked the registered local workflow {name!r}. "
+            f"Read and follow its SKILL.md at {json.dumps(str(path), ensure_ascii=False)}. "
+            "Use this conversation as the session context. Text after the command "
+            "in the original user prompt is the workflow's $ARGUMENTS; keep it as "
+            "user input, never execute it directly as shell code. "
+            f"The authoritative current Codex session_id from this hook is {json.dumps(session_id)}. "
+            "Use that exact ID if this workflow requires self-session identification. "
+            "The hook only routed the request: no workflow actions have run yet. "
+            "This workflow uses the model; the zero-token done! behavior does not apply."
+        )}}
+
+
 def cmd_prompt_hook(args: argparse.Namespace) -> int:
     try:
         raw = sys.stdin.read()
@@ -5182,6 +5235,13 @@ def cmd_prompt_hook(args: argparse.Namespace) -> int:
 
     m = PROMPT_HOOK_RE.match(prompt)
     if not m:
+        if agent == "codex":
+            workflow = _codex_workflow_prompt(prompt, session_id)
+            if workflow is not None:
+                if workflow.get("decision") != "block" and session_id:
+                    set_status(session_id, "working", HOOK_EVENT)
+                print(json.dumps(workflow, ensure_ascii=False))
+                return 0
         if agent == "codex" and session_id:
             set_status(session_id, "working", HOOK_EVENT)
         return 0  # not our command — normal prompt, goes to the model
