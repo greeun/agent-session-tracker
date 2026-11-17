@@ -503,6 +503,8 @@ after the write loop, for every written codex `.jsonl` (`codex_written`):
 
 ## Development Notes
 
+- For headless curses tests, set `TERM=xterm-256color` on the test command when the runner supplies `TERM=dumb`; the picker requires cursor and color capabilities.
+
 - Tests live under `tests/` (stdlib `unittest`, run with `python3 -m pytest -q` or `python3 -m unittest discover -s tests`) — one `test_*.py` per feature; add one when you add a feature. They load `tracker.py` via `importlib` and stub `CACHE_DIR`/`STATE_PATH` into a tempdir for state tests. **Any test that stubs `PROJECTS_DIR` must also stub `CODEX_SESSIONS_DIR` / `CODEX_LOCKS_DIR`** (the session universe now spans every agent; an unstubbed codex root leaks the real `~/.codex` rollouts into the fixture and slows the run)
 - `tests/test_golden_cli.py` + `tests/golden/*.txt` are byte-for-byte characterisation snapshots of list/json/search/show/export/stats/resume over a fixed fixture set. A deliberate output change must regenerate them with `AST_GOLDEN_UPDATE=1 python3 -m unittest tests.test_golden_cli` and the golden diff is reviewed like code; any other change must leave them untouched
 - The TUI itself requires a real TTY — `_pick_ui` can't run from non-interactive Bash calls or agent tool calls (verify its curses layout headlessly via `pty.fork` + `getyx`)

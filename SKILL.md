@@ -1,7 +1,7 @@
 ---
 name: agent-session-tracker
 description: Track live/waiting/ended/done status of Claude Code sessions — and Codex CLI sessions and ChatGPT desktop app conversations alongside them. List, search, resume, export, backup, restore sessions via `ast` CLI or TUI. Use when user says "list sessions", "세션 상태", "ast", "session tracker", "codex 세션", "chatgpt 세션", "ChatGPT 앱 대화", or wants to resume/search/export/backup sessions.
-version: 1.6.0
+version: 1.7.0
 ---
 
 # agent-session-tracker
@@ -30,7 +30,7 @@ process is ended/job-state; a live one resolves overlay → registry → `●`):
   in TUI, `ast done <id>`, or the `done!` prompt hook). Persists in
   `~/.ast/state.json`.
 
-Main script: `tracker.py` (stdlib only, Python 3.10+, v1.6.0). Installed as
+Main script: `tracker.py` (stdlib only, Python 3.10+, v1.7.0). Installed as
 `~/.local/bin/ast`. All `~/.claude/...` data paths honor `$CLAUDE_CONFIG_DIR`
 (same convention as Claude Code itself) and `~/.codex/...` honors
 `$CODEX_HOME` (Codex's own convention); ast's own files live under `~/.ast`
@@ -294,7 +294,9 @@ stale `!` self-heals to `◦` to avoid a stuck state.
 - **`v` / `V`** — preview modal (scrollable transcript). The metadata header
   (Session / Status / Cwd / Branch / Started) is **pinned** at the top of the
   modal, so only the transcript below the rule scrolls and the session stays
-  identified at any scroll offset. Inside it `←`/`→` (or `‹`/`›`, `[`/`]`)
+  identified at any scroll offset. `g`/`Home` jumps to the beginning, and
+  `G`/`End`/`Ctrl-E` jumps to the end of the transcript.
+  Inside it `←`/`→` (or `‹`/`›`, `[`/`]`)
   step to the prev/next session in the list without closing, `d`/`Ctrl-D`
   toggles done on the previewed session (same ● working guard as the list;
   the scroll position and any active search are kept), and `Del` deletes the
