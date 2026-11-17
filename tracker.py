@@ -5584,7 +5584,7 @@ HELP_LINES = [
     "  m / M                  cycle device view (all→local→other Macs; M backwards) — saved",
     "  i / I                  auto-rescan interval popup (Off/5/10/30/60/120s)",
     "  v / V                  preview the focused session (scroll/search modal)",
-    "                         ↑↓ scroll · PgUp/PgDn page · g/G top/bottom · q/Esc/v close",
+    "                         ↑↓ scroll · PgUp/PgDn page · g top · G/End/Ctrl-E bottom · q/Esc/v close",
     "                         ←/→ (or ‹ › / [ ]) prev/next session in list",
     "                         / full-text search (literal, case-insensitive)",
     "                         n / N next/prev match · Esc clear search then close",
@@ -6027,7 +6027,7 @@ def _preview_modal(stdscr, items, sel: int, ctx, on_status_change=None):
                     prompt = f" /{query}  {cnt}  n/N next/prev · / edit · Esc clear "
                 else:
                     nav = " · ←→ session" if multi else ""
-                    prompt = f" ↑↓ scroll · PgUp/PgDn · g/G{nav} · / search · d done · Del delete · q/Esc/v close "
+                    prompt = f" ↑↓ scroll · PgUp/PgDn · g top · G/^E end{nav} · / search · d done · Del delete · q/Esc/v close "
                 try:
                     win.addnstr(box_h - 2, 2, prompt, box_w - 4 - len(pos) - 1, prompt_attr)
                     win.addnstr(box_h - 2, max(2, box_w - 2 - len(pos)), pos, len(pos), dim_attr)
@@ -6102,7 +6102,7 @@ def _preview_modal(stdscr, items, sel: int, ctx, on_status_change=None):
                 top = min(max_top, top + body_h)
             elif ch in (curses.KEY_HOME, ord('g')):
                 top = head_h
-            elif ch in (curses.KEY_END, ord('G')):
+            elif ch in (curses.KEY_END, ord('G'), 5):  # End / G / Ctrl-E — bottom
                 top = max_top
             elif ch in (ord('d'), ord('D'), 4):  # d / D / Ctrl-D — toggle done on viewed session
                 st = ctx.resolve(target.session_id)

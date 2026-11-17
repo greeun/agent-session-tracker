@@ -606,7 +606,7 @@ A curses picker with fzf-style filter, status glyphs, modals, and action keys. *
 | `Space` | Toggle mark on current row |
 | `Ctrl-A` | Toggle marks on **all** visible rows |
 | `Ctrl-X` | Clear all marks |
-| **`v`** / **`V`** | Preview the focused session (scrollable modal; the metadata header stays pinned at the top). Inside: `↑↓/j/k` scroll · `PgUp/PgDn/Space` page · `g/G` top/bottom · `←/→` prev/next session · `d/Ctrl-D` toggle done on previewed session (scroll position kept) · `Del` delete previewed session (confirm in place; cancel returns to preview) · `q/Esc/v` close |
+| **`v`** / **`V`** | Preview the focused session (scrollable modal; the metadata header stays pinned at the top). Inside: `↑↓/j/k` scroll · `PgUp/PgDn/Space` page · `g/Home` top · `G/End/Ctrl-E` bottom · `←/→` prev/next session · `d/Ctrl-D` toggle done on previewed session (scroll position kept) · `Del` delete previewed session (confirm in place; cancel returns to preview) · `q/Esc/v` close |
 | **`e`** / **`E`** | Export focused session to `./<id>.md` (toast shows the path) |
 | **`o`** / **`O`** | Open the focused session's **folder** in a new terminal window — a plain interactive shell at the recorded cwd, no `claude` command (same terminal-app detection as `Enter`; cmux tab/window chooser inside cmux; a missing cwd fails with a `ast relocate` hint) |
 | **`D`** / **`d`** / **`Ctrl-D`** | Toggle **done** on current row (or all marked rows). Persists. |
