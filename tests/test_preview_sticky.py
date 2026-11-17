@@ -93,7 +93,10 @@ def _child():
 
     # scroll well past the header, snapshot, press d, snapshot again
     keyseq = [(curses.KEY_NPAGE, None), (curses.KEY_NPAGE, None),
-              (ord("d"), None), (ord("q"), None)]
+              (ord("d"), None), (5, None),
+              (ord("g"), None), (ord("G"), None),
+              (curses.KEY_HOME, None), (curses.KEY_END, None),
+              (ord("q"), None)]
     idx = [0]
     captures = []
 
@@ -184,6 +187,17 @@ class TestPreviewStickyRender(unittest.TestCase):
         before, after = caps[2], caps[3]   # frame before `d`, frame after `d`
         self.assertEqual(_body_rows(before), _body_rows(after),
                          msg="`d` reset the preview scroll position")
+
+    def test_end_shortcuts_show_last_message_and_keep_header(self):
+        caps = self.res["captures"]
+        for index in (4, 6, 8):  # Ctrl-E, G, End
+            frame = caps[index]
+            self.assertTrue(any("MSGLINE059" in line for line in frame))
+            self.assertFalse(any("MSGLINE000" in line for line in frame))
+            self.assertTrue(any(_SID in line for line in frame))
+            self.assertEqual(_body_rows(caps[4]), _body_rows(frame))
+        for index in (5, 7):  # g, Home restore the beginning
+            self.assertEqual(_body_rows(caps[0]), _body_rows(caps[index]))
 
     def test_done_toggle_updates_pinned_status_row(self):
         caps = self.res["captures"]
